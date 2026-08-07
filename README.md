@@ -29,7 +29,7 @@
 
 ## 1. 背景与目标
 
-业务需要一个支持**任意加法 mask**（item 级屏蔽，0=可见 / -inf=屏蔽）的 Attention Forward 算子，目标硬件是消费级 Blackwell（RTX 5090D, sm120）。
+生成式推荐系统模型需要一个支持**任意加法 mask**（item 级屏蔽，0=可见 / -inf=屏蔽）的 Attention Forward 算子，目标硬件是消费级 Blackwell（RTX 5090D, sm120）。
 
 一个关键前提：**PyTorch SDPA 在带任意 `attn_mask` 时只能走 MemEfficient 后端**（FlashAttention 后端不支持任意 mask），实测标准场景只有 55~99 TFLOPS；而 FA2/FA3 的官方实现分别以 sm80（cp.async）和 sm90（wgmma+TMA）为目标，均无法直接在 sm120 上发挥新特性。
 

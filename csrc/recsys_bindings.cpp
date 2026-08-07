@@ -17,9 +17,6 @@
 
 // Step 3: 包含算子声明头文件
 #include "fa/fa_fwd_op.h"
-#include "pack/pack_and_prepare.h"
-#include "jagged/jagged_forward.h"
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 4: 分发函数
@@ -36,40 +33,6 @@ CUSTOM_OP_DISPATCH_FN(
     q
 )
 
-// ── pack_and_prepare_b1 ───────────────────────────────────────────────────────
-// s_len/c_len/i_len 以 int64_t 直接传入（Python 侧先 .item() 提取，避免 D2H 同步）
-CUSTOM_OP_DISPATCH_FN(
-    pack_and_prepare_b1,
-    (const torch::Tensor& h_s,
-     const torch::Tensor& h_c,
-     const torch::Tensor& h_i,
-     int64_t s_len,
-     int64_t c_len,
-     int64_t i_len,
-     const torch::Tensor& static_cos,
-     const torch::Tensor& static_sin,
-     int64_t S_max,
-     int64_t S_mask),
-    (h_s, h_c, h_i, s_len, c_len, i_len, static_cos, static_sin, S_max, S_mask),
-    h_s
-)
-
-// ── jagged_pool_and_collect ───────────────────────────────────────────────────
-// pool_val_splits / pool_len_splits 以 int[] 传递（映射到 std::vector<int64_t>）
-CUSTOM_OP_DISPATCH_FN(
-    jagged_pool_and_collect,
-    (const torch::Tensor&        pool_values,
-     const torch::Tensor&        pool_lengths,
-     const std::vector<int64_t>& pool_val_splits,
-     const std::vector<int64_t>& pool_len_splits,
-     int64_t                     n_pooling,
-     int64_t                     reduce_mode,
-     const torch::Tensor&        ones_cache),
-    (pool_values, pool_lengths, pool_val_splits, pool_len_splits,
-     n_pooling, reduce_mode, ones_cache),
-    pool_values
-)
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 5: 注册 schema
@@ -81,31 +44,6 @@ CUSTOM_OPS_LIBRARY_BEGIN
         "Tensor q, Tensor k, Tensor v, Tensor mask",
         "-> Tensor"
     )
-    CUSTOM_OP_SCHEMA(
-        pack_and_prepare_b1,
-        "Tensor h_s,"
-        "Tensor h_c,"
-        "Tensor h_i,"
-        "int s_len,"
-        "int c_len,"
-        "int i_len,"
-        "Tensor static_cos,"
-        "Tensor static_sin,"
-        "int S_max,"
-        "int S_mask",
-        "-> Tensor[]"
-    )
-    CUSTOM_OP_SCHEMA(
-        jagged_pool_and_collect,
-        "Tensor pool_values,"
-        "Tensor pool_lengths,"
-        "int[] pool_val_splits,"
-        "int[] pool_len_splits,"
-        "int n_pooling,"
-        "int reduce_mode,"
-        "Tensor ones_cache",
-        "-> Tensor[]"
-    )
 CUSTOM_OPS_LIBRARY_END
 
 
@@ -115,8 +53,6 @@ CUSTOM_OPS_LIBRARY_END
 
 CUSTOM_OPS_IMPL_BEGIN
     CUSTOM_OP_BIND(mha_fwd_with_mask)
-    CUSTOM_OP_BIND(pack_and_prepare_b1)
-    CUSTOM_OP_BIND(jagged_pool_and_collect)
 CUSTOM_OPS_IMPL_END
 
 
