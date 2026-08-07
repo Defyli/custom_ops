@@ -14,7 +14,7 @@ custom_ops/test_custom_ops.py — 通用库自测
 
 运行方式
 --------
-    TORCH_EXTENSIONS_DIR=/workdir/tetuan_cache/torch_extensions \
+    TORCH_EXTENSIONS_DIR=./torch_extensions \
         python custom_ops/test_custom_ops.py
 """
 
