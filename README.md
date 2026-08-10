@@ -1,5 +1,7 @@
 # custom_ops — 支持任意 Mask 的 FlashAttention-2 (sm120/Blackwell 优化)
 
+中文 | [English](README_EN.md)
+
 面向生成式推荐系统场景的高性能 CUDA 算子库。核心算子 `mha_fwd_with_mask` 是支持
 **任意加法 mask**（0=可见 / -inf=屏蔽）的 FlashAttention-2 前向实现，针对消费级
 Blackwell（RTX 5090D, sm120）深度优化：TMA + mbarrier 多级流水线、Split KV 自适应
@@ -172,6 +174,36 @@ if ops.is_available():
 即可获得：自动 JIT 编译/快速 dlopen、多进程文件锁、GPU 架构自动探测、
 GCC 版本配置、优雅降级、`torch.compile`/AOTI fake 注册。
 
+## 致谢与引用
+
+本项目的 kernel 实现基于 FlashAttention 官方源码修改而来（计算骨架沿用 FA2，
+数据通路参考 FA3/hopper 的 TMA 写法移植至 sm120），并依赖 NVIDIA CUTLASS/CuTe
+（已作为头文件内置于 `thirdparty/`）。如果本项目对您有帮助，请同时引用原项目：
+
+- FlashAttention 官方仓库：https://github.com/Dao-AILab/flash-attention
+- CUTLASS：https://github.com/NVIDIA/cutlass
+
+```bibtex
+@inproceedings{dao2022flashattention,
+  title     = {FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness},
+  author    = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2022}
+}
+
+@inproceedings{dao2023flashattention2,
+  title     = {FlashAttention-2: Better Attention with Better Parallelism and Work Partitioning},
+  author    = {Dao, Tri},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024}
+}
+```
+
 ## License
 
-（待补充）
+本项目采用 [BSD 3-Clause](LICENSE) 许可证。
+
+- 本仓库代码基于 [FlashAttention](https://github.com/Dao-AILab/flash-attention)
+  （BSD 3-Clause）修改，原版权声明保留在对应源文件头部；
+- `thirdparty/` 下的 CUTLASS/CuTe 遵循其原始 BSD 3-Clause 许可证，
+  见 [thirdparty/LICENSE.cutlass](thirdparty/LICENSE.cutlass)。

@@ -1,3 +1,14 @@
+/******************************************************************************
+ * Copyright (c) 2024, Tri Dao.
+ *
+ * This file is derived from FlashAttention
+ * (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License.
+ * Modifications: ported the FA2 compute kernel (compute_attn_1rowblock) to a
+ * prefill + arbitrary additive-mask variant; removed dropout/rotary/KV-cache/
+ * alibi/local-window/softcap/split-KV logic; added bf16 mask add after QK gemm.
+ * See the LICENSE file in the repository root.
+ ******************************************************************************/
+
 /*
  * Flash Attention Forward with Additive Mask — Core Compute Kernel
  *

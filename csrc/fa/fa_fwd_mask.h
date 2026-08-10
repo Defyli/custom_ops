@@ -1,3 +1,13 @@
+/******************************************************************************
+ * Copyright (c) 2024, Tri Dao.
+ *
+ * This file is derived from FlashAttention
+ * (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License.
+ * Modifications: extended Flash_fwd_kernel_traits with smem layout and copy
+ * atoms for the bf16 additive mask.
+ * See the LICENSE file in the repository root.
+ ******************************************************************************/
+
 /*
  * Flash Attention Forward with Multiplicative Mask — Kernel Traits
  *

@@ -1,3 +1,14 @@
+/******************************************************************************
+ * Copyright (c) 2024, Tri Dao.
+ *
+ * This file is derived from FlashAttention
+ * (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License.
+ * Modifications: FA2 compute skeleton (mma.sync + online softmax) with
+ * FA3/hopper-style TMA data movement, ported to sm120; added split-KV and
+ * persistent variants for the additive-mask operator.
+ * See the LICENSE file in the repository root.
+ ******************************************************************************/
+
 /*
  * Flash Attention Forward with Additive Mask — SM120 (Blackwell, RTX 50) Kernel
  *
