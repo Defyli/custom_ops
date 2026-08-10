@@ -21,7 +21,10 @@
  *      → 不再需要 Is_even_MN / Is_even_K 分支
  *   3. Epilogue：acc_o → sO（复用 sQ smem）→ TMA store 直接写 gmem
  *
- * Mask 语义（加法 mask）：0=可见，-inf=屏蔽（与 cp.async 版一致）
+ * Mask 语义（加法 mask，与 SDPA 对齐）：softmax(S·scale + mask)，
+ *   0=可见，-inf=屏蔽，支持任意有限值偏置（ALiBi 风格）。
+ *   实现上 mask 加到未缩放的 acc_s 再统一乘 scale，因此应用点需乘 1/scale 预还原
+ *   （见各 kernel 内 mask_inv_scale；0/-inf mask 不受此影响）。
  * Mask gmem 布局：(B, seqlen_q_rounded, seqlen_k_rounded)，row-major，bf16，
  *   两个方向均已按 kBlockM/kBlockN pad（越界填 -inf，由 host 侧保证）
  */
@@ -323,20 +326,23 @@ flash_fwd_mask_kernel_sm120(
 
     // mask → acc_s 纯加法（越界列已由 host pad 成 -inf）
     // smem 版：TMA 已全 tile 搬运；gmem 版：调用前需先 issue 对应 n_block 的 ldg
+    // mask 语义对齐 SDPA：softmax(S·scale + mask)。mask 在 scale 之前加到未缩放的 acc_s 上，
+    // 因此必须乘 1/scale（-inf × 正数仍为 -inf，0/-inf mask 行为不变；有限值 mask 此前被错误缩放）
+    const float mask_inv_scale = 1.f / p.scale_softmax;
     auto apply_mask_from_smem = [&](auto &acc_s, int stage) {
         Tensor rMask = make_tensor<Element>(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
         auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
-        cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, stage), tSrMask_view);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s); ++i) {
-            acc_s(i) += static_cast<float>(rMask(i));
+    cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, stage), tSrMask_view);
+    #pragma unroll
+    for (int i = 0; i < size(acc_s); ++i) {
+            acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
         }
     };
     auto apply_mask_from_gmem = [&](auto &acc_s) {
         #pragma unroll
         for (int i = 0; i < size(acc_s); ++i) {
-            acc_s(i) += static_cast<float>(rMaskG(i));
+            acc_s(i) += static_cast<float>(rMaskG(i)) * mask_inv_scale;
         }
     };
 
@@ -684,17 +690,18 @@ flash_fwd_mask_kernel_sm120_persistent(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
         auto tMrMaskG_view = gmem_thr_copy_mask.retile_D(rMaskG);
 
-        auto apply_mask_from_smem = [&](auto &acc, int s) {
-            Tensor rM = make_tensor<Element>(partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
-            auto tV = smem_thr_copy_mask.retile_D(rM);
-            cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, s), tV);
-            #pragma unroll
-            for (int i = 0; i < size(acc); ++i) { acc(i) += static_cast<float>(rM(i)); }
-        };
-        auto apply_mask_from_gmem = [&](auto &acc) {
-            #pragma unroll
-            for (int i = 0; i < size(acc); ++i) { acc(i) += static_cast<float>(rMaskG(i)); }
-        };
+const float mask_inv_scale = 1.f / p.scale_softmax;
+auto apply_mask_from_smem = [&](auto &acc, int s) {
+Tensor rM = make_tensor<Element>(partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
+auto tV = smem_thr_copy_mask.retile_D(rM);
+cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, s), tV);
+#pragma unroll
+for (int i = 0; i < size(acc); ++i) { acc(i) += static_cast<float>(rM(i)) * mask_inv_scale; }
+};
+auto apply_mask_from_gmem = [&](auto &acc) {
+#pragma unroll
+for (int i = 0; i < size(acc); ++i) { acc(i) += static_cast<float>(rMaskG(i)) * mask_inv_scale; }
+};
 
         if constexpr (Kernel_traits::kQInRegs) {
             Tensor mQg = make_tensor(
@@ -810,7 +817,7 @@ flash_fwd_mask_kernel_sm120_persistent(
 }
 
 // ── Persistent kernel launcher ───────────────────────────────────────────────
-// 发布 1D grid（num_SMs），每个 CTA 从线性工作队列中步长式取任务，
+// 发布 1D grid（2× num_SMs，给调度器留弹性），每个 CTA 从线性工作队列中步长式取任务，
 // 消除尾效应，提升小 batch/head 场景的 SM 利用率（FA3 StaticPersistentTileScheduler 的简化版）。
 template<typename Kernel_traits>
 void run_flash_fwd_mask_sm120_persistent(const FA_mask_params &params, cudaStream_t stream) {
@@ -1014,18 +1021,19 @@ flash_fwd_mask_kernel_sm120_splitkv(
         partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
     auto tMrMaskG_view = gmem_thr_copy_mask.retile_D(rMaskG);
 
+    const float mask_inv_scale = 1.f / p.scale_softmax;   // 见主 kernel 同名注释
     auto apply_mask_from_smem = [&](auto &acc_s, int stage) {
         Tensor rMask = make_tensor<Element>(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
-        auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
-        cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, stage), tSrMask_view);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s); ++i) { acc_s(i) += static_cast<float>(rMask(i)); }
-    };
-    auto apply_mask_from_gmem = [&](auto &acc_s) {
-        #pragma unroll
-        for (int i = 0; i < size(acc_s); ++i) { acc_s(i) += static_cast<float>(rMaskG(i)); }
-    };
+auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
+cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, stage), tSrMask_view);
+#pragma unroll
+for (int i = 0; i < size(acc_s); ++i) { acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale; }
+};
+auto apply_mask_from_gmem = [&](auto &acc_s) {
+#pragma unroll
+for (int i = 0; i < size(acc_s); ++i) { acc_s(i) += static_cast<float>(rMaskG(i)) * mask_inv_scale; }
+};
 
     if constexpr (Kernel_traits::kQInRegs) {
         Tensor mQg = make_tensor(
@@ -1180,12 +1188,13 @@ flash_fwd_mask_kernel_sm120_splitkv(
 }
 
 // ── Split-KV combine kernel ──────────────────────────────────────────────────
-// grid = (num_m_blocks * (kBlockM/32), B*H, kHeadDim/32)，block = 128 线程
-// 每个 CTA 处理 32 行 × 32 列的输出子块 —— 关键：小 grid 场景下（如 1 个 m_block）
-// 仍能把归约拆成 (4 row-chunk × 4 col-chunk) = 16 个 CTA，吃满带宽。
-//   Phase1: 1 个 warp 计算本 CTA 32 行的 scale_s = exp(lse_s - lse_max) / Σ_s
+// grid = (num_m_blocks * (kBlockM/kRows), B*H, kHeadDim/kCols)，block = 128 线程
+// 每个 CTA 处理 kRows 行 × kCols 列的输出子块。tile 尺寸由 host 端自适应选择：
+// grid 足够大时用 32×32（摊薄 Phase1 开销）；小 grid 时缩到 32×16 / 16×16，
+// 把归约并行度放大 2~4 倍吃满带宽（kCols=16 时每行恰好 1 个 32B sector，不浪费带宽）。
+//   Phase1: 1 个 warp 计算本 CTA kRows 行的 scale_s = exp(lse_s - lse_max) / Σ_s
 //   Phase2: 全 CTA float4 向量化加权归约，转 bf16 写出
-template<int kHeadDim, int kNThreads, typename Element>
+template<int kHeadDim, int kNThreads, int kRows, int kCols, typename Element>
 __global__ void __launch_bounds__(kNThreads)
 flash_fwd_mask_combine_kernel_sm120(
     const Element* __restrict__ o_partial,  // (S, B, H, SqR, D) bf16
@@ -1196,9 +1205,15 @@ flash_fwd_mask_combine_kernel_sm120(
     const int64_t o_batch_stride, const int64_t o_head_stride, const int64_t o_row_stride) {
 
     constexpr int kMaxSplits = 64;    // host 侧已 clamp（8KB smem）
-    constexpr int kRows = 32;         // 每 CTA 行数
-    constexpr int kCols = 32;         // 每 CTA 列数
+    static_assert(kRows <= 32 && kCols >= 16 && kCols % 4 == 0, "tile constraint");
     __shared__ float s_scale[kMaxSplits * kRows];
+    __shared__ unsigned long long s_active;   // CTA-uniform：bit s = 该 split 有非零 scale
+
+    // PDL：与上游 splitkv kernel 重叠启动。等待其全部 CTA 写出 O_partial/LSE 后再读。
+    // 未以 PDL 属性启动时此为 no-op，安全。
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
 
     const int row0    = blockIdx.x * kRows;             // tile 内全局行起点（含 m_block 偏移）
     const int bh      = blockIdx.y;
@@ -1213,46 +1228,83 @@ flash_fwd_mask_combine_kernel_sm120(
     const int64_t bh_off_o   = ((int64_t)bidb * num_heads + bidh) * sqR * kHeadDim;
     const int64_t bh_off_lse = ((int64_t)bidb * num_heads + bidh) * sqR;
 
-    // Phase 1: per-row scales（1 个 warp，row-per-lane；外层按 split 循环保证合并访存）
-    if (tidx < kRows) {
-        const int row = row0 + tidx;
-        const float* lse_base = lse_partial + bh_off_lse + row;
-        float lse_max = -INFINITY;
-        for (int s = 0; s < num_splits; ++s) {
-            lse_max = fmaxf(lse_max, lse_base[s * split_stride_lse]);
+    // Phase 1: per-row scales（warp0，row-per-lane；外层按 split 循环保证合并访存）
+    // 同时归约出 CTA-uniform 的活跃 split 位掩码，供 Phase2 整组跳过被 mask 的 split
+    if (tidx < 32) {
+        unsigned long long bits = 0;
+        if (tidx < kRows) {
+            const int row = row0 + tidx;
+            const float* lse_base = lse_partial + bh_off_lse + row;
+            float lse_max = -INFINITY;
+            for (int s = 0; s < num_splits; ++s) {
+                lse_max = fmaxf(lse_max, lse_base[s * split_stride_lse]);
+            }
+            // 全 -inf 行（整行被 mask）：lse_max_c=0 → exp(-inf)=0 → scale 全 0 → O=0
+            const float lse_max_c = (lse_max == -INFINITY) ? 0.f : lse_max;
+            float sum = 0.f;
+            for (int s = 0; s < num_splits; ++s) {
+                sum += __expf(lse_base[s * split_stride_lse] - lse_max_c);
+            }
+            const float inv = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
+            for (int s = 0; s < num_splits; ++s) {
+                const float sc = __expf(lse_base[s * split_stride_lse] - lse_max_c) * inv;
+                s_scale[s * kRows + tidx] = sc;
+                if (sc > 0.f) { bits |= (1ull << s); }
+            }
         }
-        // 全 -inf 行（整行被 mask）：lse_max_c=0 → exp(-inf)=0 → scale 全 0 → O=0
-        const float lse_max_c = (lse_max == -INFINITY) ? 0.f : lse_max;
-        float sum = 0.f;
-        for (int s = 0; s < num_splits; ++s) {
-            sum += __expf(lse_base[s * split_stride_lse] - lse_max_c);
-        }
-        const float inv = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
-        for (int s = 0; s < num_splits; ++s) {
-            s_scale[s * kRows + tidx] = __expf(lse_base[s * split_stride_lse] - lse_max_c) * inv;
-        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+        // 注意：__reduce_or_sync 仅有 32-bit 重载（and/or/xor 无 64-bit 版），
+        // 直接传 64-bit 会被隐式截断 → splits 32~63 活跃位丢失（曾导致结果错误）
+        const unsigned bits_lo = __reduce_or_sync(0xffffffffu, static_cast<unsigned>(bits));
+        const unsigned bits_hi = __reduce_or_sync(0xffffffffu, static_cast<unsigned>(bits >> 32));
+        bits = bits_lo | (static_cast<unsigned long long>(bits_hi) << 32);
+#else
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) { bits |= __shfl_down_sync(0xffffffffu, bits, off); }
+#endif
+        if (tidx == 0) { s_active = bits; }
     }
     __syncthreads();
 
     // Phase 2: uint2(4×bf16) 向量化加权归约（kCols/4 个 chunk/行，连续线程访问连续 chunk → 合并访存）
-    constexpr int kChunksPerRow = kCols / 4;             // 8
-    constexpr int kTotalChunks  = kRows * kChunksPerRow; // 256
+    constexpr int kChunksPerRow = kCols / 4;             // 32列→8, 16列→4
+    constexpr int kTotalChunks  = kRows * kChunksPerRow;
     const Element* op_base = o_partial + bh_off_o + (int64_t)row0 * kHeadDim + col0;
     Element* o_base = o_ptr + bidb * o_batch_stride + bidh * o_head_stride
                       + (int64_t)row0 * o_row_stride + col0;
 
     #pragma unroll
     for (int c = tidx; c < kTotalChunks; c += kNThreads) {
-        const int r  = c / kChunksPerRow;                // CTA 内行 0..31
-        const int cc = (c - r * kChunksPerRow) * 4;      // CTA 内列 0..28
+        const int r  = c / kChunksPerRow;                // CTA 内行
+        const int cc = (c - r * kChunksPerRow) * 4;      // CTA 内列
+        const unsigned long long active = s_active;
         float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-        #pragma unroll 4
-        for (int s = 0; s < num_splits; ++s) {
+        const Element* cp_base = op_base + r * kHeadDim + cc;
+        // 4 路独立 load+FMA 链展开：暴露 MLP（在途字节 ×4），整组跳过非活跃 split
+        int s = 0;
+        for (; s + 4 <= num_splits; s += 4) {
+            if (((active >> s) & 0xfull) == 0ull) { continue; }
+            Element pv0[4], pv1[4], pv2[4], pv3[4];
+            *reinterpret_cast<uint2*>(pv0) = *reinterpret_cast<const uint2*>(cp_base + (s + 0) * split_stride_o);
+            *reinterpret_cast<uint2*>(pv1) = *reinterpret_cast<const uint2*>(cp_base + (s + 1) * split_stride_o);
+            *reinterpret_cast<uint2*>(pv2) = *reinterpret_cast<const uint2*>(cp_base + (s + 2) * split_stride_o);
+            *reinterpret_cast<uint2*>(pv3) = *reinterpret_cast<const uint2*>(cp_base + (s + 3) * split_stride_o);
+            const float sc0 = s_scale[(s + 0) * kRows + r];
+            const float sc1 = s_scale[(s + 1) * kRows + r];
+            const float sc2 = s_scale[(s + 2) * kRows + r];
+            const float sc3 = s_scale[(s + 3) * kRows + r];
+            // 注意：非活跃 split 的 sc=0，但 pv 可能是 masked 区的任意值；0*有限值=0 安全。
+            // masked split 的 O_partial 由主 kernel 写成有限值（l=0 时全 0），无 inf/NaN。
+            acc.x += sc0 * float(pv0[0]) + sc1 * float(pv1[0]) + sc2 * float(pv2[0]) + sc3 * float(pv3[0]);
+            acc.y += sc0 * float(pv0[1]) + sc1 * float(pv1[1]) + sc2 * float(pv2[1]) + sc3 * float(pv3[1]);
+            acc.z += sc0 * float(pv0[2]) + sc1 * float(pv1[2]) + sc2 * float(pv2[2]) + sc3 * float(pv3[2]);
+            acc.w += sc0 * float(pv0[3]) + sc1 * float(pv1[3]) + sc2 * float(pv2[3]) + sc3 * float(pv3[3]);
+        }
+        for (; s < num_splits; ++s) {   // 尾部（<4 个）
             const float sc = s_scale[s * kRows + r];
-            if (sc > 0.f) {   // 跳过整段被 mask 的 split（scale=0），省带宽
+            if (sc > 0.f) {
                 Element pv[4];
-                *reinterpret_cast<uint2*>(pv) = *reinterpret_cast<const uint2*>(
-                    op_base + s * split_stride_o + r * kHeadDim + cc);
+                *reinterpret_cast<uint2*>(pv) = *reinterpret_cast<const uint2*>(cp_base + s * split_stride_o);
                 acc.x += sc * float(pv[0]);  acc.y += sc * float(pv[1]);
                 acc.z += sc * float(pv[2]);  acc.w += sc * float(pv[3]);
             }
@@ -1325,19 +1377,56 @@ void run_flash_fwd_mask_sm120_splitkv(const FA_mask_params &params, cudaStream_t
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// combine tile 自适应：小 grid 时缩小 tile 换并行度（目标 ≥ ~128 CTA 接近吃满 170 SM）
+// kCols 最小 16（每行 16×2B=32B 恰好 1 个 sector，再小会浪费 DRAM 带宽）
+template<int kHeadDim, int kNThreads, typename Element>
+inline void launch_combine_adaptive(
+    const FA_mask_params &params, cudaStream_t stream,
+    const int rows_per_cta, const int cols_per_cta) {
+    dim3 grid(params.seqlen_q_rounded / rows_per_cta, params.b * params.h,
+              kHeadDim / cols_per_cta);
+    #define LAUNCH_COMBINE(R, C) \
+        do { \
+            auto kernel = &flash_fwd_mask_combine_kernel_sm120<kHeadDim, kNThreads, R, C, Element>; \
+            cudaLaunchConfig_t cfg = {}; \
+            cfg.gridDim = grid; \
+            cfg.blockDim = dim3(kNThreads, 1, 1); \
+            cfg.dynamicSmemBytes = 0; \
+            cfg.stream = stream; \
+            cudaLaunchAttribute attrs[1]; \
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; \
+            attrs[0].val.programmaticStreamSerializationAllowed = 1; \
+            cfg.attrs = attrs; \
+            cfg.numAttrs = 1; \
+            cudaLaunchKernelEx(&cfg, kernel, \
+                reinterpret_cast<const Element*>(params.oaccum_ptr), \
+                reinterpret_cast<const float*>(params.lseaccum_ptr), \
+                reinterpret_cast<Element*>(params.o_ptr), \
+                params.num_splits, params.seqlen_q, params.seqlen_q_rounded, \
+                params.h, params.b, \
+                params.o_batch_stride, params.o_head_stride, params.o_row_stride); \
+        } while (0)
+    if (rows_per_cta == 32 && cols_per_cta == 32)      { LAUNCH_COMBINE(32, 32); }
+    else if (rows_per_cta == 32 && cols_per_cta == 16) { LAUNCH_COMBINE(32, 16); }
+    else                                               { LAUNCH_COMBINE(16, 16); }
+    #undef LAUNCH_COMBINE
+}
+
 template<int kBlockM, int kHeadDim, typename Element>
 void run_flash_fwd_mask_combine_sm120(const FA_mask_params &params, cudaStream_t stream) {
     constexpr int kNThreads = 128;
-    // 32 行 × 32 列一个 CTA：小 grid 时把归约并行度放大 (kBlockM/32)×(kHeadDim/32) 倍
-    dim3 grid(params.seqlen_q_rounded / 32, params.b * params.h, kHeadDim / 32);
-    auto kernel = &flash_fwd_mask_combine_kernel_sm120<kHeadDim, kNThreads, Element>;
-    kernel<<<grid, kNThreads, 0, stream>>>(
-        reinterpret_cast<const Element*>(params.oaccum_ptr),
-        reinterpret_cast<const float*>(params.lseaccum_ptr),
-        reinterpret_cast<Element*>(params.o_ptr),
-        params.num_splits, params.seqlen_q, params.seqlen_q_rounded,
-        params.h, params.b,
-        params.o_batch_stride, params.o_head_stride, params.o_row_stride);
+    const int64_t ctas_32 = (int64_t)(params.seqlen_q_rounded / 32) * params.b * params.h * (kHeadDim / 32);
+    int rows_per_cta = 32, cols_per_cta = 32;
+    if (ctas_32 < 128) {
+        // 先切列（grid z 翻倍），不够再切行（grid x 再翻倍）
+        cols_per_cta = 16;
+        const int64_t ctas_32x16 = ctas_32 * 2;
+        if (ctas_32x16 < 128 && params.seqlen_q_rounded % 16 == 0) {
+            rows_per_cta = 16;
+        }
+    }
+    launch_combine_adaptive<kHeadDim, kNThreads, Element>(
+        params, stream, rows_per_cta, cols_per_cta);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

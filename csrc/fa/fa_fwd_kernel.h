@@ -8,11 +8,13 @@
  *           在 gemm 后对 acc_s 做 smem→reg copy + 逐元素加法（零分支，无 warp divergence）
  *   - 保留 Is_even_MN / Is_even_K 分支以保证边界正确性
  *
- * Mask 语义（加法 mask）：
+ * Mask 语义（加法 mask，与 SDPA 对齐，即 softmax(S·scale + mask)）：
  *   mask=0    → 可见（score 不变）
  *   mask=-inf → 屏蔽（score → -inf，softmax 后 weight = 0）
+ *   有限值    → 任意加法偏置（ALiBi 风格）；实现上 mask 先于 scale 加到 acc_s，
+ *               应用点乘 1/scale_softmax 预还原（见 apply_mask_from_smem）
  *
- * Mask tensor 的 global mem 格式：(B, seqlen_q, seqlen_k_rounded)，row-major，bf16
+ * Mask tensor 的 global mem 格式：(B, seqlen_q_rounded, seqlen_k_rounded)，row-major，bf16
  *   - seqlen_k_rounded = ceil(seqlen_k, kBlockN) * kBlockN（由调用方 pad，越界填 -inf）
  *   - kBlockN（64 或 128）本身是 8 的倍数，保证 cp.async 128-bit 无越界且整 tile 无越界
  *   - 通过 params.mask_ptr / mask_batch_stride / mask_row_stride 寻址
@@ -261,13 +263,16 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
 
     // ── apply_mask_from_smem：smem → register，然后对 acc_s 做加法 ───────────
     //
-    // mask 语义（加法 mask）：
+    // mask 语义（加法 mask，与 SDPA 对齐，即 softmax(S·scale + mask)）：
     //   mask=0    → 可见，score 不变（acc_s += 0）
     //   mask=-inf → 屏蔽，score → -inf（acc_s += -inf）
     //
     // 由于 copy_g2s_mask 已将越界列的 -inf 搬入 sMask，这里只需纯加法，
     // 无任何分支，SIMD 效率最优，零 warp divergence。
+    // 注意：acc_s 此时尚未乘 softmax_scale，mask 需乘 1/scale 预先还原
+    // （0/-inf mask 行为不变；有限值 mask 此前被错误地乘了 scale）。
     auto apply_mask_from_smem = [&](auto &acc_s) {
+        const float mask_inv_scale = 1.f / params.scale_softmax;
         Tensor rMask = make_tensor<Element>(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
         auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
@@ -276,7 +281,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
         // 纯加法，无分支：可见位加 0，屏蔽位加 -inf，均匀指令流，无 warp divergence
         #pragma unroll
         for (int i = 0; i < size(acc_s); ++i) {
-            acc_s(i) += static_cast<float>(rMask(i));
+            acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
         }
     };
 

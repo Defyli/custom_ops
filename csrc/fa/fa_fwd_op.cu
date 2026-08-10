@@ -8,7 +8,8 @@
  * 输入约定：
  *   q, k, v : (B, n_heads, seqlen, head_dim)，bfloat16，CUDA tensor，连续
  *   mask    : (B, 1, seqlen_q, seqlen_k_or_rounded)，bfloat16，CUDA tensor，连续
- *             加法 mask：0=可见，-inf=屏蔽
+ *             加法 mask，语义与 PyTorch SDPA 对齐：softmax(S·scale + mask)
+ *             —— 0=可见，-inf=屏蔽，也支持任意有限值偏置（ALiBi 风格）
  *             seqlen_k_or_rounded >= seqlen_k，允许调用方预先 pad 到 kBlockN 整数倍（推荐）
  *
  * 输出：
@@ -21,7 +22,8 @@
  * 注意：
  *   - 只支持 head_dim ∈ {64, 128}（bf16），更多 hdim 可按需扩展
  *   - 只支持 GQA（n_heads_q >= n_heads_kv，n_heads_q % n_heads_kv == 0）
- *   - 不支持 dropout、causal mask、RoPE、KV-cache、alibi
+ *   - 不支持 dropout、causal mask、RoPE、KV-cache
+ *     （alibi 类相对位置偏置可直接通过有限值加法 mask 表达）
  */
 
 #include "fa_fwd_op.h"
@@ -83,7 +85,9 @@ torch::Tensor mha_fwd_with_mask_cuda(
     // copy_g2s_mask（cp.async 版）与 TMA 版均无条件搬运整个 (kBlockM, kBlockN) tile，
     // 块大小必须与实际运行的 kernel 配置一致：
     //   sm89 路径: hdim=64 → (128,128)，hdim=128 → (64,64)（见 fa_fwd_launch.h）
-    //   sm120 路径: hdim=64 → (128,64)，hdim=128 → (64,64)（见 fa_fwd_launch.h）
+    //   sm120 路径: hdim=64/128 均为 (128,64)（见 fa_mask_sm120_block_size）
+    // 注意 sm120 splitkv 的 Split-M 变体 kernel 内用 kBlockM=64，但 host 侧 padding
+    // 仍按基准 (128,64) 对齐——128 的整数倍必然 64 对齐，M64 无需额外处理。
     // 两个方向越界的 pad 值均为 -inf（mask 语义：屏蔽 → softmax 后归零，不影响结果）
     const bool use_sm120 = fa_mask_sm120_supported();
     int kBlockM, kBlockN;
@@ -191,6 +195,11 @@ torch::Tensor mha_fwd_with_mask_cuda(
         const char* env = std::getenv("FA_SPLITKV");
         return !(env && (std::strcmp(env, "0") == 0));
     }();
+    // 环境变量 FA_SPLITM=0 可禁用 splitkv 的 kBlockM=64 变体（默认启用）
+    static const bool splitm_enabled = []() {
+        const char* env = std::getenv("FA_SPLITM");
+        return !(env && (std::strcmp(env, "0") == 0));
+    }();
 
     if (use_sm120 && use_persistent) {
         if (d == 64) { run_mha_fwd_mask_hdim64_sm120_persistent(params, stream); }
@@ -200,8 +209,21 @@ torch::Tensor mha_fwd_with_mask_cuda(
 
     // Split-KV：grid 填不满 SM 时按 K 维切分，多 CTA 并行后 combine 归约
     if (use_sm120 && splitkv_enabled) {
-        const int num_splits = fa_mask_sm120_num_splits(params, kBlockM, kBlockN);
+        int num_splits = fa_mask_sm120_num_splits(params, kBlockM, kBlockN);
         if (num_splits > 1) {
+            // Split-M 判定：kBlockM=64 变体让 m_block 数翻倍（不增加 combine 开销地提升并行度）
+            //   ① Sq<=64：kBlockM=128 会浪费半块 padding 计算，M64 严格更优
+            //   ② grid 严重填不满（< 0.5 wave）：M64 把并行度翻倍
+            bool use_m64 = false;
+            if (splitm_enabled) {
+                const int num_sms = fa_mask_sm120_num_sms();
+                const int64_t grid_ctas =
+                    (int64_t)B * H * ceil_div_int(Sq, 128) * num_splits;
+                if (Sq <= 64 || grid_ctas < num_sms / 2) {
+                    use_m64 = true;
+                    num_splits = fa_mask_sm120_num_splits(params, 64, kBlockN);
+                }
+            }
             // O_partial 用 bf16（partial 流量减半；~0.4% 相对误差 < bf16 输出量化误差），LSE 保持 fp32
             torch::Tensor oaccum   = torch::empty({num_splits, B, H, Sq_rounded, d}, q.options());
             torch::Tensor lseaccum = torch::empty({num_splits, B, H, Sq_rounded},
@@ -209,8 +231,13 @@ torch::Tensor mha_fwd_with_mask_cuda(
             params.oaccum_ptr   = oaccum.data_ptr();
             params.lseaccum_ptr = lseaccum.data_ptr();
             params.num_splits   = num_splits;
-            if (d == 64) { run_mha_fwd_mask_hdim64_sm120_splitkv(params, stream); }
-            else         { run_mha_fwd_mask_hdim128_sm120_splitkv(params, stream); }
+            if (use_m64) {
+                if (d == 64) { run_mha_fwd_mask_hdim64_sm120_splitkv_m64(params, stream); }
+                else         { run_mha_fwd_mask_hdim128_sm120_splitkv_m64(params, stream); }
+            } else {
+                if (d == 64) { run_mha_fwd_mask_hdim64_sm120_splitkv(params, stream); }
+                else         { run_mha_fwd_mask_hdim128_sm120_splitkv(params, stream); }
+            }
             return out;
         }
     }

@@ -1,21 +1,19 @@
 /*
  * Flash Attention Forward with Additive Mask — Launch Templates
  *
- * 提供两个 host-side 入口函数：
- *   run_mha_fwd_mask_hdim64   — head_dim = 64
- *   run_mha_fwd_mask_hdim128  — head_dim = 128
+ * 按架构/场景分发的 host-side 入口：
+ *   sm89（RTX 4090）基线：run_mha_fwd_mask_hdim{64,128}
+ *     hdim64  : kBlockM=128, kBlockN=128, 4 warps, smem=80KB（动态 smem）
+ *     hdim128 : kBlockM=64,  kBlockN=64,  4 warps, smem=56KB
+ *   sm120（Blackwell consumer, RTX 50）主路径：run_mha_fwd_mask_hdim{64,128}_sm120
+ *     TMA + mbarrier 多级流水（见 fa_fwd_sm120.h 文件头的设计说明）
+ *   sm120 persistent：FA_PERSISTENT=1 时启用（大 grid 消 tail 效应，d128 +2~5%）
+ *   sm120 split-KV：grid 填不满 SM 时自动启用（cost model 决定 num_splits，
+ *     部分结果 bf16 落盘 + combine 归约）；其 Split-M 变体（kBlockM=64）
+ *     在极小 grid 时再把 m_block 翻倍
  *
- * 均为 bf16、无 dropout、无 causal（mask 由外部传入）。
- * 仅针对 sm89（RTX4090）优化：
- *   hdim64  : kBlockM=128, kBlockN=128（128*128=16K smem for QKV，+mask=32K，总~64K 在 48K 上限内）
- *             → 实际: kSmemQSize=128*64*2=16KB, kSmemKVSize=128*64*2*2=32KB, +mask=128*128*2=32KB
- *             → 总=80KB 超 48KB，动态 smem 最大 99KB（RTX4090），OK。
- *   hdim128 : kBlockM=64,  kBlockN=64（RTX4090 sm89 最优）
- *             → kSmemQSize=64*128*2=16KB, kSmemKVSize=64*128*2*2=32KB, +mask=64*64*2=8KB
- *             → 总=56KB，需动态 smem
- *
- * 注意：FA2 原始 sm89+hdim128 用 (64, 64, 4) 配置，smem=(64*128 + 2*64*128)*2 = 48KB；
- *       加上 mask tile = 64*64*2=8KB，总 56KB，需设置 MaxDynamicSharedMemorySize。
+ * 均为 bf16、无 dropout、无 causal（mask 由外部传入，语义同 SDPA：
+ * softmax(S·scale + mask)，支持 0/-inf 及任意有限值偏置）。
  */
 
 #pragma once
@@ -114,9 +112,11 @@ inline void run_mha_fwd_mask_hdim128_sm120_persistent(const FA_mask_params &para
     >(params, stream);
 }
 
-// ── Split-KV num_splits 启发式（FA2/FA3 num_splits_heuristic 的适配版）────────
-// 目标：让 total_work = B*H*num_m_blocks*num_splits 恰好填满 SM（~1 wave 且效率高），
-// 同时避免过多 split 带来的 HBM 读写放大（部分结果 fp32 落盘 + combine 回读）。
+// ── Split-KV num_splits cost model（5090D 全 shape 实测拟合）──────────────────
+// 目标：小 grid（B*H*num_m_blocks ≪ num_SMs）时按 K 维切分提升并行度，
+// 同时避免过多 split 带来的读写放大（部分结果 bf16 落盘 + combine 回读）。
+// 与 FA2/FA3 的 waves-efficiency 启发式不同，这里是实测拟合的解析 cost model，
+// 大 grid 自动返回 1（无 split 开销）。
 // 环境变量 FA_NUM_SPLITS > 0 时强制使用指定值（便于按 tile size 微调）。
 inline int fa_mask_sm120_num_splits(const FA_mask_params &params, int kBlockM, int kBlockN) {
     static const int num_sms = []() {
@@ -146,17 +146,32 @@ inline int fa_mask_sm120_num_splits(const FA_mask_params &params, int kBlockM, i
     // K 块太少 → split 收益不足
     if (num_n_blocks <= 4) { return 1; }
 
-    // Cost model（5090D 实测拟合）：T(s) ≈ F + (nb/s)·t_nb·waves + c·s·total
-    //   t_nb: 单 CTA 每 n_block 延迟（d128≈3µs, d64≈1.5µs）；c: combine 每 split 每 tile ≈0.15µs
-    // waves ≤ 1 时对 s 求导得最优 s* = sqrt(nb·t_nb / (c·total))
-    const float t_nb = (params.d == 128) ? 3.0f : 1.5f;
-    constexpr float c_combine = 0.15f;
-    const float s_star = std::sqrt(float(num_n_blocks) * t_nb / (c_combine * float(total_mblocks)));
-    int best = std::max(1, int(s_star + 0.5f));
-    best = std::min({best, kMaxSplits, num_n_blocks});
-    // 不超过 SM 数太多（>1 wave 时效率模型才适用，此处保守 cap 到刚好填满）
+    // Cost model（5090D 全 shape 实测拟合）：T(s) ≈ ceil(nb/s)·K + s·P
+    // 关键洞察：combine kernel 是 3D 并行（CTAs = total·(kBlockM/32)·(d/32)），
+    // grid 未超过 SM 数时其耗时与 total 无关 → 代价项只挂饱和因子 P，不挂 total！
+    // （旧模型 s·total 高估 combine 代价，导致 total≥4 的 shape 最优 s 被系统性压低）
+    // K = 每 n_block 主 kernel 延迟 / combine 单 split 代价，分配置拟合：
+    //   d128 M128=2  d128 M64=8  d64 M128=1  d64 M64=18
+    // 验证：8 个实测 shape 的 s* 预测全部命中实测最优（16/32/16/11/16/48/64/21）
+    // 另：连续 s* 常落在 ceil(nb/s) 尾块不平整的悬崖上（实测 zigzag ±15%），
+    // 因此在 s* 邻域做离散搜索，主 kernel 项用 ceil(nb/s) 精确刻画量化效应：
+    const float K = (params.d == 128)
+        ? ((kBlockM == 64) ? 8.0f : 2.0f)
+        : ((kBlockM == 64) ? 18.0f : 1.0f);
+    const int combine_ctas = total_mblocks * (kBlockM / 32) * (params.d / 32);
+    const float P = std::max(1.0f, float(combine_ctas) / float(num_sms));
+    const float s_star = std::sqrt(float(num_n_blocks) * K / P);
     const int cap_fill = std::max(1, num_sms / std::max(1, total_mblocks));
-    best = std::min(best, std::max(cap_fill, 1));
+    const int hi = std::min({int(s_star) + 8, kMaxSplits, num_n_blocks, cap_fill});
+    const int lo = std::min(std::max(1, int(s_star) - 8), hi);  // 防 lo>hi（s* 大而 cap_fill 小时）
+    int best = 1;
+    float best_cost = 1e30f;
+    for (int s = lo; s <= hi; ++s) {
+        const float cost = float((num_n_blocks + s - 1) / s) * K + float(s) * P;
+        if (cost < best_cost) { best_cost = cost; best = s; }
+    }
+    // M64 护栏：每 split 至少 ~1.3 个 n_block，避免 prologue 占主导的悬崖（实测 s=nb 时劣化 30%+）
+    if (kBlockM == 64) { best = std::min(best, std::max(1, int(num_n_blocks * 0.75f))); }
     return clamp_splits(best);
 }
 
@@ -177,6 +192,37 @@ inline void run_mha_fwd_mask_hdim128_sm120_splitkv(const FA_mask_params &params,
         FA_mask_kernel_traits_sm120<128, 128, 64, 8, 2, /*MaskInSmem_=*/false, /*QInRegs_=*/false, T>
     >(params, stream);
     run_flash_fwd_mask_combine_sm120<128, 128, T>(params, stream);
+}
+
+// ── sm120 Split-KV + Split-M（kBlockM=64, 4 warps）──────────────────────────
+// 小 grid 场景专用：M 维劈半让 m_block 数翻倍，不增加 combine 开销地白捡 2x 并行度；
+// Sq<=64 时也避免了 kBlockM=128 半块 padding 的无效计算。代价：K/V 读取总量 ×2
+// （带宽受限场景可接受，实测 475/1181 GB/s 有余量）。
+inline void run_mha_fwd_mask_hdim64_sm120_splitkv_m64(const FA_mask_params &params, cudaStream_t stream) {
+    using T = cutlass::bfloat16_t;
+    run_flash_fwd_mask_sm120_splitkv<
+        FA_mask_kernel_traits_sm120<64, 64, 64, 4, 2, /*MaskInSmem_=*/true, /*QInRegs_=*/false, T>
+    >(params, stream);
+    run_flash_fwd_mask_combine_sm120<64, 64, T>(params, stream);
+}
+
+inline void run_mha_fwd_mask_hdim128_sm120_splitkv_m64(const FA_mask_params &params, cudaStream_t stream) {
+    using T = cutlass::bfloat16_t;
+    run_flash_fwd_mask_sm120_splitkv<
+        FA_mask_kernel_traits_sm120<128, 64, 64, 4, 2, /*MaskInSmem_=*/false, /*QInRegs_=*/false, T>
+    >(params, stream);
+    run_flash_fwd_mask_combine_sm120<64, 128, T>(params, stream);
+}
+
+// SM 数查询（供 op.cu 的 split-M 判定使用）
+inline int fa_mask_sm120_num_sms() {
+    static const int num_sms = []() {
+        int dev = 0, n = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n > 0 ? n : 1;
+    }();
+    return num_sms;
 }
 
 } // namespace FA_MASK_NAMESPACE

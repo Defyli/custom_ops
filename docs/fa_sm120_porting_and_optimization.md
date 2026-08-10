@@ -3,7 +3,7 @@
 > **硬件**：RTX 5090D（GB202，sm_120，170 SMs，~100KB smem/CTA，cuBLAS bf16 实测峰值 **235 TFLOPS**）
 > **软件**：CUDA 12.9 / PyTorch / CUTLASS+CuTe（thirdparty）
 > **算子**：带任意加法 mask 的 FA2 Forward（bf16，d∈{64,128}，支持 GQA）
-> **最终结果**：标准场景 **160~197 TFLOPS**（cuBLAS 峰值的 70~85%，SDPA 的 **2~2.7x**）；小 grid 长序列场景相对无 split 基线 **8.3~37.5x**，相对 SDPA **15~53x**
+> **最终结果**：标准场景 **160~197 TFLOPS**（cuBLAS 峰值的 70~85%，SDPA 的 **2~2.7x**）；小 grid 长序列场景相对无 split 基线 **8.3~37.5x**，相对 SDPA **17~63x**
 
 ---
 
@@ -22,6 +22,7 @@
      - [7.9 Split KV kernel 随 Sk 的耗时分解](#79-split-kv-kernel-随-sk-的耗时分解)
      - [7.10 Roofline 分析](#710-roofline-分析)
      - [7.11 NCU 详细指标总结](#711-ncu-详细指标总结)
+   - [Phase 8：Combine v2 + PDL + Split-M——小 grid 再进一轮](#phase-8combine-v2--pdl--split-m小-grid-再进一轮)
 4. [最终性能全景](#4-最终性能全景)
 5. [经验总结：可复用的方法论](#5-经验总结可复用的方法论)
 
@@ -123,7 +124,7 @@ FA3 的核心优化之一是 producer/consumer warp specialization。我们完�
 
 - **cuBLAS bf16 实测峰值 235.2 TFLOPS**，我们 d64/d128 均已达其 **~80%**
 - d64：stall 干净（long_scoreboard 0.8%，0 bank conflict）→ 接近极致
-- d128：long_scoreboard 6.8%（gmem 直读 mask/Q 的延迟）+ 2 万次 smem bank conflict → 加 mask 双缓冲软件流水（提前一轮发射 ldg）
+- d128：long_scoreboard 6.8%（gmem 直读 mask/Q 的延迟）→ 加 mask 双缓冲软件流水（提前一轮发射 ldg）。另有 2 万次 smem bank conflict（load 侧），但相对 6713 万次 smem load wavefronts 冲突率仅 **0.03%**（≈0.01% 运行时影响），确认无需处理
 
 同期验证并否决的方向：CUDA 12.9 升级 + LOAD256/STORE256 向量化 epilogue（epilogue 仅占 ~5% 耗时，收益 <1%）、`ld.global.b256` PTX 语法修正（改用 cute `.v8.f32`）。
 
@@ -213,76 +214,77 @@ splitkv 每 CTA 只跑 2~4 个 n_block，深流水线无意义；把 d128 的 QI
 
 #### 7.9 Split KV kernel 随 Sk 的耗时分解
 
-用 nsys kernel-level 对 d128 Sq=128 auto-split 做了 Sk 扫描（每个 Sk 跑 50 次取均值），拆出主 kernel 与 combine kernel 的各自耗时，用于看清谁是瓶颈、谁波动大：
+用 nsys kernel-level 对 d128 Sq=128 auto-split 做了 Sk 扫描（每个 Sk 跑 50 次取均值），拆出主 kernel 与 combine kernel 的各自耗时，用于看清谁是瓶颈、谁波动大。**下表为 Phase 8 优化后数据**（主 kernel 走 Split-M M64 变体，combine 走自适应 tile + PDL），括号内为 Phase 7 末的旧值：
 
 | Sk | splitkv 主 kernel (µs) | combine kernel (µs) | 端到端 (µs) |
 |---:|---:|---:|---:|
-| 1024 | 5.98 | 3.67 | 9.65 |
-| 2048 | 9.21 | 4.67 | 13.87 |
-| 4096 | 9.31 | 6.44 | 15.75 |
-| 8192 | 12.43 | 8.86 | 21.29 |
-| 16384 | 15.47 | 10.74 | 26.21 |
-| 32768 | 27.72 | 10.69 | 38.41 |
-| 65536 | 52.03 | 10.68 | 62.71 |
+| 1024 | 5.86 (5.98) | 1.87 (3.67) | 7.73 (9.65) |
+| 2048 | 6.05 (9.21) | 4.51 (4.67) | 10.57 (13.87) |
+| 4096 | 7.93 (9.31) | 5.67 (6.44) | 13.61 (15.75) |
+| 8192 | 9.82 (12.43) | 7.81 (8.86) | 17.63 (21.29) |
+| 16384 | 13.75 (15.47) | 9.66 (10.74) | 23.41 (26.21) |
+| 32768 | 19.05 (27.72) | 14.57 (10.69) | 33.61 (38.41) |
+| 65536 | 35.09 (52.03) | 14.52 (10.68) | 49.61 (62.71) |
 
 ![SplitKV 与 Combine kernel 耗时随 Sk 变化](assets/kernel_time_vs_sk.png)
 
 **关键观察**：
-1. **主 kernel 是瓶颈，且波动大**：Sk 翻倍时耗时近似线性翻倍；Sk ≥ 32768 后斜率变陡（L2 容量 96MB 放不下 2×Sk×128B 的 K+V，开始大量 DRAM 回流）。
-2. **combine kernel 几乎不随 Sk 变化**：它的 work 只由 (Sq, num_splits, d) 决定。Sk 增长只让 num_splits 略增（auto cost model），导致 8K 之后缓慢爬升到 ~10.7µs 就饱和。
-3. **小 Sk 时 combine 占比可达 40%**（1024 时 3.67/9.65），说明 cost model 的 num_splits 下限保护是必要的——否则极小 Sk 会被过度 split。
+1. **主 kernel 仍随 Sk 增长但大幅变浅**：Split-M 让 32K/64K 分别改善 21%/33%（每 CTA 的 n_block 数减半，流水延迟下限的影响被摊薄）。Sk ≥ 32768 后斜率依然变陡（L2 96MB 放不下 K+V 的 DRAM 回流）。
+2. **combine 在小 Sk 显著改善**（1K 时 3.67→1.87µs，自适应 16×16 tile + PDL），但在 s 触及 64 上限的极端 Sk（32K/64K）略有回退（10.7→14.6µs）——小 tile 的 LSE 重复读取在高 split 数下被放大。端到端仍 -12%/-21%，属于可接受的取舍。
+3. **小 Sk 时 combine 占比已降至 24%**（1024 时 1.87/7.73，旧版为 38%），cost model 与 combine 的协同改善明显。
 
 #### 7.10 Roofline 分析
 
 **机器峰值**（实测）：cuBLAS bf16 GEMM = **234.2 TFLOPS**；DRAM triad（bf16 c=a+b）= **1180.7 GB/s**；ridge point = 234.2e12 / 1180.7e9 ≈ **198.4 FLOP/B**。
 
-两个 kernel 的 operating point（Sq=128 Sk=8192 d128，NCU `--clock-control none` 不锁频 + NCU 实测 DRAM bytes）：
+两个 kernel 的 operating point（Sq=128 Sk=8192 d128，NCU `--clock-control none` 不锁频 + NCU 实测 DRAM bytes）。**下表为 Phase 8 后数据**（主 kernel 为 Split-M M64 变体，combine 为 16×16 自适应 tile），括号内为旧值：
 
 | Kernel | Arithmetic Intensity (FLOP/B) | Achieved TF | Achieved BW (GB/s) | 瓶颈判定 |
 |---|---:|---:|---:|---|
-| splitkv 主 kernel | **84.5** | 35.8 | 424.5 | ridge 左侧（AI<198）→ **带宽受限**，实测达 ridge 上限的 36% |
-| combine kernel | **1.14** | ~0 | 85.8 | 纯带宽 kernel，AI≈1 → **DRAM 受限** |
-| （对照）SDPA MemEff 同 shape | 84.5* | 14.9 | — | 同 AI，但 achieved TF 仅 14.9 → 带宽利用率 1/2.4 |
+| splitkv 主 kernel | **84.5** | 40.1 (35.8) | 475 (424) | ridge 左侧（AI<198）→ **带宽受限**，达 ridge 上限的 40% (36%) |
+| combine kernel | **0.96** (1.14) | ~0 | 66 (86) | 纯带宽 kernel → **并行度受限**（SM active 8.6%→30.4%，long_scoreboard 58.9%→29.1%） |
+| （对照）SDPA MemEff 同 shape | 84.5* | 14.9 | — | 同 AI，但 achieved TF 仅 14.9 → 带宽利用率 1/2.7 |
 
-\* 同计算量、同访存量级，AI 与 splitkv 主 kernel 相同；SDPA 慢 2.4× 等价于带宽利用率仅 1/2.4。
+\* 同计算量、同访存量级，AI 与 splitkv 主 kernel 相同；SDPA 慢 2.7× 等价于带宽利用率仅 1/2.7。
+
+注：combine 的 NCU 串行化测量看不到 PDL 的启动重叠收益——其 wall-clock 改善体现在 nsys/e2e（此 shape 8.86→7.81µs，Sk=1024 时 3.67→1.87µs）。
 
 ![Roofline 分析](assets/roofline.png)
 
 **结论**：
-1. 两个 kernel 都在 ridge 左侧（**带宽受限**），这与 NCU 显示的 `smsp__cycles_active` 仅 22.4% 一致——SM 不是瓶颈，DRAM 才是。
-2. splitkv 主 kernel 达 ridge 上限的 36%，说明仍有 ~3× 的带宽挖掘空间（当前 424 GB/s vs 峰值 1181 GB/s）。瓶颈是单 CTA 的 TMA 发射节奏 + L2 局部性，不是 SM 算力。
-3. combine kernel 带宽利用率仅 7.3%——因为它 grid 太小（4×1×4 CTA，仅 4 个 SM 在跑），是典型的**并行度受限**而非带宽受限。3D grid 已比 v1 提升 10×，但绝对值仍低，说明 Sq=128 时 combine 的并行度天花板就在这里。
+1. 两个 kernel 都在 ridge 左侧（**带宽受限**）——SM 不是瓶颈，DRAM/并行度才是。
+2. splitkv 主 kernel 达 ridge 上限的 40%（Split-M 后 SM active 22.4%→29.9%，wall-clock 12.4→9.8µs），仍有 ~2.5× 的带宽挖掘空间（475 GB/s vs 峰值 1181 GB/s）。瓶颈是单 CTA 的 TMA 发射节奏 + L2 局部性，不是 SM 算力。
+3. combine kernel 并行度大幅改善（grid 16→64 CTA，SM active ×3.5），但绝对带宽利用率仍低——Sq=128 时 combine 的并行度天花板就在这里。
 
 #### 7.11 NCU 详细指标总结
 
-配置：B=1 H=1 Sq=128 Sk=8192 d=128，`--clock-control none`（不锁频，Duration 接近 wall clock）。
+配置：B=1 H=1 Sq=128 Sk=8192 d=128，`--clock-control none`（不锁频，Duration 接近 wall clock）。**下表为 Phase 8 后数据**：主 kernel 为 Split-M M64 变体（4 warps），combine 为 16×16 自适应 tile + PDL；括号内为 Phase 7 末旧值（M128 + 32×32 tile）。
 
 | 指标 | splitkv 主 kernel | combine kernel | 说明 |
 |---|---:|---:|---|
-| **Duration (µs)** | 14.98 | 17.06 | 单次 launch，NCU 有 profile 开销，比 nsys 偏大 |
-| Grid | (51,1,1) | (4,1,4) | splitkv grid=51×num_m_blocks；combine 3D=16 |
-| Block | (256,1,1) | (128,1,1) | 8/4 warps per CTA |
-| **SM Active (smsp__cycles_active)** | 22.4% | 8.6% | 远低于 100% → 并行度/带宽受限 |
-| **DRAM Throughput** | 32.1% | 6.5% | 主 kernel 跑到峰值 1/3；combine 仅 6.5% |
-| **Occupancy (warps_active)** | 15.9% | 8.3% | 极低，寄存器/smem 限制了 CTA 数 |
-| waves_per_SM | 0.30 | 0.01 | 主 kernel 51 CTA/170 SM < 1 wave；combine 16 CTA 更少 |
-| Regs/Thread | 191 | 56 | splitkv 因 QInRegs 占用大 |
-| Smem/Block | 99.4 KB | 9.2 KB | splitkv d128 3 级流水 + Q 占满 |
-| DRAM Read | 6.36 MB | 1.46 MB | K/V/mask vs O_partial/LSE |
-| DRAM Write | 0 B | 0 B | 写都被 L2 拦截（combine 写 O 因 grid 小未 flush） |
-| L2 Read Sectors | 252,701 | 57,376 | 主 kernel L2 命中后仍回流的量 |
-| L2 Write Sectors | 53,810 | 1,037 | partial 写 → L2 |
-| FMA pipe active | 0.72% | 0.17% | 非 FMA 重计算 |
-| **Stall: long_scoreboard** | **16.9%** | **58.9%** | 主因！combine 58.9% = gmem 等待 |
-| Stall: barrier | 6.6% | 28.0% | mbarrier 等待；combine 有 __syncthreads |
-| Stall: wait | 15.9% | 4.9% | 当前 FA 流水 wait |
-| Stall: no_instruction | 3.2% | 2.2% | I-cache 命中 |
-| Stall: short_scoreboard | 1.7% | 2.7% | smem 等待 |
-| Stall: mio_throttle | 1.9% | 0.02% | MIO 队列 |
+| **Duration (µs)** | 13.38 (14.98) | 16.48 (17.06) | NCU 串行化测量，PDL 收益不可见，以 nsys 为准 |
+| Grid | (64,1,1) ((51,1,1)) | (8,1,8)=64 ((4,1,4)=16) | M64: 2 m_block×32 split；combine CTA ×4 |
+| Block | (128,1,1) ((256,1,1)) | (128,1,1) | M64 变体 4 warps |
+| **SM Active** | 29.9% (22.4%) | 30.2% (8.6%) | 并行度均显著提升 |
+| **DRAM Throughput** | 36.1% (32.1%) | 5.0% (6.5%) | 主 kernel 带宽利用率提高 |
+| **Occupancy (warps_active)** | 8.2% (15.9%) | 7.4% (8.3%) | M64 每 CTA warps 减半，总并行度靠 CTA 数 |
+| waves_per_SM | 0.38 (0.30) | 0.05 (0.01) | 仍 < 1 wave |
+| Regs/Thread | 191 (191) | 62 (56) | |
+| Smem/Block | 83.0 KB (99.4) | 5.1 KB (9.2) | M64 smem 需求下降 |
+| DRAM Read | 6.36 MB (6.36) | 1.09 MB (1.46) | combine 少读 25%（自适应 tile 消除越界超读） |
+| L2 Read Sectors | 372,527 (252,701) | 47,458 (57,376) | 主 kernel +47%：Split-M 使 K/V 读两遍（预期内代价） |
+| L2 Write Sectors | 33,550 (53,810) | 2,062 (1,037) | partial 写 -38%（M64 每 split 行数减半） |
+| FMA pipe active | 0.80% (0.72%) | 0.21% (0.17%) | |
+| **Stall: long_scoreboard** | 24.8% (16.9%) | **29.1% (58.9%)** | combine 的 gmem 等待减半 |
+| Stall: barrier | 2.2% (6.6%) | 62.6% (28.0%) | combine 的 barrier 含 PDL `cudaGridDependencySynchronize` 主动等待（预期的重叠行为，非问题） |
+| Stall: wait | 21.9% (15.9%) | 2.0% (4.9%) | |
+| Stall: no_instruction | 3.1% (3.2%) | 2.7% (2.2%) | |
+| Stall: short_scoreboard | 2.1% (1.7%) | 0.9% (2.7%) | |
+| Stall: mio_throttle | 2.2% (1.9%) | 0% (0.02%) | |
 
 **指标解读**：
-- **splitkv 主 kernel**：long_scoreboard 16.9%（gmem TMA 等待）+ barrier 6.6% + wait 15.9% = ~40% 的 warp 时间在等数据/同步。SM Active 仅 22.4% 说明 51 个 CTA 没填满 170 个 SM，且每个 CTA 内部也有大量 stall。这是**带宽 + 并行度双受限**的典型表现——cost model 选 s=51 是为了平衡 mainloop 与 combine，但从纯算力看还有空间。
-- **combine kernel**：long_scoreboard **58.9%** 占绝对主导——4 个 CTA 在等 DRAM 读 O_partial，而 4 个 CTA 远填不满 170 SM。Duration 17µs 中有近 10µs 在纯等 DRAM。这就是为什么 combine 在小 grid 下是瓶颈，以及为什么 3D grid 并行化（把 1 CTA 拆成 16 CTA）能带来 10× 收益——它把并行度从 1 拉到 16，long_scoreboard 占比虽仍高但绝对耗时大降。
+- **splitkv 主 kernel（M64）**：SM Active 22.4%→29.9%，wall-clock 12.4→9.8µs（nsys）。代价清晰可见：L2 read +47%（K/V 被 2 个 m_block 各读一遍），long_scoreboard 24.8%（每 CTA 仅 2 个 n_block，流水线基本不进稳态，TMA 等待占比必然偏高）。这是用带宽换并行度的主动交易——roofline 上距离带宽天花板仍有 2.5×，划算。
+- **combine kernel**：long_scoreboard 58.9%→29.1% 是自适应 tile（16→64 CTA）的直接效果；barrier 62.6% 主要是 PDL 的 grid 依赖等待（与主 kernel 收尾重叠，属于设计行为）。DRAM 读取量本身也降了 25%。
 
 ---
 
@@ -302,22 +304,71 @@ splitkv 每 CTA 只跑 2~4 个 n_block，深流水线无意义；把 d128 的 QI
 
 ---
 
+### Phase 8：Combine v2 + PDL + Split-M——小 grid 再进一轮
+
+基于 §7.9~7.11 的 profile 结论（主 kernel 带宽/并行度双受限、combine 并行度受限、双 kernel 间有 3.4µs launch 空隙），本轮打了三个靶向优化，叠加 cost model 的一次重要修正。
+
+#### 8.1 Combine kernel v2：自适应 tile + PDL + 活跃位掩码
+
+- **自适应 tile**：tile 从固定 32×32 变为模板参数（kRows×kCols），host 端按 grid 规模选择——32×32 CTA 数 < 128 时先切列（32×16，grid z 翻倍）、再切行（16×16，grid x 翻倍），目标 ≥128 CTA 接近吃满 170 SM。kCols 下限 16：每行 16×2B=32B 恰好 1 个 DRAM sector，再小会浪费带宽
+- **PDL（Programmatic Dependent Launch）**：combine 以 `cudaLaunchAttributeProgrammaticStreamSerialization` 启动、kernel 内 `cudaGridDependencySynchronize()` 等待上游——combine 的启动/前缀与 splitkv 主 kernel 收尾重叠，回收双 kernel 间的 launch 空隙
+- **活跃 split 位掩码**：Phase1 归约出 CTA-uniform 的 64-bit 位掩码 `s_active`，Phase2 以 4 个 split 为一组**整组跳过**全零组（被 mask 的 split 不读 O_partial，省带宽）；配套 4 路独立 load+FMA 链展开，在途字节 ×4 暴露 MLP
+
+#### 8.2 Split-M（kBlockM=64 变体）：不增加 combine 开销的 2x 并行度
+
+依据：splitkv 主 kernel waves/SM 仅 0.30，而 Sq=128 只有 1 个 m_block。**Split-M 让 m_block 数翻倍，输出行天然独立、不产生任何 combine 归约开销**。代价是 K/V 读取总量 ×2（带宽受限场景可接受，实测 424/1181 GB/s 有余量）。触发条件（`fa_fwd_op.cu`）：`Sq<=64`（避免 M128 半块 padding 浪费）或 grid < 0.5 wave。新增 d64/d128 两个 M64 splitkv 模板实例（4 warps），可用 `FA_SPLITM=0` 禁用。
+
+#### 8.3 Cost model v2：饱和因子修正（本轮最重要的认知更新）
+
+初版模型 `T(s) = ceil(nb/s)·K + s·total_mblocks` 拟合时出现**打地鼠**：在 Sq=128 上拟合的 K 会让 Sq=1024/GQA 的 s 系统性偏小（回退 +10%），修完又反过来弄坏 Sq=512。把 8 个 shape 的实测最优 s 全部摊开反推后发现：**最优 s 几乎不随 total_mblocks 变化**——combine 是 3D 并行 kernel，grid 未饱和前其耗时与 total 无关，`s·total` 惩罚项根本是错的。修正为：
+
+```
+T(s) = ceil(nb/s)·K + s·P
+P = max(1, combine_ctas / num_SMs)   # combine grid 未饱和时 P=1
+K（分配置拟合）: d128 M128=2  d128 M64=8  d64 M128=1  d64 M64=18
+```
+
+**8 个实测 shape 的 s* 预测全部命中实测最优**（16/32/16/11/16/48/64/21）。另修复 `s*` 很大而 `cap_fill` 很小时 `lo > hi` 导致搜索循环不执行、静默返回 1 的边界 bug。
+
+#### 8.4 附带捕获的两个坑
+
+1. **`__reduce_or_sync` 只有 32-bit 重载**：归约 64-bit 活跃位掩码时被隐式截断，**splits 32~63 的活跃位丢失**导致结果错误。修复：高低 32-bit 分别 reduce 再拼。该 bug 只在 num_splits>32 且高号 split 整段被 mask 时触发，常规回归难以覆盖。
+2. **扩展加载的 fast-path 陷阱**：`custom_ops` 框架的 `.so 已存在 → 直接 dlopen` 快速路径**不做源码时间戳/哈希检查**。本轮一度出现 .o 已重编译但 .so 未重链接、源码修改完全没进二进制的情况， benchmark "怎么改都没变化"——删 .so 强制重编译后才恢复。**改 C++ 源码后必须确认重编译真实发生**（ nsys 看 grid 维度是最直接的验证手段）。
+3. **mask scale 语义 bug（本轮最重要捕获）**：引入不规则形状 + **有限值随机 mask**（非 0/-inf）的全面测试后，19/100 用例全灭。定位为 kernel 把 mask 加到**未缩放**的 QK^T 上、随后 softmax 统一乘 scale——即实际计算的是 `softmax((S+mask)·scale)` 而非 SDPA 语义的 `softmax(S·scale+mask)`，有限值 mask 被错误地乘了 1/√d。**该 bug 对 0/-inf mask 完全隐形**（-inf×正数仍为 -inf），此前所有回归（zero mask、-inf 随机、整段屏蔽）一个都抓不到它。修复：7 处 mask 应用点（sm120 三个 kernel 的 smem/gmem 两路 + sm89 base kernel）统一乘 `1/scale_softmax` 预还原。修复后 100/100 全过。**教训：边界语义的测试矩阵必须包含有限值随机 mask——只测 0/-inf 等于没测 mask 的数值路径。**
+
+#### 8.5 本轮收益（auto 模式，vs 上轮文档值）
+
+| Shape | 上轮 | 本轮 | Δ |
+|---|---:|---:|---:|
+| d128 Sq=128 Sk=8192 | 24.7µs | **18.5µs** | -25% |
+| d128 Sq=128 Sk=32768 | 41.2µs | **34.9µs** | -15% |
+| d128 Sq=512 Sk=8192 | 28.8µs | **24.6µs** | -14% |
+| d128 Sq=1024 Sk=8192 | 36.2µs | **32.8µs** | -9% |
+| d128 GQA H2/Hk1 Sq512 Sk16K | 51.8µs | **49.3µs** | -5% |
+| d64 Sq=128 Sk=8192 | 20.7µs | **12.3µs** | **-40%** |
+| d64 Sq=1024 Sk=8192 | 24.2µs | **20.5µs** | -15% |
+| d64 GQA H2/Hk1 Sq512 Sk16K | 36.3µs | **32.5µs** | -11% |
+
+标准场景 8 个 shape 中 7 个在 ±1% 以内（路径完全不变）；B32 H16 1024² d128 表观 +4.4%，经新旧二进制同环境对测（1544 vs 1567µs）确认为**测量时代漂移 ~2.4% + 同源码不同构建的布局噪声 ~2%**，主 kernel 源码本轮零改动，非真实回退。
+
+---
+
 ## 4. 最终性能全景
 
 ### 4.1 小 grid + 长序列（splitkv 自动生效，SDPA 走 MemEfficient 后端）
 
 | Shape | custom (auto) | SDPA | 加速比 |
 |---|---|---|---|
-| d128 Sq=128 Sk=8192 | 24.7µs (21.8 TF) | 553.5µs | **22.4x** |
-| d128 Sq=128 Sk=32768 | 41.2µs (52.1 TF) | 2199.0µs | **53.3x** |
-| d128 Sq=512 Sk=8192 | 28.8µs (74.7 TF) | 553.6µs | **19.3x** |
-| d128 Sq=1024 Sk=8192 | 36.2µs (118.6 TF) | 555.0µs | **15.3x** |
-| d128 H=2 Hk=1 Sq=512 Sk=16384 (GQA) | 51.8µs (165.7 TF) | 1104.1µs | **21.3x** |
-| d64 Sq=128 Sk=8192 | 20.7µs | 432.6µs | **20.9x** |
-| d64 Sq=1024 Sk=8192 | 24.2µs (88.9 TF) | 436.5µs | **18.1x** |
-| d64 H=2 Hk=1 Sq=512 Sk=16384 (GQA) | 36.3µs (118.4 TF) | 867.2µs | **23.9x** |
+| d128 Sq=128 Sk=8192 | 18.5µs (29.0 TF) | 553.5µs | **29.9x** |
+| d128 Sq=128 Sk=32768 | 34.9µs (61.6 TF) | 2199.0µs | **63.0x** |
+| d128 Sq=512 Sk=8192 | 24.6µs (87.1 TF) | 553.6µs | **22.5x** |
+| d128 Sq=1024 Sk=8192 | 32.8µs (130.8 TF) | 555.0µs | **16.9x** |
+| d128 H=2 Hk=1 Sq=512 Sk=16384 (GQA) | 49.3µs (174.4 TF) | 1104.1µs | **22.4x** |
+| d64 Sq=128 Sk=8192 | 12.3µs | 432.6µs | **35.2x** |
+| d64 Sq=1024 Sk=8192 | 20.5µs (104.6 TF) | 436.5µs | **21.3x** |
+| d64 H=2 Hk=1 Sq=512 Sk=16384 (GQA) | 32.5µs (132.3 TF) | 867.2µs | **26.7x** |
 
-> 对照组：SDPA FlashAttention 后端（**不支持 mask**，仅作参照）在同 shape 无 mask 时为 20.6/43.2/41.1µs——我们**带 mask** 达到 24.7/41.1/35.7µs，Sk=32768 与 Sq=1024 时**反超 Flash 后端**。
+> 对照组：SDPA FlashAttention 后端（**不支持 mask**，仅作参照）在同 shape 无 mask 时为 20.6/43.2/41.1µs——我们**带 mask** 达到 18.5/34.9/24.6µs，三个 shape **全部反超 Flash 后端**。
 
 ### 4.2 标准场景（splitkv 自动退化单 kernel，无开销）
 
@@ -335,8 +386,31 @@ splitkv 每 CTA 只跑 2~4 个 n_block，深流水线无意义；把 d128 的 QI
 
 ### 4.3 精度
 
-- 全路径（base / persistent / splitkv s∈{2..64} ∪ auto）× 10 组 shape（含 GQA、非对齐 seqlen、随机 -inf mask、整段屏蔽）回归 **ALL PASS**
+- 全路径（base / persistent / splitkv s∈{2..64} ∪ auto / Split-M M64）× 10 组 shape（含 GQA、非对齐 seqlen、随机 -inf mask、整段屏蔽）回归 **ALL PASS**
 - vs SDPA：`allclose(atol=0.01, rtol=0.02)` 全过，max_abs_err ≤ 0.002（bf16 partial 无可感知精度损失）
+
+### 4.4 不规则形状鲁棒性（业务序列长度如 Sk=2201）
+
+**20 组不规则形状 × 5 种 mask（zero / 随机 -inf / 整行屏蔽 / 尾部 17% 屏蔽 / 有限值随机偏置）= 100 用例，vs SDPA 全部 PASS**（atol=0.01, rtol=0.02）。形状覆盖：Sk=2201/3333/4097/12345 等非对齐长度、Sq∈{1,31,64,65,129} 边界、GQA 3:1/2:1、奇数 batch/头、1×1 退化、大 grid 不规则（2047×2049）。
+
+性能（zero mask，vs SDPA MemEfficient）：
+
+| Shape | custom | SDPA | 加速比 |
+|---|---:|---:|---:|
+| B1 H1 Sq128 **Sk=2201** d128 | 18.7µs | 160.3µs | **8.6x** |
+| B1 H1 Sq128 **Sk=2201** d64 | 18.5µs | 125.4µs | **6.8x** |
+| B2 H4/2 Sq512 Sk=2201 d128 (GQA) | 41.0µs | 250.6µs | **6.1x** |
+| B1 H1 Sq777 Sk3333 d128 | 28.7µs | 244.0µs | **8.5x** |
+| B3 H6/3 Sq1000 Sk2201 d128 (GQA) | 132.7µs | 345.7µs | **2.6x** |
+| B1 H3/1 Sq640 Sk5000 d64 (GQA 3:1) | 32.8µs | 278.5µs | **8.5x** |
+| B1 H1 Sq128 Sk30000 d128 | 43.1µs | 2016.7µs | **46.8x** |
+| B1 H2/1 Sq500 Sk12345 d128 (GQA) | 61.5µs | 863.0µs | **14.0x** |
+| B1 H1 Sq65 Sk8193 d128（跨 m_block 边界） | 26.7µs | 564.9µs | **21.2x** |
+| B1 H1 Sq1 Sk1 d128（退化） | 14.6µs | 31.3µs | **2.1x** |
+| B1 H16 Sq1000 Sk1000 d64（标准不规则） | 34.9µs | 77.0µs | **2.2x** |
+| B4 H16/4 Sq2047 Sk2049 d128（GQA 大 grid） | 839.5µs | 2065.1µs | **2.5x** |
+
+> 不规则形状下 splitkv 的 ceil 区间划分 + host 端双向 padding（-inf 填充）工作正常；tail-blocked mask（尾部 17% 列屏蔽，模拟真实变长 batch）与有限值随机偏置（ALiBi 风格）均数值正确。
 
 ---
 
@@ -355,4 +429,5 @@ splitkv 每 CTA 只跑 2~4 个 n_block，深流水线无意义；把 d128 的 QI
 |---|---|
 | `FA_NUM_SPLITS=n` | 强制 split 数（0=auto cost model） |
 | `FA_SPLITKV=0` | 禁用 split KV |
+| `FA_SPLITM=0` | 禁用 splitkv 的 kBlockM=64（Split-M）变体 |
 | `FA_PERSISTENT=1` | 启用 persistent kernel（d128 部分场景 +2~5%） |
