@@ -36,10 +36,14 @@
 
 using namespace cute;
 
-// ── 带 mask smem 的 fwd kernel traits ───────────────────────────────────────
+// ── 带 mask smem 的 fwd kernel traits ───────────────────────────────────────────
+// kStages_：K/V/Mask 多级缓冲级数（仅 splitkv 双缓冲路径使用，默认 1 = 单缓冲）。
+//   kStages=1 时各布局/尺寸与历史版本完全一致（base/splitkv 单缓冲路径零改动）；
+//   kStages>1 时提供 *Staged 布局别名，K/V/Mask 各 kStages 级（sm120 多级流水的
+//   cp.async 对应物），smem 预算 = Q + kStages×(K+V+Mask)。
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
          bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, bool MaskQFull_=false,
-         typename elem_type=cutlass::bfloat16_t,
+         typename elem_type=cutlass::bfloat16_t, int kStages_=1,
          typename Base=Flash_fwd_kernel_traits<
              kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
              Is_Q_in_regs_, Share_Q_K_smem_, elem_type>>
@@ -60,6 +64,8 @@ struct FA_mask_kernel_traits : public Base {
     // MaskQFull_=true：host 保证 mask_seqlen_q % kBlockM == 0，编译期裁掉 mask 行谓词
     // 路径（copy_if → 无谓词 copy），消除谓词张量的寄存器开销（生产主场景）
     static constexpr bool kMaskQFull = MaskQFull_;
+    // K/V/Mask 多级缓冲级数（1 = 单缓冲，2 = splitkv 双缓冲路径）
+    static constexpr int kStages = kStages_;
 
     // ── Mask SmemLayout ────────────────────────────────────────────────────
     // 参照 hstu_mask.h 中 SmemLayoutMask 的做法：
@@ -80,6 +86,28 @@ struct FA_mask_kernel_traits : public Base {
         SmemLayoutAtomMask{},
         Shape<Int<kBlockM>, Int<kBlockN>, _1>{}
     ));
+
+    // ── 多级缓冲布局（kStages > 1 时使用）───────────────────────────────
+    // K/V: (kBlockN, kHeadDim, kStages)；V 转置视图 sVt(d, n, s) = sV(n, d, s)
+    // （布局组合方式与 sm120 的 SmemLayoutVtransposed 一致）
+    using SmemLayoutKVStaged = decltype(tile_to_shape(
+        typename Base::SmemLayoutAtomQ{},
+        Shape<Int<kBlockN>, Int<kHeadDim>, Int<kStages_>>{}));
+    using SmemLayoutVtransposedStaged = decltype(composition(
+        SmemLayoutKVStaged{},
+        make_layout(Shape<Int<kHeadDim>, Int<kBlockN>, Int<kStages_>>{},
+                    make_stride(Int<kBlockN>{}, _1{}, Int<kBlockN * kHeadDim_>{}))));
+    using SmemLayoutVtransposedStagedNoSwizzle =
+        decltype(get_nonswizzle_portion(SmemLayoutVtransposedStaged{}));
+    // Mask: (kBlockM, kBlockN, kStages)
+    using SmemLayoutMaskStaged = decltype(tile_to_shape(
+        SmemLayoutAtomMask{},
+        Shape<Int<kBlockM>, Int<kBlockN>, Int<kStages_>>{}));
+    // 双缓冲 smem 总量（Q 单缓冲 + K/V/Mask × kStages）
+    static constexpr int kSmemSizeStaged =
+        Base::kSmemQSize
+        + 2 * kStages_ * kBlockN_ * kHeadDim_ * int(sizeof(Element))
+        + kStages_ * kBlockM_ * kBlockN_ * int(sizeof(Element));
 
     // ── GmemTiledCopyMask：cp.async 128-bit ─────────────────────────────
     // 参照 hstu_mask.h 的 GmemTiledCopyMask（等同于 GmemTiledCopyRab）

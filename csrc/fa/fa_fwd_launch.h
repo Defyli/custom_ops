@@ -2,9 +2,12 @@
  * Flash Attention Forward with Additive Mask — Launch Templates
  *
  * 按架构/场景分发的 host-side 入口：
- *   sm89（RTX 4090）基线：run_mha_fwd_mask_hdim{64,128}
- *     hdim64  : kBlockM=128, kBlockN=128, 4 warps, smem=80KB（动态 smem）
- *     hdim128 : kBlockM=64,  kBlockN=64,  4 warps, smem=56KB
+*   sm89（RTX 4090）基线：run_mha_fwd_mask_hdim{64,128}
+*     hdim64  : kBlockM=128, kBlockN=128, 4 warps, smem=80KB（动态 smem）
+*     hdim128 : kBlockM=64,  kBlockN=64,  4 warps, smem=56KB
+*   sm89 Split-KV（自 sm120 移植）：小 grid + 长序列时自动启用（cost model 决定
+*     num_splits），部分结果 bf16 落盘 + combine 归约；combine kernel 为 sm89
+*     自有独立副本（sm89/fa_fwd_kernel.h，与 sm120 完全解耦，可各自调优）
  *   sm120（Blackwell consumer, RTX 50）主路径：run_mha_fwd_mask_hdim{64,128}_sm120
  *     TMA + mbarrier 多级流水（见 fa_fwd_sm120.h 文件头的设计说明）
  *   （persistent kernel 与主 kernel 的 M64 变体均实测负收益，已从分发中移除）
@@ -240,6 +243,140 @@ inline int fa_mask_sm120_num_sms() {
         return n > 0 ? n : 1;
     }();
     return num_sms;
+}
+
+// SM 数查询（供 op.cu 的 sm89 Split-M 判定使用；与 sm120 同名 helper 各自独立）
+inline int fa_mask_sm89_num_sms() {
+    static const int num_sms = []() {
+        int dev = 0, n = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n > 0 ? n : 1;
+    }();
+    return num_sms;
+}
+
+// ── sm89 Split-KV 路径 ──────────────────────────────────────────────────────
+// （combine kernel 与其启动器 run_flash_fwd_mask_combine_sm89 定义在
+//   sm89/fa_fwd_kernel.h，与 sm120 路径完全解耦）
+
+// sm89 Split-KV num_splits cost model（结构与 fa_mask_sm120_num_splits 相同）：
+//   T(s) ≈ ceil(nb/s)·K + s·P
+//   K = 每 n_block 主 kernel 延迟 / combine 单 split 代价
+//   P = combine 饱和因子（小 grid 时为纯延迟下限 P0，大 grid 时 ~combine_ctas/SM）
+// 参数在 RTX 4090D（128 SM）上用 8 个小-grid shape 的 num_splits 全量
+// sweep（s ∈ {2..64}）网格搜索拟合：max regret 13.7%，mean 7.3%。
+//   K：d64 (128,128) tile = 3.5，d128 (64,64) tile = 2.25；P0 = 0.35
+//   d128 K=2.25 系 DB 混合分派后重拟合（旧 SB-only 标定 K=1.75，混合分派后
+//   实测 s* 上移；重拟合后 max regret 11.7%、mean 7.3%，较 K=1.75 改善
+//   ~4pp；剩余 regret 主要来自 ceil(nb/s) 量化 zigzag，解析模型难精细刻画）
+//   cap_fill = 2×SM/total：允许至多 2 wave（实测 1 wave 精确对齐时尾效应
+//   最重（exact-wave 一致性劣化 10~30%），留 2 wave 余量反而更优）
+inline int fa_mask_sm89_num_splits(const FA_mask_params &params, int kBlockM, int kBlockN) {
+    static const int num_sms = []() {
+        int dev = 0, n = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n > 0 ? n : 1;
+    }();
+    const int num_m_blocks = (params.seqlen_q + kBlockM - 1) / kBlockM;
+    const int num_n_blocks = (params.seqlen_k + kBlockN - 1) / kBlockN;
+    const int total_mblocks = params.b * params.h * num_m_blocks;
+
+    auto clamp_splits = [&](int s) {
+        return std::max(1, std::min(s, num_n_blocks));
+    };
+
+    constexpr int kMaxSplits = 64;   // combine kernel smem 上界（kMaxSplits*32*4B = 8KB）
+    if (total_mblocks >= 0.8f * num_sms) { return 1; }
+    if (num_n_blocks <= 4) { return 1; }
+
+    const float K = (kBlockN == 64) ? ((params.d == 128) ? 2.25f : 2.5f) : 3.5f;
+    const int combine_ctas = total_mblocks * (kBlockM / 32) * (params.d / 32);
+    const float P = std::max(0.35f, float(combine_ctas) / float(num_sms));
+    const float s_star = std::sqrt(float(num_n_blocks) * K / P);
+    const int cap_fill = std::max(1, (2 * num_sms) / std::max(1, total_mblocks));
+    const int hi = std::min({int(s_star) + 8, kMaxSplits, num_n_blocks, cap_fill});
+    const int lo = std::min(std::max(1, int(s_star) - 8), hi);
+    int best = 1;
+    float best_cost = 1e30f;
+    for (int s = lo; s <= hi; ++s) {
+        const float cost = float((num_n_blocks + s - 1) / s) * K + float(s) * P;
+        if (cost < best_cost) { best_cost = cost; best = s; }
+    }
+    return clamp_splits(best);
+}
+
+inline void run_mha_fwd_mask_hdim64_splitkv(const FA_mask_params &params, cudaStream_t stream) {
+    using T = cutlass::bfloat16_t;
+    // 与 base 同配置：(128, 128, 8 warps)，mask q 维对齐时走无谓词变体
+    if (params.mask_seqlen_q % 128 == 0) {
+        run_flash_fwd_with_mask_splitkv<
+            FA_mask_kernel_traits<64, 128, 128, 8, false, false, /*MaskQFull_=*/true, T>
+        >(params, stream);
+    } else {
+        run_flash_fwd_with_mask_splitkv<
+            FA_mask_kernel_traits<64, 128, 128, 8, false, false, /*MaskQFull_=*/false, T>
+        >(params, stream);
+    }
+    run_flash_fwd_mask_combine_sm89<64, T>(params, stream);
+}
+
+inline void run_mha_fwd_mask_hdim128_splitkv(const FA_mask_params &params, cudaStream_t stream) {
+    using T = cutlass::bfloat16_t;
+    // (64, 64, 4 warps)，双缓冲（kStages=2）：Q(16KB) + K/V×2(64KB) + Mask×2(16KB) = 96KB ≤ 99KB。
+    // 实测（4090D，交错 A/B）：双缓冲消除每 tile 的两次串行往返等待，在每 CTA
+    // tile 数较少（≤16）时快 4~10%；但稳态循环吞吐略低（运行期 stage 偏移的
+    // 寻址开销 + 96KB smem 限制单 CTA/SM），tile 数多（≥32）的长串行运行慢 2~8%
+    // → 按 tiles_per_cta 混合分发。
+    // d64-M64 不能套用此结论：其 tile 计算量减半而 smem 32KB→56KB 使 occupancy
+    // 从 2~3 CTA/SM 掉到 1，实测 DB 慢 10~40%，保持单缓冲。
+    const int nb = (params.seqlen_k + 63) / 64;                 // kBlockN = 64
+    const int tiles_per_cta = (nb + params.num_splits - 1) / params.num_splits;
+    const bool use_db = (tiles_per_cta <= 16);
+    if (use_db) {
+        if (params.mask_seqlen_q % 64 == 0) {
+            run_flash_fwd_with_mask_splitkv<
+                FA_mask_kernel_traits<128, 64, 64, 4, false, false, /*MaskQFull_=*/true, T, /*kStages_=*/2>
+            >(params, stream);
+        } else {
+            run_flash_fwd_with_mask_splitkv<
+                FA_mask_kernel_traits<128, 64, 64, 4, false, false, /*MaskQFull_=*/false, T, /*kStages_=*/2>
+            >(params, stream);
+        }
+    } else {
+        if (params.mask_seqlen_q % 64 == 0) {
+            run_flash_fwd_with_mask_splitkv<
+                FA_mask_kernel_traits<128, 64, 64, 4, false, false, /*MaskQFull_=*/true, T>
+            >(params, stream);
+        } else {
+            run_flash_fwd_with_mask_splitkv<
+                FA_mask_kernel_traits<128, 64, 64, 4, false, false, /*MaskQFull_=*/false, T>
+            >(params, stream);
+        }
+    }
+    run_flash_fwd_mask_combine_sm89<128, T>(params, stream);
+}
+
+// ── sm89 Split-KV + Split-M（kBlockM=64，仅 d64；自 sm120 同名策略移植）──────────
+// 小 grid 场景：M 维劈半让 m_block 数翻倍，不增加 combine 开销地提升并行度；
+// Sq<=64 时也避免 kBlockM=128 半块 padding 的无效计算。
+// 代价：K/V 读取总量 ×2（小 grid 带宽充裕，L2 可容纳米 swipe）
+inline void run_mha_fwd_mask_hdim64_splitkv_m64(const FA_mask_params &params, cudaStream_t stream) {
+    using T = cutlass::bfloat16_t;
+    // (64, 64, 4 warps)：与 sm120 的 d64 M64 变体同 tile 配置。
+    // 不用双缓冲：tile 计算量减半（d64）+ smem 32KB→56KB 使 occupancy 从 2~3 CTA/SM
+    // 掉到 1 CTA/SM，实测（4090D 交错 A/B）DB 慢 10~40%，单缓冲严格更优
+    if (params.mask_seqlen_q % 64 == 0) {
+        run_flash_fwd_with_mask_splitkv<
+            FA_mask_kernel_traits<64, 64, 64, 4, false, false, /*MaskQFull_=*/true, T>
+        >(params, stream);
+    } else {
+        run_flash_fwd_with_mask_splitkv<
+            FA_mask_kernel_traits<64, 64, 64, 4, false, false, /*MaskQFull_=*/false, T>
+        >(params, stream);
+    }
+    run_flash_fwd_mask_combine_sm89<64, T>(params, stream);
 }
 
 } // namespace FA_MASK_NAMESPACE

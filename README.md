@@ -5,8 +5,9 @@
 面向生成式推荐系统场景的高性能 CUDA 算子库。核心算子 `mha_fwd_with_mask` 是支持
 **任意加法 mask**（0=可见 / -inf=屏蔽）的 FlashAttention-2 前向实现，针对消费级
 Blackwell（RTX 5090D, sm120）深度优化：TMA + mbarrier 多级流水线、Split KV 自适应
-并行，性能显著超越 PyTorch SDPA；同时内置 sm89（RTX 40）cp.async 基线路径，
-非 Blackwell GPU 开箱即用，实测同样稳定超越 SDPA（见下方性能小节）。
+并行，性能显著超越 PyTorch SDPA；同时内置 sm89（RTX 4090D）cp.async 路径，已自
+sm120 移植 Split-KV + Split-M + 双缓冲三项优化，小 grid 长序列场景同样大幅超越
+SDPA（8~34x），大 grid 保持 1.1~1.9x 优势（见下方性能小节）。
 
 > 完整的移植与优化过程记录见 [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md)。
 
@@ -47,60 +48,69 @@ Blackwell（RTX 5090D, sm120）深度优化：TMA + mbarrier 多级流水线、S
 
 ### RTX 4090D (sm89, bf16)
 
-sm89 走 cp.async 基线 kernel（TMA / 多级流水线 / Split KV 为 sm120 专属优化），
+sm89 走 cp.async 基线 kernel，自 sm120 移植了 **Split-KV + Split-M + 双缓冲**
+三项优化：小 grid 长序列时自动按 K 维切分提升 SM 利用率（cost model 选最优 split
+数），d128 splitkv 在每 CTA tile 数 ≤16 时启用双缓冲（kStages=2）消除 cp.async
+串行往返等待，d64 小 grid 时启用 Split-M（kBlockM=64）翻倍并行度。
 tile 配置：d64 → (M=128, N=128, 8 warps)，d128 → (M=64, N=64, 4 warps)。
-对 SDPA+mask（MemEfficient 后端）保持 **1.14~1.86x** 优势，d128 大 shape 达
-**120+ TFLOPS**。
 
 测试环境：RTX 4090 D（sm_89）/ PyTorch 2.6.0 / CUDA 11.8；benchmark 默认参数
 （mask_ratio=0.1、warmup=10、iters=50，迭代间 256MB L2 刷新，取中位数）。
 
-标准场景（大 grid，全部 9 组）：
+标准场景（大 grid，splitkv 自动退化为单 kernel，全部 9 组）：
 
 | Shape | custom | SDPA+mask | 加速比 |
 |---|---|---|---|
 | d64 B=1 H=16 S=1024 | 73.7µs (58.3 TF) | 84.0µs | **1.14x** |
-| d64 B=4 H=16 S=2048 | 587.8µs (116.9 TF) | 784.4µs | **1.33x** |
-| d64 B=1 H=8 S=8192 | 1166.7µs (117.8 TF) | 1680.4µs | **1.44x** |
-| d64 B=32 H=16 S=1024 | 1196.0µs (114.9 TF) | 1497.1µs | **1.25x** |
+| d64 B=4 H=16 S=2048 | 587.8µs (116.9 TF) | 782.3µs | **1.33x** |
+| d64 B=1 H=8 S=8192 | 1166.3µs (117.8 TF) | 1686.5µs | **1.45x** |
+| d64 B=32 H=16 S=1024 | 1195.0µs (115.0 TF) | 1508.4µs | **1.26x** |
 | d128 B=1 H=16 S=1024 | 103.4µs (83.1 TF) | 170.0µs | **1.64x** |
-| d128 B=4 H=16 S=2048 | 1103.9µs (124.5 TF) | 1941.5µs | **1.76x** |
-| d128 B=1 H=8 S=8192 | 2174.0µs (126.4 TF) | 3815.3µs | **1.76x** |
-| d128 B=4 H=16 Hk=4 S=2048 (GQA) | 1101.7µs (124.8 TF) | 2044.8µs | **1.86x** |
-| d128 B=32 H=16 S=1024 | 2269.2µs (121.1 TF) | 3874.8µs | **1.71x** |
+| d128 B=4 H=16 S=2048 | 1103.8µs (124.5 TF) | 1936.4µs | **1.75x** |
+| d128 B=1 H=8 S=8192 | 2172.9µs (126.5 TF) | 3811.3µs | **1.75x** |
+| d128 B=4 H=16 Hk=4 S=2048 (GQA) | 1099.7µs (125.0 TF) | 2040.8µs | **1.86x** |
+| d128 B=32 H=16 S=1024 | 2269.2µs (121.1 TF) | 3866.6µs | **1.70x** |
 
-小 grid + 长序列场景（sm89 上 Split KV 不生效，全部 8 组）：
+小 grid + 长序列场景（splitkv 自动生效，全部 8 组）：
 
-| Shape | custom | SDPA+mask | 加速比 |
-|---|---|---|---|
-| d128 Sq=128 Sk=8192 | 238.6µs | 431.1µs | **1.81x** |
-| d128 Sq=128 Sk=32768 | 934.9µs | 1694.7µs | **1.81x** |
-| d128 Sq=512 Sk=8192 | 237.6µs | 430.1µs | **1.81x** |
-| d128 Sq=1024 Sk=8192 | 239.5µs (17.9 TF) | 428.0µs | **1.79x** |
-| d128 H=2 Hk=1 Sq=512 Sk=16384 | 473.1µs | 841.7µs | **1.78x** |
-| d64 Sq=128 Sk=8192 | 233.5µs | 411.6µs | **1.76x** |
-| d64 Sq=1024 Sk=8192 | 233.5µs (9.2 TF) | 413.7µs | **1.77x** |
-| d64 H=2 Hk=1 Sq=512 Sk=16384 | 461.8µs | 810.0µs | **1.75x** |
+| Shape | custom | SDPA+mask | 加速比 | SDPA flash* |
+|---|---|---|---|---|
+| d128 Sq=128 Sk=8192 | 22.5µs (23.8 TF) | 462.8µs | **20.55x** | 29.7µs |
+| d128 Sq=128 Sk=32768 | 53.2µs (40.3 TF) | 1824.8µs | **34.27x** | 52.2µs |
+| d128 Sq=512 Sk=8192 | 39.9µs (53.8 TF) | 429.1µs | **10.74x** | 37.9µs |
+| d128 Sq=1024 Sk=8192 | 55.3µs (77.7 TF) | 428.3µs | **7.74x** | 52.2µs |
+| d128 H=2 Hk=1 Sq=512 Sk=16384 | 96.3µs (89.2 TF) | 840.8µs | **8.73x** | 122.9µs |
+| d64 Sq=128 Sk=8192 | 19.5µs (13.8 TF) | 412.6µs | **21.21x** | 16.4µs |
+| d64 Sq=1024 Sk=8192 | 41.8µs (51.3 TF) | 415.7µs | **9.94x** | 33.8µs |
+| d64 H=2 Hk=1 Sq=512 Sk=16384 | 57.3µs (74.9 TF) | 809.0µs | **14.11x** | 69.6µs |
 
-sm89 结果说明：
+> \* SDPA flash 列为不带 mask 的 FlashAttention 后端参照（不支持任意 mask）；
+> 公平对照是 SDPA+mask 列。
 
-- **加速比低于 sm120（2~2.7x）**：sm89 路径是 FA2 式 cp.async 基线，没有 TMA /
-  多级流水线 / persistent 等优化，主要价值是让非 Blackwell GPU 开箱即用；
-  sm89 上也无法超越 SDPA 不带 mask 的 Flash 后端（“带 mask 超 Flash”是
-  sm120 上的现象）。
-- **小 grid 长序列是 sm89 的短板**：Split KV 尚未移植到 sm89，B=1、H=1、Sq=128
-  这类 shape 只启动 1 个 CTA 串行处理 64~256 个 KV 块（延迟受限，耗时基本与 Sk
-  成正比），虽然仍是 SDPA+mask 的 1.75~1.8x，但远落后于内置 KV 切分的 Flash
-  后端（如 d64 Sq=128 Sk=8192 Flash 仅 16µs）——把 splitkv 移植到 sm89 尚有
-  可观优化空间。
-- d64 加速比（1.14~1.44x）低于 d128（1.64~1.86x）：主因是 SDPA MemEfficient
-  在 d64 上本身表现更好（约 88 TF vs d128 的 71 TF），而本算子两种 head dim
-  效率接近（115~126 TF）。
+sm89 优化说明：
+
+- **Split-KV 移植自 sm120**：B=1、H=1、Sq=128 这类小 grid 长序列 shape 原先只启动
+  1 个 CTA 串行处理 64~256 个 KV 块（耗时 234~935µs）；移植 splitkv 后按 K 维切分
+  填满 128 个 SM，耗时降至 19~53µs（**10~18x 提升**），部分 shape 已追平甚至超越
+  SDPA 不带 mask 的 Flash 后端（如 d128 Sq=128 Sk=32768: 53.2µs ≈ Flash 52.2µs；
+  d128 H=2 Hk=1 Sq=512 Sk=16384: 96.3µs < Flash 122.9µs，d64 同 shape 57.3µs < 69.6µs）。
+- **双缓冲混合分派**：d128 splitkv 在 tiles_per_cta ≤16 时启用双缓冲（DB），
+  消除每 tile 的两次串行 cp.async 往返等待，实测快 4~10%；但 DB 的 96KB smem
+  限制单 CTA/SM，tile 数多（≥32）的长串行反而慢 2~8% → 按 tiles_per_cta 混合分派。
+  d64-M64 因 tile 计算量减半 + smem 翻倍使 occupancy 从 2~3 CTA/SM 掉到 1，
+  DB 实测慢 10~40%，保持单缓冲。
+- **Split-M（d64 专用）**：kBlockM=64 让 m_block 数翻倍，不增加 combine 开销地
+  提升并行度；实测 Sq>64 且 total<SM/2 时快 5~21%。Sq≤64 时 m_block 不翻倍、
+  小 tile 反而低效（慢 ~6%），故不采用 sm120 的 Sq≤64 规则。
+- **cost model 独立标定**：sm89 的 K/P0 参数在 4090D（128 SM）上用全 shape sweep
+  拟合（d128 K=2.25, P0=0.35, cap_fill=2×SM/total），DB 混合分派后重拟合；
+  max regret 11.7%、mean 7.3%（剩余 regret 主要来自 ceil(nb/s) 量化 zigzag）。
 
 ## 环境要求
 
 - NVIDIA GPU：sm120（RTX 5090D，TMA 主路径，充分测试）或 sm89（RTX 4090D，
-  cp.async 基线路径，已测试）；其余 sm80+ 架构理论上可编译运行，未验证
+  cp.async 路径（含自 sm120 移植的 Split-KV），已测试）；其余 sm80+ 架构理论上
+  可编译运行，未验证
 - CUDA >= 11.8（sm89 路径）/ >= 12.8（sm120a），GCC >= 9
 - PyTorch >= 2.1（CUDA 版本），bf16
 
@@ -193,11 +203,13 @@ custom_ops/
 ├── recsys.py              # RecsysOps：mha_fwd_with_mask 算子封装
 ├── csrc/
 │   ├── recsys_bindings.cpp        # torch.ops 注册入口
-│   └── fa/                        # FA2 + mask CUDA kernel（sm120 优化）
-│       ├── fa_fwd_op.cu           # 算子入口 / 路径分发
-│       ├── fa_fwd_sm120.h         # sm120 TMA 流水线 kernel / splitkv / persistent
-│       ├── fa_fwd_kernel.h        # 计算 mainloop / softmax / epilogue
-│       └── ...
+│   └── fa/                        # FA2 + mask kernel（sm89 + sm120 双路径，互不依赖）
+│       ├── fa_fwd_op.cu           # 算子入口 / 架构分发
+│       ├── fa_fwd_launch.h        # 各架构 launcher + Split-KV cost model
+│       ├── sm89/fa_fwd_kernel.h   # sm89 cp.async kernel：base / splitkv（DB/SB）/ combine
+│       ├── sm120/fa_fwd_sm120.h   # sm120 TMA 流水线 kernel / splitkv / persistent / combine
+│       ├── cpu/                   # CPU 参考实现（未接入算子分发，仅供参考）
+│       └── common/                # 两路共用的参数包 / softmax / utils
 ├── thirdparty/            # CUTLASS / CuTe（头文件依赖）
 ├── benchmark/             # 性能基准测试
 ├── examples/              # 使用示例

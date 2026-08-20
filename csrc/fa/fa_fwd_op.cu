@@ -184,6 +184,8 @@ torch::Tensor mha_fwd_with_mask_cuda(
     //      > 1 时自动判定 Split-M（Sq<=64 或 grid < 0.5 wave → kBlockM=64 变体）
     //   2. 否则走 base kernel。persistent kernel 已实测全线负收益（+0.2%~+5.1%），
     //      不参与分发（kernel 模板保留在 fa_fwd_sm120.h 作历史参考，不被实例化）
+    // sm89：同构策略（Split-KV cost model 独立标定，无 Split-M 变体），
+    //   小 grid + 长序列（B*H*num_m_blocks ≪ SM 数）时按 K 维切分提升并行度
     at::cuda::CUDAGuard device_guard(q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -222,6 +224,39 @@ torch::Tensor mha_fwd_with_mask_cuda(
         if (d == 64) { run_mha_fwd_mask_hdim64_sm120(params, stream); }
         else         { run_mha_fwd_mask_hdim128_sm120(params, stream); }
     } else {
+        // sm89 路径：小 grid + 长序列时启用 Split-KV（策略/数据布局自 sm120 移植）
+        int num_splits = fa_mask_sm89_num_splits(params, kBlockM, kBlockN);
+        if (num_splits > 1) {
+            // Split-M 判定（仅 d64，sm120 同名策略的 sm89 实测修正版）：
+            //   kBlockM=64 让 m_block 数翻倍，不增加 combine 开销地提升并行度。
+            //   实测（4090D）：Sq>64 且 total<SM/2 时 M64 快 5~21%（细粒度 CTA
+            //   负载均衡 + m_block 翻倍）；Sq<=64 时 m_block 不翻倍，小 tile
+            //   反而低效（实测慢 ~6%）→ 不采用 sm120 的 Sq<=64 规则
+            bool use_m64 = false;
+            if (d == 64) {
+                const int num_sms = fa_mask_sm89_num_sms();
+                const int total_mblocks_m128 = B * H * ceil_div_int(Sq, 128);
+                if ((Sq > 64) && (total_mblocks_m128 < num_sms / 2)) {
+                    use_m64 = true;
+                    num_splits = fa_mask_sm89_num_splits(params, 64, 64);
+                }
+            }
+            // O_partial 用 bf16（partial 流量减半；~0.4% 相对误差 < bf16 输出量化误差），LSE 保持 fp32
+            torch::Tensor oaccum   = torch::empty({num_splits, B, H, Sq_rounded, d}, q.options());
+            torch::Tensor lseaccum = torch::empty({num_splits, B, H, Sq_rounded},
+                                                  q.options().dtype(torch::kFloat32));
+            params.oaccum_ptr   = oaccum.data_ptr();
+            params.lseaccum_ptr = lseaccum.data_ptr();
+            params.num_splits   = num_splits;
+            if (use_m64) {
+                run_mha_fwd_mask_hdim64_splitkv_m64(params, stream);
+            } else if (d == 64) {
+                run_mha_fwd_mask_hdim64_splitkv(params, stream);
+            } else {
+                run_mha_fwd_mask_hdim128_splitkv(params, stream);
+            }
+            return out;
+        }
         if (d == 64) { run_mha_fwd_mask_hdim64(params, stream); }
         else         { run_mha_fwd_mask_hdim128(params, stream); }
     }

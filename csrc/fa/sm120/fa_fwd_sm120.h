@@ -1496,32 +1496,43 @@ void run_flash_fwd_mask_sm120_splitkv(const FA_mask_params &params, cudaStream_t
 
 // combine tile 自适应：小 grid 时缩小 tile 换并行度（目标 ≥ ~128 CTA 接近吃满 170 SM）
 // kCols 最小 16（每行 16×2B=32B 恰好 1 个 sector，再小会浪费 DRAM 带宽）
+// use_pdl：sm90+ 用 PDL 属性与上游 splitkv kernel 重叠启动。
 template<int kHeadDim, int kNThreads, typename Element>
 inline void launch_combine_adaptive(
     const FA_mask_params &params, cudaStream_t stream,
-    const int rows_per_cta, const int cols_per_cta) {
+    const int rows_per_cta, const int cols_per_cta, const bool use_pdl) {
     dim3 grid(params.seqlen_q_rounded / rows_per_cta, params.b * params.h,
               kHeadDim / cols_per_cta);
     #define LAUNCH_COMBINE(R, C) \
         do { \
             auto kernel = &flash_fwd_mask_combine_kernel_sm120<kHeadDim, kNThreads, R, C, Element>; \
-            cudaLaunchConfig_t cfg = {}; \
-            cfg.gridDim = grid; \
-            cfg.blockDim = dim3(kNThreads, 1, 1); \
-            cfg.dynamicSmemBytes = 0; \
-            cfg.stream = stream; \
-            cudaLaunchAttribute attrs[1]; \
-            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; \
-            attrs[0].val.programmaticStreamSerializationAllowed = 1; \
-            cfg.attrs = attrs; \
-            cfg.numAttrs = 1; \
-            cudaLaunchKernelEx(&cfg, kernel, \
-                reinterpret_cast<const Element*>(params.oaccum_ptr), \
-                reinterpret_cast<const float*>(params.lseaccum_ptr), \
-                reinterpret_cast<Element*>(params.o_ptr), \
-                params.num_splits, params.seqlen_q, params.seqlen_q_rounded, \
-                params.h, params.b, \
-                params.o_batch_stride, params.o_head_stride, params.o_row_stride); \
+            if (use_pdl) { \
+                cudaLaunchConfig_t cfg = {}; \
+                cfg.gridDim = grid; \
+                cfg.blockDim = dim3(kNThreads, 1, 1); \
+                cfg.dynamicSmemBytes = 0; \
+                cfg.stream = stream; \
+                cudaLaunchAttribute attrs[1]; \
+                attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; \
+                attrs[0].val.programmaticStreamSerializationAllowed = 1; \
+                cfg.attrs = attrs; \
+                cfg.numAttrs = 1; \
+                cudaLaunchKernelEx(&cfg, kernel, \
+                    reinterpret_cast<const Element*>(params.oaccum_ptr), \
+                    reinterpret_cast<const float*>(params.lseaccum_ptr), \
+                    reinterpret_cast<Element*>(params.o_ptr), \
+                    params.num_splits, params.seqlen_q, params.seqlen_q_rounded, \
+                    params.h, params.b, \
+                    params.o_batch_stride, params.o_head_stride, params.o_row_stride); \
+            } else { \
+                kernel<<<grid, kNThreads, 0, stream>>>( \
+                    reinterpret_cast<const Element*>(params.oaccum_ptr), \
+                    reinterpret_cast<const float*>(params.lseaccum_ptr), \
+                    reinterpret_cast<Element*>(params.o_ptr), \
+                    params.num_splits, params.seqlen_q, params.seqlen_q_rounded, \
+                    params.h, params.b, \
+                    params.o_batch_stride, params.o_head_stride, params.o_row_stride); \
+            } \
         } while (0)
     if (rows_per_cta == 32 && cols_per_cta == 32)      { LAUNCH_COMBINE(32, 32); }
     else if (rows_per_cta == 32 && cols_per_cta == 16) { LAUNCH_COMBINE(32, 16); }
@@ -1543,7 +1554,7 @@ void run_flash_fwd_mask_combine_sm120(const FA_mask_params &params, cudaStream_t
         }
     }
     launch_combine_adaptive<kHeadDim, kNThreads, Element>(
-        params, stream, rows_per_cta, cols_per_cta);
+        params, stream, rows_per_cta, cols_per_cta, /*use_pdl=*/true);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
