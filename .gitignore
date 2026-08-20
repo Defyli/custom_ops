@@ -1,0 +1,19 @@
+# Python 运行时缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# custom_ops JIT 编译缓存（CustomOps.build_dir_fallback，含 .so/.o/lock）
+torch_extensions/
+
+# 编译中间产物
+*.o
+*.obj
+
+# 编辑器 / 操作系统
+*.swp
+*~
+.DS_Store
+
+# benchmark 输出
+result.csv
