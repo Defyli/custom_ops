@@ -1,31 +1,34 @@
-# custom_ops — 支持任意 Mask 的 FlashAttention-2 (sm120/Blackwell 优化)
+# custom_ops — 支持任意 Mask 的 FlashAttention-2
 
 中文 | [English](README_EN.md)
 
-面向生成式推荐系统场景的高性能 CUDA 算子库。核心算子 `mha_fwd_with_mask` 是支持
-**任意加法 mask**（0=可见 / -inf=屏蔽）的 FlashAttention-2 前向实现，针对消费级
-Blackwell（RTX 5090D, sm120）深度优化：TMA + mbarrier 多级流水线、Split KV 自适应
-并行，性能显著超越 PyTorch SDPA；同时内置 sm89（RTX 4090D）cp.async 路径，已自
-sm120 移植 Split-KV + Split-M + 双缓冲三项优化，小 grid 长序列场景同样大幅超越
-SDPA（8~34x），大 grid 保持 1.1~1.9x 优势（见下方性能小节）。
+面向生成式推荐系统的高性能 CUDA 注意力算子库。核心算子 `mha_fwd_with_mask`
+是支持**任意加法 mask**（0=可见 / -inf=屏蔽）的 FlashAttention-2 前向实现，
+深度适配消费级 GPU（sm120 / sm89），带 mask 性能显著优于 PyTorch SDPA。
 
-> 完整的移植与优化过程记录见 [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md)。
+**亮点**
 
-## 特性
+- **任意 mask 直达 softmax**：因果、滑动窗口、padding、随机稀疏（item 级屏蔽）
+  等任意形态，无需改 kernel
+- **sm120（RTX 5090D）**：标准场景 **160~197 TFLOPS**（cuBLAS bf16 实测峰值的
+  70~85%），SDPA+mask 的 **2~2.7x**；小 grid 长序列场景最高 **53x**
+- **sm89（RTX 4090D）**：开箱即用，标准场景 SDPA+mask 的 **1.1~1.9x**，
+  小 grid 长序列场景最高 **34x**
+- **原生 GQA**：K/V 头数整除 Q 头数即可，无需手动扩展
+- **自适应 Split-KV**：cost model 自动选择 split 数，大 grid 自动退化为
+  单 kernel，零开销、无需调参
+- **JIT 自动编译**：首次 import 自动构建，多进程安全，支持
+  `torch.compile`/AOTI
 
-- **任意加法 mask**：bf16 mask 直接参与 softmax（0=可见 / -inf=屏蔽），支持因果、
-  滑动窗口、padding、随机稀疏（item 级屏蔽）等任意形态
-- **GQA 原生支持**：K/V 头数整除 Q 头数即可，无需手动扩展
-- **Split KV 自适应**：小 grid 长序列场景自动拆分 K 维提升 SM 利用率，
-  cost model 选择最优 split 数，大 grid 自动退化为单 kernel 零开销
-- **JIT 编译框架**：`CustomOps` 基类提供自动编译/加载、多进程文件锁、
-  GPU 架构自动探测、`torch.compile`/AOTI fake 注册，可复用于其他自定义算子
+> 完整的移植与优化过程记录见
+> [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md)。
 
 ## 性能
 
 ### RTX 5090D (sm120, bf16)
 
-标准场景：**160~197 TFLOPS**（cuBLAS bf16 实测峰值的 70~85%），SDPA 的 **2~2.7x**：
+标准场景：**160~197 TFLOPS**（cuBLAS bf16 实测峰值的 70~85%），SDPA+mask 的
+**2~2.7x**：
 
 | Shape | custom | SDPA+mask | 加速比 |
 |---|---|---|---|
@@ -34,7 +37,7 @@ SDPA（8~34x），大 grid 保持 1.1~1.9x 优势（见下方性能小节）。
 | d128 B=4 H=16 S=2048 | 776.4µs (177.0 TF) | 1873.7µs | **2.41x** |
 | d128 B=4 H=16 Hk=4 S=2048 (GQA) | 772.1µs (178.0 TF) | 1877.7µs | **2.43x** |
 
-小 grid + 长序列场景（splitkv 自动生效）：SDPA 的 **15~53x**：
+小 grid + 长序列场景（Split-KV 自动生效）：SDPA+mask 的 **15~53x**：
 
 | Shape | custom | SDPA+mask | 加速比 |
 |---|---|---|---|
@@ -48,16 +51,13 @@ SDPA（8~34x），大 grid 保持 1.1~1.9x 优势（见下方性能小节）。
 
 ### RTX 4090D (sm89, bf16)
 
-sm89 走 cp.async 基线 kernel，自 sm120 移植了 **Split-KV + Split-M + 双缓冲**
-三项优化：小 grid 长序列时自动按 K 维切分提升 SM 利用率（cost model 选最优 split
-数），d128 splitkv 在每 CTA tile 数 ≤16 时启用双缓冲（kStages=2）消除 cp.async
-串行往返等待，d64 小 grid 时启用 Split-M（kBlockM=64）翻倍并行度。
-tile 配置：d64 → (M=128, N=128, 8 warps)，d128 → (M=64, N=64, 4 warps)。
+sm89 路径为 cp.async 实现，同样具备自适应 Split-KV（自 sm120 移植）：小 grid
+长序列自动切分 K 维填满 SM，大 grid 自动退化为单 kernel，无需任何配置。
 
-测试环境：RTX 4090 D（sm_89）/ PyTorch 2.6.0 / CUDA 11.8；benchmark 默认参数
-（mask_ratio=0.1、warmup=10、iters=50，迭代间 256MB L2 刷新，取中位数）。
+测试环境：RTX 4090D / PyTorch 2.6.0 / CUDA 11.8，benchmark 默认参数
+（见 [Benchmark](#benchmark) 小节）。
 
-标准场景（大 grid，splitkv 自动退化为单 kernel，全部 9 组）：
+标准场景（大 grid）：
 
 | Shape | custom | SDPA+mask | 加速比 |
 |---|---|---|---|
@@ -71,7 +71,7 @@ tile 配置：d64 → (M=128, N=128, 8 warps)，d128 → (M=64, N=64, 4 warps)�
 | d128 B=4 H=16 Hk=4 S=2048 (GQA) | 1099.7µs (125.0 TF) | 2040.8µs | **1.86x** |
 | d128 B=32 H=16 S=1024 | 2269.2µs (121.1 TF) | 3866.6µs | **1.70x** |
 
-小 grid + 长序列场景（splitkv 自动生效，全部 8 组）：
+小 grid + 长序列场景（Split-KV 自动生效）：
 
 | Shape | custom | SDPA+mask | 加速比 | SDPA flash* |
 |---|---|---|---|---|
@@ -85,26 +85,11 @@ tile 配置：d64 → (M=128, N=128, 8 warps)，d128 → (M=64, N=64, 4 warps)�
 | d64 H=2 Hk=1 Sq=512 Sk=16384 | 57.3µs (74.9 TF) | 809.0µs | **14.11x** | 69.6µs |
 
 > \* SDPA flash 列为不带 mask 的 FlashAttention 后端参照（不支持任意 mask）；
-> 公平对照是 SDPA+mask 列。
+> 公平对照是 SDPA+mask 列。得益于 Split-KV，部分小 grid shape 已追平甚至超过
+> 该参照（如 d128 H=2 Hk=1 Sq=512 Sk=16384: 96.3µs vs 122.9µs）。
 
-sm89 优化说明：
-
-- **Split-KV 移植自 sm120**：B=1、H=1、Sq=128 这类小 grid 长序列 shape 原先只启动
-  1 个 CTA 串行处理 64~256 个 KV 块（耗时 234~935µs）；移植 splitkv 后按 K 维切分
-  填满 128 个 SM，耗时降至 19~53µs（**10~18x 提升**），部分 shape 已追平甚至超越
-  SDPA 不带 mask 的 Flash 后端（如 d128 Sq=128 Sk=32768: 53.2µs ≈ Flash 52.2µs；
-  d128 H=2 Hk=1 Sq=512 Sk=16384: 96.3µs < Flash 122.9µs，d64 同 shape 57.3µs < 69.6µs）。
-- **双缓冲混合分派**：d128 splitkv 在 tiles_per_cta ≤16 时启用双缓冲（DB），
-  消除每 tile 的两次串行 cp.async 往返等待，实测快 4~10%；但 DB 的 96KB smem
-  限制单 CTA/SM，tile 数多（≥32）的长串行反而慢 2~8% → 按 tiles_per_cta 混合分派。
-  d64-M64 因 tile 计算量减半 + smem 翻倍使 occupancy 从 2~3 CTA/SM 掉到 1，
-  DB 实测慢 10~40%，保持单缓冲。
-- **Split-M（d64 专用）**：kBlockM=64 让 m_block 数翻倍，不增加 combine 开销地
-  提升并行度；实测 Sq>64 且 total<SM/2 时快 5~21%。Sq≤64 时 m_block 不翻倍、
-  小 tile 反而低效（慢 ~6%），故不采用 sm120 的 Sq≤64 规则。
-- **cost model 独立标定**：sm89 的 K/P0 参数在 4090D（128 SM）上用全 shape sweep
-  拟合（d128 K=2.25, P0=0.35, cap_fill=2×SM/total），DB 混合分派后重拟合；
-  max regret 11.7%、mean 7.3%（剩余 regret 主要来自 ceil(nb/s) 量化 zigzag）。
+作为参照：未启用 Split-KV 时，小 grid 长序列 shape 只能由单个 CTA 串行处理全部
+KV 块，耗时 234~935µs；Split-KV 自动生效后降至 19~53µs（**10~18x**）。
 
 ## 环境要求
 
@@ -206,7 +191,7 @@ custom_ops/
 │   └── fa/                        # FA2 + mask kernel（sm89 + sm120 双路径，互不依赖）
 │       ├── fa_fwd_op.cu           # 算子入口 / 架构分发
 │       ├── fa_fwd_launch.h        # 各架构 launcher + Split-KV cost model
-│       ├── sm89/fa_fwd_kernel.h   # sm89 cp.async kernel：base / splitkv（DB/SB）/ combine
+│       ├── sm89/fa_fwd_kernel.h   # sm89 cp.async kernel：base / splitkv / combine
 │       ├── sm120/fa_fwd_sm120.h   # sm120 TMA 流水线 kernel / splitkv / persistent / combine
 │       ├── cpu/                   # CPU 参考实现（未接入算子分发，仅供参考）
 │       └── common/                # 两路共用的参数包 / softmax / utils

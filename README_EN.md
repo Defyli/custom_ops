@@ -1,41 +1,38 @@
-# custom_ops — FlashAttention-2 with Arbitrary Mask (Optimized for sm120/Blackwell)
+# custom_ops — FlashAttention-2 with Arbitrary Mask
 
 [中文](README.md) | English
 
-A high-performance CUDA operator library for generative recommender systems. The core
-operator `mha_fwd_with_mask` is a FlashAttention-2 forward implementation supporting
-**arbitrary additive masks** (0 = visible / -inf = masked), deeply optimized for
-consumer Blackwell GPUs (RTX 5090D, sm120) with TMA + mbarrier multi-stage pipelining
-and adaptive Split-KV parallelism — significantly outperforming PyTorch SDPA. An
-sm89 (RTX 4090D) cp.async path is also included, with Split-KV + Split-M +
-double buffering ported from sm120: small-grid long-sequence shapes see **8–34x**
-speedups over SDPA there as well, while large grids keep a **1.1–1.9x** edge
-(see the performance section below).
+A high-performance CUDA attention operator library for generative recommender
+systems. The core operator `mha_fwd_with_mask` is a FlashAttention-2 forward
+implementation supporting **arbitrary additive masks** (0 = visible / -inf = masked),
+deeply optimized for consumer GPUs (sm120 / sm89) and significantly faster than
+PyTorch SDPA with a mask.
+
+**Highlights**
+
+- **Arbitrary masks go straight into softmax**: causal, sliding-window, padding,
+  random-sparse (item-level masking) — any pattern, no kernel changes
+- **sm120 (RTX 5090D)**: **160–197 TFLOPS** on standard shapes (70–85% of the
+  measured cuBLAS bf16 peak), **2–2.7x** over SDPA+mask; up to **53x** on
+  small-grid long-sequence shapes
+- **sm89 (RTX 4090D)**: works out of the box — **1.1–1.9x** over SDPA+mask on
+  standard shapes, up to **34x** on small-grid long-sequence shapes
+- **Native GQA**: K/V head count only needs to divide Q head count,
+  no manual expansion required
+- **Adaptive Split-KV**: a cost model picks the split count automatically;
+  large grids fall back to a single kernel with zero overhead — nothing to tune
+- **JIT build**: the first import compiles automatically (multi-process safe),
+  `torch.compile`/AOTI compatible
 
 > Full record of the porting and optimization journey:
 > [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md) (in Chinese).
-
-## Features
-
-- **Arbitrary additive mask**: bf16 mask participates directly in softmax
-  (0 = visible / -inf = masked) — supports causal, sliding-window, padding,
-  random sparse (item-level masking), or any custom pattern
-- **Native GQA support**: K/V head count only needs to divide Q head count,
-  no manual expansion required
-- **Adaptive Split-KV**: automatically splits along the K dimension for
-  small-grid long-sequence shapes to improve SM utilization; a cost model picks
-  the near-optimal split count, while large-grid shapes fall back to a single
-  kernel with zero overhead
-- **JIT compilation framework**: the `CustomOps` base class provides automatic
-  build/load, multi-process file locking, GPU arch auto-detection, and
-  `torch.compile`/AOTI fake registration — reusable for any custom operator library
 
 ## Performance
 
 ### RTX 5090D (sm120, bf16)
 
 Standard shapes: **160–197 TFLOPS** (70–85% of the measured cuBLAS bf16 peak),
-**2–2.7x** over SDPA:
+**2–2.7x** over SDPA+mask:
 
 | Shape | custom | SDPA+mask | Speedup |
 |---|---|---|---|
@@ -45,7 +42,7 @@ Standard shapes: **160–197 TFLOPS** (70–85% of the measured cuBLAS bf16 peak
 | d128 B=4 H=16 Hk=4 S=2048 (GQA) | 772.1µs (178.0 TF) | 1877.7µs | **2.43x** |
 
 Small-grid + long-sequence shapes (Split-KV kicks in automatically):
-**15–53x** over SDPA:
+**15–53x** over SDPA+mask:
 
 | Shape | custom | SDPA+mask | Speedup |
 |---|---|---|---|
@@ -61,18 +58,15 @@ Small-grid + long-sequence shapes (Split-KV kicks in automatically):
 
 ### RTX 4090D (sm89, bf16)
 
-On sm89 the library runs the cp.async kernel with **Split-KV + Split-M + double
-buffering** ported from sm120: small-grid long-sequence shapes automatically split
-along the K dimension to fill the SMs (a cost model picks the near-optimal split
-count); the d128 splitkv path enables double buffering (kStages=2) when
-tiles-per-CTA ≤ 16 to hide cp.async round-trip latency; small-grid d64 shapes
-enable Split-M (kBlockM=64) to double parallelism.
-Tile configs: d64 → (M=128, N=128, 8 warps), d128 → (M=64, N=64, 4 warps).
+The sm89 path is a cp.async implementation with the same adaptive Split-KV
+ported from sm120: small-grid long-sequence shapes split along the K dimension
+to fill the SMs automatically, while large grids fall back to a single kernel —
+zero configuration needed.
 
-Test setup: RTX 4090 D (sm_89) / PyTorch 2.6.0 / CUDA 11.8; benchmark defaults
-(mask_ratio=0.1, warmup=10, iters=50, 256MB L2 flush between iterations, median).
+Test setup: RTX 4090D / PyTorch 2.6.0 / CUDA 11.8, default benchmark settings
+(see the [Benchmark](#benchmark) section).
 
-Standard shapes (large grid, Split-KV automatically degrades to a single kernel; all 9):
+Standard shapes (large grid):
 
 | Shape | custom | SDPA+mask | Speedup |
 |---|---|---|---|
@@ -86,7 +80,7 @@ Standard shapes (large grid, Split-KV automatically degrades to a single kernel;
 | d128 B=4 H=16 Hk=4 S=2048 (GQA) | 1099.7µs (125.0 TF) | 2040.8µs | **1.86x** |
 | d128 B=32 H=16 S=1024 | 2269.2µs (121.1 TF) | 3866.6µs | **1.70x** |
 
-Small-grid + long-sequence shapes (Split-KV kicks in automatically; all 8):
+Small-grid + long-sequence shapes (Split-KV kicks in automatically):
 
 | Shape | custom | SDPA+mask | Speedup | SDPA flash* |
 |---|---|---|---|---|
@@ -101,34 +95,12 @@ Small-grid + long-sequence shapes (Split-KV kicks in automatically; all 8):
 
 > \* The SDPA flash column is the mask-free FlashAttention backend, shown for
 > reference only (it does not support arbitrary masks); the fair comparison is
-> the SDPA+mask column.
+> the SDPA+mask column. Thanks to Split-KV, some small-grid shapes now match or
+> beat even this reference (e.g. d128 H=2 Hk=1 Sq=512 Sk=16384: 96.3µs vs 122.9µs).
 
-Notes on the sm89 optimizations:
-
-- **Split-KV ported from sm120**: small-grid long-sequence shapes like B=1, H=1,
-  Sq=128 used to launch a single CTA that serially walks 64–256 KV blocks
-  (234–935µs, latency-bound). With Split-KV the K dimension is split to fill
-  all 128 SMs, bringing latency down to 19–53µs (**10–18x faster**). Several
-  shapes now match or beat SDPA's mask-free Flash backend (e.g.
-  d128 Sq=128 Sk=32768: 53.2µs ≈ Flash 52.2µs; d128 H=2 Hk=1 Sq=512 Sk=16384:
-  96.3µs vs Flash 122.9µs; the d64 H=2 shape: 57.3µs vs 69.6µs).
-- **Hybrid double-buffering dispatch**: the d128 splitkv path enables double
-  buffering (DB) when tiles_per_cta ≤ 16, eliminating the two serial cp.async
-  round-trip waits per tile — measured 4–10% faster. But DB's 96KB smem limits
-  occupancy to one CTA/SM, so long serial runs with many tiles (≥32) are 2–8%
-  slower → dispatched per tiles_per_cta. The d64-M64 variant keeps single
-  buffering: halved per-tile compute plus doubled smem drops occupancy from
-  2–3 to 1 CTA/SM, and DB measured 10–40% slower there.
-- **Split-M (d64 only)**: kBlockM=64 doubles the m_block count, boosting
-  parallelism at no extra combine cost — 5–21% faster when Sq > 64 and
-  total < SM/2. When Sq ≤ 64 the m_block count does not double and the smaller
-  tile is actually less efficient (~6% slower), so sm120's Sq≤64 rule is not
-  adopted on sm89.
-- **Independently calibrated cost model**: the sm89 K/P0 parameters were fitted
-  with full-shape num_splits sweeps on the 4090D (d128 K=2.25, P0=0.35,
-  cap_fill = 2×SM/total), refit after the hybrid DB dispatch landed; max regret
-  11.7%, mean 7.3% (the residual regret mostly comes from ceil(nb/s)
-  quantization zigzag that the analytic model cannot capture).
+For reference: without Split-KV, small-grid long-sequence shapes are processed
+by a single CTA serially walking all KV blocks, taking 234–935µs — with
+Split-KV enabled automatically this drops to 19–53µs (**10–18x**).
 
 ## Requirements
 
@@ -232,7 +204,7 @@ custom_ops/
 │   └── fa/                        # FA2 + mask kernel (sm89 + sm120 paths, decoupled)
 │       ├── fa_fwd_op.cu           # operator entry / arch dispatch
 │       ├── fa_fwd_launch.h        # per-arch launchers + Split-KV cost model
-│       ├── sm89/fa_fwd_kernel.h   # sm89 cp.async kernel: base / splitkv (DB/SB) / combine
+│       ├── sm89/fa_fwd_kernel.h   # sm89 cp.async kernel: base / splitkv / combine
 │       ├── sm120/fa_fwd_sm120.h   # sm120 TMA pipeline kernel / splitkv / persistent / combine
 │       ├── cpu/                   # CPU reference implementation (not wired into dispatch)
 │       └── common/                # shared params / softmax / utils
