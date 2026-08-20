@@ -14,7 +14,10 @@ import sys
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 本仓库根目录 custom_ops/ 自身就是 Python 包（根下有 __init__.py），
+# 需把它的上一级目录加入 sys.path，`import custom_ops` 才能命中包本体。
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../custom_ops（仓库根 = 包根）
+sys.path.insert(0, os.path.dirname(_PKG_ROOT))
 
 from custom_ops import ops  # noqa: E402
 

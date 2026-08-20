@@ -5,7 +5,8 @@
 面向生成式推荐系统场景的高性能 CUDA 算子库。核心算子 `mha_fwd_with_mask` 是支持
 **任意加法 mask**（0=可见 / -inf=屏蔽）的 FlashAttention-2 前向实现，针对消费级
 Blackwell（RTX 5090D, sm120）深度优化：TMA + mbarrier 多级流水线、Split KV 自适应
-并行，性能显著超越 PyTorch SDPA。
+并行，性能显著超越 PyTorch SDPA；同时内置 sm89（RTX 40）cp.async 基线路径，
+非 Blackwell GPU 开箱即用，实测同样稳定超越 SDPA（见下方性能小节）。
 
 > 完整的移植与优化过程记录见 [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md)。
 
@@ -19,7 +20,9 @@ Blackwell（RTX 5090D, sm120）深度优化：TMA + mbarrier 多级流水线、S
 - **JIT 编译框架**：`CustomOps` 基类提供自动编译/加载、多进程文件锁、
   GPU 架构自动探测、`torch.compile`/AOTI fake 注册，可复用于其他自定义算子
 
-## 性能（RTX 5090D, sm120, bf16）
+## 性能
+
+### RTX 5090D (sm120, bf16)
 
 标准场景：**160~197 TFLOPS**（cuBLAS bf16 实测峰值的 70~85%），SDPA 的 **2~2.7x**：
 
@@ -42,10 +45,63 @@ Blackwell（RTX 5090D, sm120）深度优化：TMA + mbarrier 多级流水线、S
 > 注：SDPA 带任意 `attn_mask` 时只能走 MemEfficient 后端（FlashAttention 后端不支持
 > 任意 mask）。部分 shape 下本算子**带 mask 甚至比 SDPA 不带 mask 的 Flash 后端更快**。
 
+### RTX 4090D (sm89, bf16)
+
+sm89 走 cp.async 基线 kernel（TMA / 多级流水线 / Split KV 为 sm120 专属优化），
+tile 配置：d64 → (M=128, N=128, 8 warps)，d128 → (M=64, N=64, 4 warps)。
+对 SDPA+mask（MemEfficient 后端）保持 **1.14~1.86x** 优势，d128 大 shape 达
+**120+ TFLOPS**。
+
+测试环境：RTX 4090 D（sm_89）/ PyTorch 2.6.0 / CUDA 11.8；benchmark 默认参数
+（mask_ratio=0.1、warmup=10、iters=50，迭代间 256MB L2 刷新，取中位数）。
+
+标准场景（大 grid，全部 9 组）：
+
+| Shape | custom | SDPA+mask | 加速比 |
+|---|---|---|---|
+| d64 B=1 H=16 S=1024 | 73.7µs (58.3 TF) | 84.0µs | **1.14x** |
+| d64 B=4 H=16 S=2048 | 587.8µs (116.9 TF) | 784.4µs | **1.33x** |
+| d64 B=1 H=8 S=8192 | 1166.7µs (117.8 TF) | 1680.4µs | **1.44x** |
+| d64 B=32 H=16 S=1024 | 1196.0µs (114.9 TF) | 1497.1µs | **1.25x** |
+| d128 B=1 H=16 S=1024 | 103.4µs (83.1 TF) | 170.0µs | **1.64x** |
+| d128 B=4 H=16 S=2048 | 1103.9µs (124.5 TF) | 1941.5µs | **1.76x** |
+| d128 B=1 H=8 S=8192 | 2174.0µs (126.4 TF) | 3815.3µs | **1.76x** |
+| d128 B=4 H=16 Hk=4 S=2048 (GQA) | 1101.7µs (124.8 TF) | 2044.8µs | **1.86x** |
+| d128 B=32 H=16 S=1024 | 2269.2µs (121.1 TF) | 3874.8µs | **1.71x** |
+
+小 grid + 长序列场景（sm89 上 Split KV 不生效，全部 8 组）：
+
+| Shape | custom | SDPA+mask | 加速比 |
+|---|---|---|---|
+| d128 Sq=128 Sk=8192 | 238.6µs | 431.1µs | **1.81x** |
+| d128 Sq=128 Sk=32768 | 934.9µs | 1694.7µs | **1.81x** |
+| d128 Sq=512 Sk=8192 | 237.6µs | 430.1µs | **1.81x** |
+| d128 Sq=1024 Sk=8192 | 239.5µs (17.9 TF) | 428.0µs | **1.79x** |
+| d128 H=2 Hk=1 Sq=512 Sk=16384 | 473.1µs | 841.7µs | **1.78x** |
+| d64 Sq=128 Sk=8192 | 233.5µs | 411.6µs | **1.76x** |
+| d64 Sq=1024 Sk=8192 | 233.5µs (9.2 TF) | 413.7µs | **1.77x** |
+| d64 H=2 Hk=1 Sq=512 Sk=16384 | 461.8µs | 810.0µs | **1.75x** |
+
+sm89 结果说明：
+
+- **加速比低于 sm120（2~2.7x）**：sm89 路径是 FA2 式 cp.async 基线，没有 TMA /
+  多级流水线 / persistent 等优化，主要价值是让非 Blackwell GPU 开箱即用；
+  sm89 上也无法超越 SDPA 不带 mask 的 Flash 后端（“带 mask 超 Flash”是
+  sm120 上的现象）。
+- **小 grid 长序列是 sm89 的短板**：Split KV 尚未移植到 sm89，B=1、H=1、Sq=128
+  这类 shape 只启动 1 个 CTA 串行处理 64~256 个 KV 块（延迟受限，耗时基本与 Sk
+  成正比），虽然仍是 SDPA+mask 的 1.75~1.8x，但远落后于内置 KV 切分的 Flash
+  后端（如 d64 Sq=128 Sk=8192 Flash 仅 16µs）——把 splitkv 移植到 sm89 尚有
+  可观优化空间。
+- d64 加速比（1.14~1.44x）低于 d128（1.64~1.86x）：主因是 SDPA MemEfficient
+  在 d64 上本身表现更好（约 88 TF vs d128 的 71 TF），而本算子两种 head dim
+  效率接近（115~126 TF）。
+
 ## 环境要求
 
-- NVIDIA GPU，compute capability >= 9.0（Hopper / Blackwell，依赖 TMA；已在 sm120 上充分测试）
-- CUDA >= 12.8（sm120a 支持），GCC >= 9
+- NVIDIA GPU：sm120（RTX 5090D，TMA 主路径，充分测试）或 sm89（RTX 4090D，
+  cp.async 基线路径，已测试）；其余 sm80+ 架构理论上可编译运行，未验证
+- CUDA >= 11.8（sm89 路径）/ >= 12.8（sm120a），GCC >= 9
 - PyTorch >= 2.1（CUDA 版本），bf16
 
 ## 快速开始

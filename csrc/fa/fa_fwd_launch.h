@@ -60,19 +60,24 @@ inline void fa_mask_sm120_block_size(int d, int &kBlockM, int &kBlockN) {
 }
 
 // ── hdim = 64 ─────────────────────────────────────────────────────────────────
-// sm89: non-causal 时 128x128 最优（2 CTAs per SM at 80KB smem on RTX4090）
+// sm89: non-causal 时 128x128 最优；kNWarps=8（FA2 同 tile 尺寸的标准配置）。
+// 注：kBlockM=128, kBlockN=128 必须配 8 warps。若用 4 warps，每线程仅累加器就需
+// acc_s(128)+acc_o(64)=192 个 fp32 寄存器，叠加 MMA/mask/地址等状态后远超 255
+// 上限，ptxas 溢出严重（实测 REG:255 + STACK 200B/线程），且主循环内 K/Mask
+// 预加载的 64 位 gmem 地址从溢出槽恢复时高位为垃圾值 → illegal memory access
+// （sm89 实测；8 warps 把累加器压力减半后实测 REG:~200/无溢出，问题消除）。
 inline void run_mha_fwd_mask_hdim64(const FA_mask_params &params, cudaStream_t stream) {
     using T = cutlass::bfloat16_t;
-    // kBlockM=128, kBlockN=128, kNWarps=4
+    // kBlockM=128, kBlockN=128, kNWarps=8（256 threads）
     // smem: Q=16KB + K=16KB + V=16KB + Mask=32KB = 80KB (需要动态 smem)
     // mask q 维对齐 kBlockM 时走编译期无谓词变体（省谓词张量寄存器）
     if (params.mask_seqlen_q % 128 == 0) {
         run_flash_fwd_with_mask<
-            FA_mask_kernel_traits<64, 128, 128, 4, false, false, /*MaskQFull_=*/true, T>
+            FA_mask_kernel_traits<64, 128, 128, 8, false, false, /*MaskQFull_=*/true, T>
         >(params, stream);
     } else {
         run_flash_fwd_with_mask<
-            FA_mask_kernel_traits<64, 128, 128, 4, false, false, /*MaskQFull_=*/false, T>
+            FA_mask_kernel_traits<64, 128, 128, 8, false, false, /*MaskQFull_=*/false, T>
         >(params, stream);
     }
 }
