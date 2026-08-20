@@ -14,7 +14,9 @@
  * @param q     (B, H,  Sq, d)  bfloat16，CUDA，连续
  * @param k     (B, Hk, Sk, d)  bfloat16，CUDA，连续
  * @param v     (B, Hk, Sk, d)  bfloat16，CUDA，连续
- * @param mask  (B, 1,  Sq, Sk) bfloat16，CUDA，连续；加法 mask：0=可见，-inf=屏蔽
+ * @param mask  (B, 1, Sq_mask, Sk_mask) bfloat16，CUDA，连续；加法 mask：0=可见，-inf=屏蔽
+ *              q 维：Sq_mask >= Sq 即可，无需 pad（kernel 内谓词/TMA OOB 处理越界行）
+ *              k 维：Sk_mask == Sk，或预 pad 到 kBlockN(64/128) 整数倍（越界列填 -inf）
  * @return out  (B, H,  Sq, d)  bfloat16
  *
  * 限制：

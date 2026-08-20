@@ -1,13 +1,3 @@
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- *
- * This file is derived from FlashAttention
- * (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License.
- * Modifications: adapted the FA2 launch templates for the additive-mask
- * variant; added sm120 (TMA pipeline / split-KV / persistent) dispatch.
- * See the LICENSE file in the repository root.
- ******************************************************************************/
-
 /*
  * Flash Attention Forward with Additive Mask — Launch Templates
  *
@@ -17,7 +7,7 @@
  *     hdim128 : kBlockM=64,  kBlockN=64,  4 warps, smem=56KB
  *   sm120（Blackwell consumer, RTX 50）主路径：run_mha_fwd_mask_hdim{64,128}_sm120
  *     TMA + mbarrier 多级流水（见 fa_fwd_sm120.h 文件头的设计说明）
- *   sm120 persistent：FA_PERSISTENT=1 时启用（大 grid 消 tail 效应，d128 +2~5%）
+ *   （persistent kernel 与主 kernel 的 M64 变体均实测负收益，已从分发中移除）
  *   sm120 split-KV：grid 填不满 SM 时自动启用（cost model 决定 num_splits，
  *     部分结果 bf16 落盘 + combine 归约）；其 Split-M 变体（kBlockM=64）
  *     在极小 grid 时再把 m_block 翻倍
@@ -32,8 +22,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include "fa_fwd_kernel.h"
-#include "fa_fwd_sm120.h"
+#include "sm89/fa_fwd_kernel.h"
+#include "sm120/fa_fwd_sm120.h"
 
 namespace FA_MASK_NAMESPACE {
 
@@ -75,9 +65,16 @@ inline void run_mha_fwd_mask_hdim64(const FA_mask_params &params, cudaStream_t s
     using T = cutlass::bfloat16_t;
     // kBlockM=128, kBlockN=128, kNWarps=4
     // smem: Q=16KB + K=16KB + V=16KB + Mask=32KB = 80KB (需要动态 smem)
-    run_flash_fwd_with_mask<
-        FA_mask_kernel_traits<64, 128, 128, 4, false, false, T>
-    >(params, stream);
+    // mask q 维对齐 kBlockM 时走编译期无谓词变体（省谓词张量寄存器）
+    if (params.mask_seqlen_q % 128 == 0) {
+        run_flash_fwd_with_mask<
+            FA_mask_kernel_traits<64, 128, 128, 4, false, false, /*MaskQFull_=*/true, T>
+        >(params, stream);
+    } else {
+        run_flash_fwd_with_mask<
+            FA_mask_kernel_traits<64, 128, 128, 4, false, false, /*MaskQFull_=*/false, T>
+        >(params, stream);
+    }
 }
 
 // ── hdim = 128 ────────────────────────────────────────────────────────────────
@@ -86,40 +83,37 @@ inline void run_mha_fwd_mask_hdim128(const FA_mask_params &params, cudaStream_t 
     using T = cutlass::bfloat16_t;
     // kBlockM=64, kBlockN=64, kNWarps=4
     // smem: Q=16KB + K=16KB + V=16KB + Mask=8KB = 56KB (需要动态 smem)
-    run_flash_fwd_with_mask<
-        FA_mask_kernel_traits<128, 64, 64, 4, false, false, T>
-    >(params, stream);
+    if (params.mask_seqlen_q % 64 == 0) {
+        run_flash_fwd_with_mask<
+            FA_mask_kernel_traits<128, 64, 64, 4, false, false, /*MaskQFull_=*/true, T>
+        >(params, stream);
+    } else {
+        run_flash_fwd_with_mask<
+            FA_mask_kernel_traits<128, 64, 64, 4, false, false, /*MaskQFull_=*/false, T>
+        >(params, stream);
+    }
 }
 
 // ── sm120 (Blackwell) 路径：TMA + mbarrier 多级流水 ─────────────────────────
 inline void run_mha_fwd_mask_hdim64_sm120(const FA_mask_params &params, cudaStream_t stream) {
     using T = cutlass::bfloat16_t;
     run_flash_fwd_mask_sm120<
-        FA_mask_kernel_traits_sm120<64, 128, 64, 8, 2, /*MaskInSmem_=*/true, /*QInRegs_=*/false, T>
+        FA_mask_kernel_traits_sm120<64, 128, 64, 8, 2, /*MaskInSmem_=*/true, /*QInRegs_=*/false, /*MaskQFull_=*/false, T>
     >(params, stream);
 }
 
 inline void run_mha_fwd_mask_hdim128_sm120(const FA_mask_params &params, cudaStream_t stream) {
     using T = cutlass::bfloat16_t;
-    run_flash_fwd_mask_sm120<
-        FA_mask_kernel_traits_sm120<128, 128, 64, 8, 3, /*MaskInSmem_=*/false, /*QInRegs_=*/true, T>
-    >(params, stream);
-}
-
-// ── sm120 Persistent kernel 版本 ─────────────────────────────────────────────
-// 1D grid（num_SMs × 2），每个 CTA 步长式取任务，消除大 grid 的 tail 效应。
-inline void run_mha_fwd_mask_hdim64_sm120_persistent(const FA_mask_params &params, cudaStream_t stream) {
-    using T = cutlass::bfloat16_t;
-    run_flash_fwd_mask_sm120_persistent<
-        FA_mask_kernel_traits_sm120<64, 128, 64, 8, 2, /*MaskInSmem_=*/true, /*QInRegs_=*/false, T>
-    >(params, stream);
-}
-
-inline void run_mha_fwd_mask_hdim128_sm120_persistent(const FA_mask_params &params, cudaStream_t stream) {
-    using T = cutlass::bfloat16_t;
-    run_flash_fwd_mask_sm120_persistent<
-        FA_mask_kernel_traits_sm120<128, 128, 64, 8, 3, /*MaskInSmem_=*/false, /*QInRegs_=*/true, T>
-    >(params, stream);
+    // mask q 维对齐 kBlockM 时走编译期无边界路径变体（省 ~14 寄存器，splitkv longK 实测 +15%）
+    if (params.mask_seqlen_q % 128 == 0) {
+        run_flash_fwd_mask_sm120<
+            FA_mask_kernel_traits_sm120<128, 128, 64, 8, 3, /*MaskInSmem_=*/false, /*QInRegs_=*/true, /*MaskQFull_=*/true, T>
+        >(params, stream);
+    } else {
+        run_flash_fwd_mask_sm120<
+            FA_mask_kernel_traits_sm120<128, 128, 64, 8, 3, /*MaskInSmem_=*/false, /*QInRegs_=*/true, /*MaskQFull_=*/false, T>
+        >(params, stream);
+    }
 }
 
 // ── Split-KV num_splits cost model（5090D 全 shape 实测拟合）──────────────────
@@ -127,7 +121,6 @@ inline void run_mha_fwd_mask_hdim128_sm120_persistent(const FA_mask_params &para
 // 同时避免过多 split 带来的读写放大（部分结果 bf16 落盘 + combine 回读）。
 // 与 FA2/FA3 的 waves-efficiency 启发式不同，这里是实测拟合的解析 cost model，
 // 大 grid 自动返回 1（无 split 开销）。
-// 环境变量 FA_NUM_SPLITS > 0 时强制使用指定值（便于按 tile size 微调）。
 inline int fa_mask_sm120_num_splits(const FA_mask_params &params, int kBlockM, int kBlockN) {
     static const int num_sms = []() {
         int dev = 0, n = 0;
@@ -135,11 +128,6 @@ inline int fa_mask_sm120_num_splits(const FA_mask_params &params, int kBlockM, i
         cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
         return n > 0 ? n : 1;
     }();
-    static const int env_splits = []() {
-        const char *e = std::getenv("FA_NUM_SPLITS");
-        return e ? std::atoi(e) : 0;
-    }();
-
     const int num_m_blocks = (params.seqlen_q + kBlockM - 1) / kBlockM;
     const int num_n_blocks = (params.seqlen_k + kBlockN - 1) / kBlockN;
     const int total_mblocks = params.b * params.h * num_m_blocks;
@@ -148,7 +136,6 @@ inline int fa_mask_sm120_num_splits(const FA_mask_params &params, int kBlockM, i
         // ceil 区间划分下 num_splits > num_n_blocks 会产生空 split，无意义
         return std::max(1, std::min(s, num_n_blocks));
     };
-    if (env_splits > 0) { return clamp_splits(env_splits); }
 
     constexpr int kMaxSplits = 64;   // combine kernel smem 上界（kMaxSplits*32*4B = 8KB）
     // grid 已接近填满 SM → 不 split
@@ -189,7 +176,7 @@ inline int fa_mask_sm120_num_splits(const FA_mask_params &params, int kBlockM, i
 inline void run_mha_fwd_mask_hdim64_sm120_splitkv(const FA_mask_params &params, cudaStream_t stream) {
     using T = cutlass::bfloat16_t;
     run_flash_fwd_mask_sm120_splitkv<
-        FA_mask_kernel_traits_sm120<64, 128, 64, 8, 2, /*MaskInSmem_=*/true, /*QInRegs_=*/false, T>
+        FA_mask_kernel_traits_sm120<64, 128, 64, 8, 2, /*MaskInSmem_=*/true, /*QInRegs_=*/false, /*MaskQFull_=*/false, T>
     >(params, stream);
     run_flash_fwd_mask_combine_sm120<128, 64, T>(params, stream);
 }
@@ -198,9 +185,15 @@ inline void run_mha_fwd_mask_hdim128_sm120_splitkv(const FA_mask_params &params,
     using T = cutlass::bfloat16_t;
     // splitkv 专用配置：每 CTA 仅处理数个 n_block，深流水线收益小；
     // 改用 QInRegs=false（Q 走 TMA 批量加载 + ldmatrix，替代 32KB 标量 gmem 直载）+ kStages=2 腾出 smem
-    run_flash_fwd_mask_sm120_splitkv<
-        FA_mask_kernel_traits_sm120<128, 128, 64, 8, 2, /*MaskInSmem_=*/false, /*QInRegs_=*/false, T>
-    >(params, stream);
+    if (params.mask_seqlen_q % 128 == 0) {
+        run_flash_fwd_mask_sm120_splitkv<
+            FA_mask_kernel_traits_sm120<128, 128, 64, 8, 2, /*MaskInSmem_=*/false, /*QInRegs_=*/false, /*MaskQFull_=*/true, T>
+        >(params, stream);
+    } else {
+        run_flash_fwd_mask_sm120_splitkv<
+            FA_mask_kernel_traits_sm120<128, 128, 64, 8, 2, /*MaskInSmem_=*/false, /*QInRegs_=*/false, /*MaskQFull_=*/false, T>
+        >(params, stream);
+    }
     run_flash_fwd_mask_combine_sm120<128, 128, T>(params, stream);
 }
 
@@ -210,17 +203,26 @@ inline void run_mha_fwd_mask_hdim128_sm120_splitkv(const FA_mask_params &params,
 // （带宽受限场景可接受，实测 475/1181 GB/s 有余量）。
 inline void run_mha_fwd_mask_hdim64_sm120_splitkv_m64(const FA_mask_params &params, cudaStream_t stream) {
     using T = cutlass::bfloat16_t;
+    // 注：kStages=3 实测负收益（+18%，d64 M64 tile 小，深流水的额外 barrier 开销摊不薄），保持 2
     run_flash_fwd_mask_sm120_splitkv<
-        FA_mask_kernel_traits_sm120<64, 64, 64, 4, 2, /*MaskInSmem_=*/true, /*QInRegs_=*/false, T>
+        FA_mask_kernel_traits_sm120<64, 64, 64, 4, 2, /*MaskInSmem_=*/true, /*QInRegs_=*/false, /*MaskQFull_=*/false, T>
     >(params, stream);
     run_flash_fwd_mask_combine_sm120<64, 64, T>(params, stream);
 }
 
 inline void run_mha_fwd_mask_hdim128_sm120_splitkv_m64(const FA_mask_params &params, cudaStream_t stream) {
     using T = cutlass::bfloat16_t;
-    run_flash_fwd_mask_sm120_splitkv<
-        FA_mask_kernel_traits_sm120<128, 64, 64, 4, 2, /*MaskInSmem_=*/false, /*QInRegs_=*/false, T>
-    >(params, stream);
+    // 注：QInRegs+3st 实测全 Sk 负收益（M64 每 CTA 仅 2 个 n_block，第 3 级等不到数据、
+    // Q 直载 16KB 标量 ldg 的 prologue 开销反而凸显），保持 Q-TMA + 2 级流水
+    if (params.mask_seqlen_q % 64 == 0) {
+        run_flash_fwd_mask_sm120_splitkv<
+            FA_mask_kernel_traits_sm120<128, 64, 64, 4, 2, /*MaskInSmem_=*/false, /*QInRegs_=*/false, /*MaskQFull_=*/true, T>
+        >(params, stream);
+    } else {
+        run_flash_fwd_mask_sm120_splitkv<
+            FA_mask_kernel_traits_sm120<128, 64, 64, 4, 2, /*MaskInSmem_=*/false, /*QInRegs_=*/false, /*MaskQFull_=*/false, T>
+        >(params, stream);
+    }
     run_flash_fwd_mask_combine_sm120<64, 128, T>(params, stream);
 }
 

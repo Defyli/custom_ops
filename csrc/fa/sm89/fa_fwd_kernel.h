@@ -1,14 +1,3 @@
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- *
- * This file is derived from FlashAttention
- * (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License.
- * Modifications: ported the FA2 compute kernel (compute_attn_1rowblock) to a
- * prefill + arbitrary additive-mask variant; removed dropout/rotary/KV-cache/
- * alibi/local-window/softcap/split-KV logic; added bf16 mask add after QK gemm.
- * See the LICENSE file in the repository root.
- ******************************************************************************/
-
 /*
  * Flash Attention Forward with Additive Mask — Core Compute Kernel
  *
@@ -25,14 +14,16 @@
  *   有限值    → 任意加法偏置（ALiBi 风格）；实现上 mask 先于 scale 加到 acc_s，
  *               应用点乘 1/scale_softmax 预还原（见 apply_mask_from_smem）
  *
- * Mask tensor 的 global mem 格式：(B, seqlen_q_rounded, seqlen_k_rounded)，row-major，bf16
- *   - seqlen_k_rounded = ceil(seqlen_k, kBlockN) * kBlockN（由调用方 pad，越界填 -inf）
- *   - kBlockN（64 或 128）本身是 8 的倍数，保证 cp.async 128-bit 无越界且整 tile 无越界
- *   - 通过 params.mask_ptr / mask_batch_stride / mask_row_stride 寻址
+ * Mask tensor 的 global mem 格式：(B, mask_seqlen_q, mask_seqlen_k)，row-major，bf16
+ *   - q 维：mask_seqlen_q ∈ [seqlen_q, 任意]，无需 pad——copy_g2s_mask 用 cute copy_if
+ *     按行谓词跳过越界行（这些行的输出反正被 epilogue 丢弃）
+ *   - k 维：越界列已由调用方/host pad 成 -inf，kBlockN（64 或 128）是 8 的倍数，
+ *     保证 cp.async 128-bit 无越界且整 tile 无越界
+ *   - 通过 params.mask_ptr / mask_batch_stride / mask_row_stride / mask_seqlen_q 寻址
  *
- * copy_g2s_mask 无需 predicate：
- *   seqlen_k_rounded 是 8 的倍数，gmem 中越界列已填 -inf，
- *   cp.async 128-bit 直接搬整个 tile，越界列的 -inf 自然流入 smem。
+ * copy_g2s_mask 只需行谓词（列方向已由 -inf pad 保证）：
+ *   行坐标 >= params.mask_seqlen_q - m_block*kBlockM 的 copy 向量被 copy_if 跳过，
+ *   对应 smem 行在 prologue 一次性清 0（防止未初始化 smem 的 NaN 垃圾模式）。
  *
  * Smem 布局：
  *   [sQ (kBlockM × kHeadDim, swizzled)]
@@ -53,66 +44,16 @@
 #include "fa_fwd_mask.h"
 
 // 复用 FA2 的工具函数（softmax、gemm、copy、convert_type 等）
-#include "utils.h"
-#include "softmax.h"
+#include "../common/utils.h"
+#include "../common/softmax.h"
+// 与 sm120 共享的参数包
+#include "../common/fa_fwd_params.h"
 
 namespace FA_MASK_NAMESPACE {
 
 using namespace cute;
 
-// ── 扩展参数结构体 ─────────────────────────────────────────────────────────────
-struct FA_mask_params {
-    // QKV
-    void *__restrict__ q_ptr;
-    void *__restrict__ k_ptr;
-    void *__restrict__ v_ptr;
-
-    int64_t q_batch_stride;
-    int64_t k_batch_stride;
-    int64_t v_batch_stride;
-    int64_t q_row_stride;
-    int64_t k_row_stride;
-    int64_t v_row_stride;
-    int64_t q_head_stride;
-    int64_t k_head_stride;
-    int64_t v_head_stride;
-
-    // Output
-    void *__restrict__ o_ptr;
-    int64_t o_batch_stride;
-    int64_t o_row_stride;
-    int64_t o_head_stride;
-
-    // Additive mask: (B, seqlen_q_rounded, seqlen_k_rounded), row-major, bf16
-    // seqlen_q_rounded = ceil(seqlen_q, kBlockM) * kBlockM（由调用方保证，越界填 -inf）
-    // seqlen_k_rounded = ceil(seqlen_k, kBlockN) * kBlockN（由调用方保证，越界填 -inf）
-    // 双向对齐保证 copy_g2s_mask 整 tile 搬运无越界；
-    // kBlockN 本身是 8 的倍数，满足 cp.async 128-bit 要求
-    void *__restrict__ mask_ptr;
-    int64_t mask_batch_stride;    // stride over batch dim
-    int64_t mask_row_stride;      // stride over seqlen_q_rounded = seqlen_k_rounded
-
-    // Dims
-    int b, h, h_k;
-    int h_h_k_ratio;              // h / h_k
-    int seqlen_q, seqlen_k;
-    int seqlen_k_rounded;         // = ceil(seqlen_k, kBlockN) * kBlockN
-    int seqlen_q_rounded;         // = ceil(seqlen_q, kBlockM) * kBlockM
-    int d;                        // head dim
-
-    float scale_softmax;          // 1 / sqrt(d)
-    float scale_softmax_log2;     // log2(e) * scale_softmax
-
-    bool is_bf16;
-
-    // ── Split-KV（num_splits > 1 时有效）─────────────────────────────────────
-    // O_partial: (num_splits, B, H, seqlen_q_rounded, d) bf16，已按各 split 本地 l 归一化
-    // LSE_partial: (num_splits, B, H, seqlen_q_rounded) fp32，lse = m*scale + log(l)
-    void *__restrict__ oaccum_ptr = nullptr;
-    void *__restrict__ lseaccum_ptr = nullptr;
-    int num_splits = 1;
-};
-
+// FA_mask_params 定义见 common/fa_fwd_params.h（sm89/sm120 共用）
 
 // ── 核心计算函数 ───────────────────────────────────────────────────────────────
 // Kernel_traits: FA_mask_kernel_traits<kHeadDim, kBlockM, kBlockN, kNWarps, ...>
@@ -199,11 +140,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
     auto gmem_thr_copy_Mask = gmem_tiled_copy_Mask.get_thread_slice(tidx);
 
     // gMask：全局 mask tensor for this batch，用 local_tile 按 n_block 索引
-    // mask 已由调用方 pad 到 (seqlen_q_rounded, seqlen_k_rounded)，双向均无越界问题
+    // 行数 = mask 实际行数（≥ seqlen_q，无需对齐）；越界行的 copy 由行谓词跳过
     Tensor mMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<const Element*>(params.mask_ptr)
                       + bidb * params.mask_batch_stride),
-        make_shape(params.seqlen_q_rounded, params.seqlen_k_rounded),
+        make_shape(params.mask_seqlen_q, params.seqlen_k_rounded),
         make_stride(params.mask_row_stride, _1{})
     );
     Tensor gMask = local_tile(mMask, Shape<Int<kBlockM>, Int<kBlockN>>{},
@@ -214,6 +155,33 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
     // 避免 4D partition 时内部嵌套 rank 造成 CopyAtom rank-mismatch 编译错误
     auto sMask_s0 = sMask(_, _, _0{});  // 2D: (kBlockM, kBlockN)
     Tensor tQsMask = gmem_thr_copy_Mask.partition_D(sMask_s0);  // (COPY_V, COPY_M, COPY_N)
+
+    // ── mask 行谓词（q 维不 pad）：行坐标 >= mask 实际剩余行数的 copy 向量被跳过 ──
+    // kMaskQFull（host 保证 mask_seqlen_q % kBlockM == 0）时编译期裁掉谓词，纯 copy
+    Tensor cMask   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor tMcMask = gmem_thr_copy_Mask.partition_S(cMask);      // (CPY_V, CPY_M, CPY_N) 坐标
+    Tensor tMpMask = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+    const int mask_rows_left = params.mask_seqlen_q - m_block * kBlockM;
+    if constexpr (!Kernel_traits::kMaskQFull) {
+        #pragma unroll
+        for (int m = 0; m < size<0>(tMpMask); ++m) {
+            #pragma unroll
+            for (int n = 0; n < size<1>(tMpMask); ++n) {
+                tMpMask(m, n) = get<0>(tMcMask(_0{}, m, n)) < mask_rows_left;
+            }
+        }
+        // 边界 CTA：谓词跳过的 smem 行一次性清 0（这些行的输出被 epilogue 丢弃，清 0 仅避免
+        // 未初始化 smem 可能出现的 NaN 位模式；与 cp.async 写入位置不重叠，无 race）
+        if (mask_rows_left < kBlockM) {
+            #pragma unroll
+            for (int m = 0; m < size<1>(tQsMask); ++m) {
+                #pragma unroll
+                for (int n = 0; n < size<2>(tQsMask); ++n) {
+                    if (!tMpMask(m, n)) { clear(tQsMask(_, m, n)); }
+                }
+            }
+        }
+    }
 
     // ── MMA handles ─────────────────────────────────────────────────────────
     typename Kernel_traits::TiledMma tiled_mma;
@@ -260,17 +228,19 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
     }
 
-    // ── copy_g2s_mask：将一个 mask tile 从 gmem 无条件搬到 smem ──────────────
-    // 关键：seqlen_k_rounded 已由调用方对齐到 8（128bit / sizeof(bf16) = 8），
-    // gmem 中越界列已填 -inf，cp.async 128-bit 可以直接搬整个 tile，
-    // 越界列的 -inf 自然流入 sMask，无需任何 predicate 判断。
-    auto copy_g2s_mask = [&](int n_block_id) {
-        // tQsMask 是 3D (COPY_V, COPY_M, COPY_N)，由 partition_D(sMask_s0) 生成
-        // tQgMask(_, _, _, n_block_id) 也是 3D，rank 匹配
-        cute::copy(gmem_tiled_copy_Mask,
-                   tQgMask(_, _, _, n_block_id),
-                   tQsMask);
-    };
+        // ── copy_g2s_mask：将一个 mask tile 从 gmem 搬到 smem（行谓词跳过越界行）──────
+    // 列方向：seqlen_k_rounded 已由调用方对齐到 8（128bit / sizeof(bf16) = 8），
+    // gmem 中越界列已填 -inf，cp.async 128-bit 直接搬整个 tile，越界列的 -inf 自然流入 smem。
+    // 行方向：tMpMask 谓词跳过 mask 实际行数之外的行（q 维无需 pad）。
+auto copy_g2s_mask = [&](int n_block_id) {
+    // tQsMask 是 3D (COPY_V, COPY_M, COPY_N)；tQgMask(_, _, _, n_block_id) rank 匹配
+    if constexpr (Kernel_traits::kMaskQFull) {
+        cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
+    } else {
+        cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
+                      tQgMask(_, _, _, n_block_id), tQsMask);
+    }
+};
 
     // ── apply_mask_from_smem：smem → register，然后对 acc_s 做加法 ───────────
     //

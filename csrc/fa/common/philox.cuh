@@ -1,11 +1,3 @@
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- *
- * This file is derived from FlashAttention
- * (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License.
- * See the LICENSE file in the repository root.
- ******************************************************************************/
-
 // Pytorch also has an implementation of Philox RNG: https://github.com/pytorch/pytorch/blob/8ca3c881db3e3510fcb7725389f6a0633c9b992c/torch/csrc/jit/tensorexpr/cuda_random.h
 #pragma once
 // Philox CUDA.

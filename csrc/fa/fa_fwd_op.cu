@@ -100,36 +100,32 @@ torch::Tensor mha_fwd_with_mask_cuda(
     const int Sk_rounded = ceil_div_int(Sk, kBlockN) * kBlockN;
     const int Sq_rounded = ceil_div_int(Sq, kBlockM) * kBlockM;
 
-    // mask 允许以下合法形状（Sq_mask 为 mask 实际行数，Sk_mask 为实际列数）：
-    //   (B, 1, Sq,         Sk)          — 未 pre-pad，算子内部双向 pad
-    //   (B, 1, Sq,         Sk_rounded)  — 列已 pre-pad
-    //   (B, 1, Sq_rounded, Sk_rounded)  — 双向已 pre-pad（zero-copy）
+    // mask 合法形状（Sq_mask/Sk_mask 为 mask 实际行/列数）：
+    //   q 维：Sq_mask >= Sq 即可，无需对齐——越界行的输出被 epilogue 丢弃，
+    //         sm89 用 cute copy_if 谓词跳过、sm120 由 TMA 原生 OOB zero-fill，均不越界读
+    //   k 维：Sk_mask == Sk（算子内部 pad 到 kBlockN 倍数）或
+    //         Sk_mask >= Sk_rounded 且为 kBlockN 整数倍（调用方预 pad，越界列须填 -inf）
     const int64_t Sq_mask = mask.size(2);
     const int64_t Sk_mask = mask.size(3);
     TORCH_CHECK(
         mask.size(1) == 1
-        && (Sq_mask == Sq || Sq_mask == Sq_rounded)
-        && (Sk_mask == Sk || Sk_mask == Sk_rounded),
-        "mask shape must be (B, 1, Sq_or_Sq_rounded, Sk_or_Sk_rounded)"
+        && Sq_mask >= Sq
+        && (Sk_mask == Sk || (Sk_mask >= Sk_rounded && Sk_mask % kBlockN == 0)),
+        "mask shape must be (B, 1, >=Sq, Sk_or_padded) with k-dim padding aligned to block size"
     );
 
     torch::Tensor mask_padded;
-    const bool sq_needs_pad = (static_cast<int>(Sq_mask) < Sq_rounded);
     const bool sk_needs_pad = (static_cast<int>(Sk_mask) < Sk_rounded);
-    if (!sq_needs_pad && !sk_needs_pad) {
-        // 调用方已双向 pre-pad（zero-copy，确保 contiguous）
+    if (!sk_needs_pad) {
+        // 调用方已 pre-pad k 维（zero-copy，确保 contiguous）
         mask_padded = mask.is_contiguous() ? mask : mask.contiguous();
     } else {
-        // 至少有一个方向需要 pad，填 -inf
-        // torch::nn::functional::pad 的 padding 顺序为从最后维度向前：
-        //   {left_last, right_last, left_2nd_last, right_2nd_last, ...}
-        //   即 {pad_Sk_left, pad_Sk_right, pad_Sq_left, pad_Sq_right}
+        // 只需 pad k 维（最后一维），填 -inf；q 维从不 pad
         const float neg_inf = -std::numeric_limits<float>::infinity();
-        const int pad_sk = sk_needs_pad ? (Sk_rounded - static_cast<int>(Sk_mask)) : 0;
-        const int pad_sq = sq_needs_pad ? (Sq_rounded - static_cast<int>(Sq_mask)) : 0;
+        const int pad_sk = Sk_rounded - static_cast<int>(Sk_mask);
         mask_padded = torch::nn::functional::pad(
             mask,
-            torch::nn::functional::PadFuncOptions({0, pad_sk, 0, pad_sq})
+            torch::nn::functional::PadFuncOptions({0, pad_sk})
             .mode(torch::kConstant).value(neg_inf)
         ).contiguous();
     }
@@ -160,11 +156,12 @@ torch::Tensor mha_fwd_with_mask_cuda(
     params.v_head_stride  = v.stride(1);
     params.o_head_stride  = out.stride(1);
 
-    // mask_padded: (B, 1, Sq_rounded, Sk_rounded) row-major
-    //   batch_stride = stride over batch dim
-    //   row_stride   = Sk_rounded（Sq_rounded 行方向 stride）
+    // mask_padded: (B, 1, mask_seqlen_q, mask_seqlen_k) row-major
+    //   batch_stride = stride over batch dim；row_stride = q 维 stride（= mask 实际列数）
+    //   mask_seqlen_q = 实际行数（≥ Sq，q 维不 pad，kernel 侧谓词/TMA OOB 处理）
     params.mask_batch_stride = mask_padded.stride(0);   // B 维 stride
-    params.mask_row_stride   = mask_padded.stride(2);   // Sq 维 stride（= Sk_rounded）
+    params.mask_row_stride   = mask_padded.stride(2);   // q 维 stride（= mask 实际列数）
+    params.mask_seqlen_q     = static_cast<int>(mask_padded.size(2));
 
     params.b              = B;
     params.h              = H;
@@ -181,41 +178,23 @@ torch::Tensor mha_fwd_with_mask_cuda(
     params.scale_softmax          = softmax_scale;
     params.scale_softmax_log2     = softmax_scale * static_cast<float>(M_LOG2E);
 
-    // ── 启动 kernel ──────────────────────────────────────────────────────────
+    // ── 启动 kernel（全自适应，无环境变量开关）──────────────────────────────
+    // 策略选择（sm120，5090D 全 shape 实测标定）：
+    //   1. Split-KV：cost model 决定 num_splits（大 grid 自动返回 1 → 无开销退化）；
+    //      > 1 时自动判定 Split-M（Sq<=64 或 grid < 0.5 wave → kBlockM=64 变体）
+    //   2. 否则走 base kernel。persistent kernel 已实测全线负收益（+0.2%~+5.1%），
+    //      不参与分发（kernel 模板保留在 fa_fwd_sm120.h 作历史参考，不被实例化）
     at::cuda::CUDAGuard device_guard(q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // 环境变量 FA_PERSISTENT=1 时使用 persistent kernel（1D grid + 步长调度）
-    static const bool use_persistent = []() {
-        const char* env = std::getenv("FA_PERSISTENT");
-        return env && (std::strcmp(env, "1") == 0);
-    }();
-    // 环境变量 FA_SPLITKV=0 可禁用 split KV（默认启用，由启发式决定 num_splits）
-    static const bool splitkv_enabled = []() {
-        const char* env = std::getenv("FA_SPLITKV");
-        return !(env && (std::strcmp(env, "0") == 0));
-    }();
-    // 环境变量 FA_SPLITM=0 可禁用 splitkv 的 kBlockM=64 变体（默认启用）
-    static const bool splitm_enabled = []() {
-        const char* env = std::getenv("FA_SPLITM");
-        return !(env && (std::strcmp(env, "0") == 0));
-    }();
-
-    if (use_sm120 && use_persistent) {
-        if (d == 64) { run_mha_fwd_mask_hdim64_sm120_persistent(params, stream); }
-        else         { run_mha_fwd_mask_hdim128_sm120_persistent(params, stream); }
-        return out;
-    }
-
-    // Split-KV：grid 填不满 SM 时按 K 维切分，多 CTA 并行后 combine 归约
-    if (use_sm120 && splitkv_enabled) {
+    if (use_sm120) {
         int num_splits = fa_mask_sm120_num_splits(params, kBlockM, kBlockN);
         if (num_splits > 1) {
             // Split-M 判定：kBlockM=64 变体让 m_block 数翻倍（不增加 combine 开销地提升并行度）
             //   ① Sq<=64：kBlockM=128 会浪费半块 padding 计算，M64 严格更优
             //   ② grid 严重填不满（< 0.5 wave）：M64 把并行度翻倍
             bool use_m64 = false;
-            if (splitm_enabled) {
+            {
                 const int num_sms = fa_mask_sm120_num_sms();
                 const int64_t grid_ctas =
                     (int64_t)B * H * ceil_div_int(Sq, 128) * num_splits;
@@ -240,9 +219,6 @@ torch::Tensor mha_fwd_with_mask_cuda(
             }
             return out;
         }
-    }
-
-    if (use_sm120) {
         if (d == 64) { run_mha_fwd_mask_hdim64_sm120(params, stream); }
         else         { run_mha_fwd_mask_hdim128_sm120(params, stream); }
     } else {

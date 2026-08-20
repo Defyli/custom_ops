@@ -1,11 +1,3 @@
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- *
- * This file is derived from FlashAttention
- * (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License.
- * See the LICENSE file in the repository root.
- ******************************************************************************/
-
 /**
  * @file flash_namespace_config.h
  * @brief Configuration file for Flash namespace management and isolation

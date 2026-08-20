@@ -1,13 +1,3 @@
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- *
- * This file is derived from FlashAttention
- * (https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License.
- * Modifications: extended Flash_fwd_kernel_traits with smem layout and copy
- * atoms for the bf16 additive mask.
- * See the LICENSE file in the repository root.
- ******************************************************************************/
-
 /*
  * Flash Attention Forward with Multiplicative Mask — Kernel Traits
  *
@@ -42,13 +32,13 @@
 #include <cutlass/numeric_types.h>
 
 // 复用 FA2 Flash_fwd_kernel_traits 基类
-#include "kernel_traits.h"
+#include "../common/kernel_traits.h"
 
 using namespace cute;
 
 // ── 带 mask smem 的 fwd kernel traits ───────────────────────────────────────
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
-         bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false,
+         bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, bool MaskQFull_=false,
          typename elem_type=cutlass::bfloat16_t,
          typename Base=Flash_fwd_kernel_traits<
              kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
@@ -67,6 +57,9 @@ struct FA_mask_kernel_traits : public Base {
     static constexpr int kNWarps    = Base::kNWarps;
     static constexpr int kNThreads  = Base::kNThreads;
     static constexpr bool Has_cp_async = Base::Has_cp_async;
+    // MaskQFull_=true：host 保证 mask_seqlen_q % kBlockM == 0，编译期裁掉 mask 行谓词
+    // 路径（copy_if → 无谓词 copy），消除谓词张量的寄存器开销（生产主场景）
+    static constexpr bool kMaskQFull = MaskQFull_;
 
     // ── Mask SmemLayout ────────────────────────────────────────────────────
     // 参照 hstu_mask.h 中 SmemLayoutMask 的做法：

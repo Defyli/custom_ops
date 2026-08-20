@@ -39,7 +39,7 @@
 #pragma GCC optimize("O3,no-finite-math-only")
 
 #include "fa_fwd_cpu.h"
-#include "fa_fwd_op.h"
+#include "../fa_fwd_op.h"
 
 #include <torch/extension.h>
 #include <omp.h>
