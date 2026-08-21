@@ -14,6 +14,10 @@ mixed_gemm 解决的问题：生成式推荐模型中 bf16 权重精度损失大
 --------
     python benchmark/benchmark_mixed_gemm.py
 
+    # 指定 residual 后端（默认 auto：FP8 可用则 FP8，否则 INT8）
+    python benchmark/benchmark_mixed_gemm.py --backend int8
+    python benchmark/benchmark_mixed_gemm.py --backend fp8
+
     # 指定单个 shape、调整迭代次数
     python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096
     python benchmark/benchmark_mixed_gemm.py --warmup 20 --iters 100
@@ -93,9 +97,7 @@ def mean_rel_err(y, y_ref):
 # 主流程
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_suite(shapes, args):
-    backend = "fp8" if ops.mixed_gemm_fp8_available() else "int8"
-    print(f"\nresidual backend: {backend}（CUDA 编译期决定；int8 为 SM80+ 兼容档）")
+def run_suite(shapes, args, backend):
     header = (
         f"{'shape (M,N,K)':<22}"
         f"{'mixed':>10}{'TF':>8}"
@@ -104,6 +106,8 @@ def run_suite(shapes, args):
         f"{'bf16':>10}"
         f"{'err mixed':>11}{'err bf16':>10}"
     )
+    print(f"\nresidual backend: {backend}"
+          + ("（CUDA 编译期决定；int8 为 SM80+ 兼容档）" if backend == "int8" else ""))
     print(header)
     print("-" * len(header))
 
@@ -162,6 +166,8 @@ def run_suite(shapes, args):
 
 def main():
     parser = argparse.ArgumentParser(description="mixed_gemm benchmark")
+    parser.add_argument("--backend", choices=["auto", "fp8", "int8"], default="auto",
+                        help="residual 后端（默认 auto：FP8 可用则 FP8，否则 INT8）")
     parser.add_argument("--shape", nargs=3, type=int, metavar=("M", "N", "K"),
                         help="指定单个 shape，覆盖默认 shape 集")
     parser.add_argument("--warmup", type=int, default=10)
@@ -184,7 +190,14 @@ def main():
           "mixed 比 bf16 低 2 倍+）")
 
     shapes = [tuple(args.shape)] if args.shape else SHAPES
-    rows = run_suite(shapes, args)
+    if args.backend == "auto":
+        backend = "fp8" if ops.mixed_gemm_fp8_available() else "int8"
+    else:
+        if args.backend == "fp8":
+            assert ops.mixed_gemm_fp8_available(), (
+                "FP8 后端不可用（需编译期 CUDA >= 12.4 且 GPU 为 SM89+）")
+        backend = args.backend
+    rows = run_suite(shapes, args, backend)
 
     if args.csv:
         with open(args.csv, "w") as f:

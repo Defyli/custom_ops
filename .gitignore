@@ -6,6 +6,9 @@ __pycache__/
 # custom_ops JIT 编译缓存（CustomOps.build_dir_fallback，含 .so/.o/lock）
 torch_extensions/
 
+# 原始 TensorRT 插件源码（内部参考代码，506MB，不属于开源仓库）
+3rd/
+
 # 编译中间产物
 *.o
 *.obj

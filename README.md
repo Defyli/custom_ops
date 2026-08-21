@@ -29,13 +29,14 @@
 **混合精度 GEMM `mixed_gemm`**
 
 - **精度 ≈ fp32，速度 > tf32**：权重离线拆分为 bf16 主项 + fp8/int8
-  residual 补偿项，消除权重的系统性舍入偏差（RMS 误差比纯 bf16 低 **2 倍+**，
-  最大误差低 **3.5 倍**），RTX 4090D 上为 fp32 matmul 的 **1.2~2.1x**、
-  tf32 的 **1.1~1.6x**，大 shape 有效算力 **82.9 TFLOPS**
+  residual 补偿项，消除权重的系统性舍入偏差（RMS 误差比纯 bf16 低 **2.3 倍**，
+  最大误差低 **3.9 倍**），RTX 4090D 上为 fp32 matmul 的 **1.3~2.5x**、
+  tf32 的 **1.2~1.6x**，大 shape 有效算力 **100 TFLOPS**
 - **Epilogue 融合**：bias 相加 + silu/gelu 激活融合在 GEMM kernel 内，
   不产生额外 kernel 与中间显存
-- **双 residual 后端**：FP8 e4m3（SM89+，需编译期 CUDA >= 12.4）与
-  INT8 动态量化（SM80+，CUDA 11.8 即可），编译期自动选择
+- **双 residual 后端**：FP8 e4m3（SM89+，需编译期 CUDA >= 12.4，小 M 略快、
+  免 scale 存储）与 INT8 动态量化（SM80+，CUDA 11.8 即可，大 M 更快），
+  精度一致，编译期自动选择
 - **自适应 tile/split-K**：沿用原 TensorRT 插件的 wall-clock 启发式，
   小 M 自动 split-K，无需调参
 
@@ -115,28 +116,43 @@ sm89 路径为 cp.async 实现，同样具备自适应 Split-KV（自 sm120 移�
 作为参照：未启用 Split-KV 时，小 grid 长序列 shape 只能由单个 CTA 串行处理全部
 KV 块，耗时 234~935µs；Split-KV 自动生效后降至 19~53µs（**10~18x**）。
 
-### mixed_gemm（RTX 4090D，INT8 residual 后端）
+### mixed_gemm（RTX 4090D，FP8 / INT8 residual 双后端）
 
-推荐 MLP 层 `silu(x @ W^T + b)`（fp32 权重/输入）：mixed_gemm 为 fp32 matmul 的
-**1.2~2.1x**、tf32 的 **1.1~1.6x**，大 shape 有效算力 **82.9 TFLOPS**；精度接近
-fp32（权重舍入误差被完全消除，误差仅剩激活的无偏舍入噪声，RMS 误差比纯 bf16
-低 2 倍+）。
+推荐 MLP 层 `silu(x @ W^T + b)`（fp32 权重/输入）。测试环境：RTX 4090D /
+PyTorch 2.11 / CUDA 12.8（FP8 与 INT8 后端同机对照）；编译期 CUDA < 12.4 时
+FP8 自动降级 INT8（精度相同）。
 
-| Shape (M,N,K) | mixed | TFLOPS | fp32 | vs fp32 | tf32 | vs tf32 | bf16* |
-|---|---|---|---|---|---|---|---|
-| 16, 4096, 4096 | 103.4µs | 5.2 | 126.0µs | **1.22x** | 112.6µs | **1.09x** | 60.4µs |
-| 64, 4096, 4096 | 110.5µs | 19.4 | 140.3µs | **1.27x** | 119.8µs | **1.08x** | 70.7µs |
-| 256, 4096, 4096 | 142.7µs | 60.2 | 275.5µs | **1.93x** | 211.6µs | **1.48x** | 96.3µs |
-| 1024, 4096, 4096 | 445.6µs | 77.1 | 859.1µs | **1.93x** | 513.0µs | **1.15x** | 317.4µs |
-| 4096, 4096, 4096 | 1657.9µs | 82.9 | 3487.7µs | **2.10x** | 2248.0µs | **1.36x** | 1114.1µs |
-| 512, 4096, 256 | 31.7µs | 33.8 | 58.4µs | **1.84x** | 50.2µs | **1.58x** | 24.6µs |
+mixed_gemm 最优后端为 fp32 matmul 的 **1.3~2.5x**、tf32 的 **1.2~1.6x**，
+大 shape 有效算力 **100 TFLOPS**；精度接近 fp32（权重舍入误差被完全消除，
+误差仅剩激活的无偏舍入噪声）。
 
-精度（4096³，相对 fp32 金标准）：mean rel-err mixed **8.0e-3** vs bf16 1.2e-2；
-RMS 误差 **1.7e-3** vs 3.6e-3（低 2.1x）；最大绝对误差 **1.5e-2** vs 5.5e-2（低 3.5x）。
+| Shape (M,N,K) | mixed FP8 | mixed INT8 | fp32 | vs fp32† | tf32 | bf16* |
+|---|---|---|---|---|---|---|
+| 16, 4096, 4096 | 96.3µs | 103.4µs | 122.9µs | **1.28x** | 117.8µs | 61.4µs |
+| 64, 4096, 4096 | 100.4µs | 109.6µs | 130.8µs | **1.30x** | 122.9µs | 65.5µs |
+| 256, 4096, 4096 | 151.6µs | 145.4µs | 245.8µs | **1.69x** | 210.8µs | 86.8µs |
+| 1024, 4096, 4096 | 511.0µs | 440.4µs | 935.0µs | **2.12x** | 602.1µs | 296.6µs |
+| 4096, 4096, 4096 | 1730.6µs (79.4 TF) | 1374.2µs (100.0 TF) | 3449.9µs | **2.51x** | 2188.3µs | 1044.5µs |
+| 512, 4096, 256 | 30.8µs | 29.7µs | 56.3µs | **1.90x** | 45.9µs | 19.5µs |
+
+精度（4096³，相对 fp32 金标准，FP8 与 INT8 后端实测一致）：mean rel-err
+mixed **8.0e-3** vs bf16 1.2e-2；RMS 误差 **1.7e-3** vs 4.0e-3（低 2.3x）；
+最大绝对误差 **1.6e-2** vs 6.1e-2（低 3.9x）。
+
+后端选择说明：
+
+- **小 M（≤64）FP8 略快**（7~10%，量化 kernel 更简单）；**大 M INT8 更快**
+  （最高 21%）；`vs fp32†` 取每行更优后端的倍率。`backend="auto"` 在 FP8
+  可用时默认选 FP8（精度相同、免 per-channel scale 存储），大 M 追求极致
+  性能可显式 `backend="int8"`
+- 两种 residual 后端精度一致：权重舍入偏差均被消除，剩余误差主导项是激活的
+  bf16 舍入噪声（两种量化精度都已足够细）
+- CUDA 11.8 编译时同一 INT8 kernel 大 shape 慢 ~17%（nvcc 代码生成差异，
+  4096³ 实测 1658µs），小 shape 不受影响；建议用较新 CUDA 编译
 
 > \* bf16 列为 `bf16(x) @ bf16(W)^T`（权重离线预转，与 mixed_gemm 的离线权重拆分
 > 对等）+ fp32 epilogue：速度快 1.3~1.7x（单次 GEMM vs 主项+补偿双 GEMM），但
-> 权重舍入误差完全未补偿。FP8 后端（需 CUDA >= 12.4 + SM89+）residual 精度更高。
+> 权重舍入误差完全未补偿。
 
 ## 环境要求
 
@@ -275,7 +291,8 @@ python benchmark/benchmark_fa.py --warmup 20 --iters 100 --mask-ratio 0.3 --csv 
 
 ```bash
 # mixed_gemm：对比 fp32 / tf32 / bf16 matmul 的耗时与精度
-python benchmark/benchmark_mixed_gemm.py
+python benchmark/benchmark_mixed_gemm.py                       # 后端 auto（FP8 可用则 FP8）
+python benchmark/benchmark_mixed_gemm.py --backend int8        # 指定 residual 后端
 python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
 ```
 

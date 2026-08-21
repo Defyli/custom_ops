@@ -34,14 +34,15 @@ with two core operators:
 
 - **Accuracy ≈ fp32, faster than tf32**: weights are split offline into a bf16
   main term plus an fp8/int8 residual correction term, eliminating the systematic
-  weight-rounding bias (**2x+ lower RMS error** and **3.5x lower max error** than
-  plain bf16); **1.2–2.1x** over fp32 matmul and **1.1–1.6x** over tf32 on
-  RTX 4090D, up to **82.9 TFLOPS** effective on large shapes
+  weight-rounding bias (**2.3x lower RMS error** and **3.9x lower max error** than
+  plain bf16); **1.3–2.5x** over fp32 matmul and **1.2–1.6x** over tf32 on
+  RTX 4090D, up to **100 TFLOPS** effective on large shapes
 - **Epilogue fusion**: bias addition and silu/gelu activation are fused into the
   GEMM kernel — no extra kernels, no intermediate buffers
 - **Dual residual backends**: FP8 e4m3 (SM89+, requires CUDA >= 12.4 at build
-  time) and INT8 dynamic quantization (SM80+, works with CUDA 11.8), selected
-  automatically at compile time
+  time, slightly faster on small M, no scale storage) and INT8 dynamic
+  quantization (SM80+, works with CUDA 11.8, faster on large M) — identical
+  accuracy, selected automatically at compile time
 - **Adaptive tile/split-K**: the wall-clock heuristics of the original
   TensorRT plugin are retained — small-M shapes get split-K automatically
 
@@ -128,32 +129,49 @@ For reference: without Split-KV, small-grid long-sequence shapes are processed
 by a single CTA serially walking all KV blocks, taking 234–935µs — with
 Split-KV enabled automatically this drops to 19–53µs (**10–18x**).
 
-### mixed_gemm (RTX 4090D, INT8 residual backend)
+### mixed_gemm (RTX 4090D, FP8 / INT8 residual backends)
 
-Recommendation MLP layer `silu(x @ W^T + b)` with fp32 weights/activations:
-mixed_gemm runs at **1.2–2.1x** over fp32 matmul and **1.1–1.6x** over tf32, up
-to **82.9 TFLOPS** effective on large shapes; accuracy is close to fp32 (the
-systematic weight-rounding bias is fully eliminated — the remaining error is
-just unbiased activation rounding noise, with 2x+ lower RMS error than bf16).
+Recommendation MLP layer `silu(x @ W^T + b)` with fp32 weights/activations.
+Test setup: RTX 4090D / PyTorch 2.11 / CUDA 12.8 (FP8 and INT8 backends measured
+on the same machine); when built with CUDA < 12.4, FP8 falls back to INT8
+automatically (identical accuracy).
 
-| Shape (M,N,K) | mixed | TFLOPS | fp32 | vs fp32 | tf32 | vs tf32 | bf16* |
-|---|---|---|---|---|---|---|---|
-| 16, 4096, 4096 | 103.4µs | 5.2 | 126.0µs | **1.22x** | 112.6µs | **1.09x** | 60.4µs |
-| 64, 4096, 4096 | 110.5µs | 19.4 | 140.3µs | **1.27x** | 119.8µs | **1.08x** | 70.7µs |
-| 256, 4096, 4096 | 142.7µs | 60.2 | 275.5µs | **1.93x** | 211.6µs | **1.48x** | 96.3µs |
-| 1024, 4096, 4096 | 445.6µs | 77.1 | 859.1µs | **1.93x** | 513.0µs | **1.15x** | 317.4µs |
-| 4096, 4096, 4096 | 1657.9µs | 82.9 | 3487.7µs | **2.10x** | 2248.0µs | **1.36x** | 1114.1µs |
-| 512, 4096, 256 | 31.7µs | 33.8 | 58.4µs | **1.84x** | 50.2µs | **1.58x** | 24.6µs |
+The best backend per shape runs at **1.3–2.5x** over fp32 matmul and **1.2–1.6x**
+over tf32, up to **100 TFLOPS** effective on large shapes; accuracy is close to
+fp32 (the systematic weight-rounding bias is fully eliminated — the remaining
+error is just unbiased activation rounding noise).
 
-Accuracy (4096³, vs the fp32 golden reference): mean rel-err mixed **8.0e-3**
-vs bf16 1.2e-2; RMS error **1.7e-3** vs 3.6e-3 (2.1x lower); max absolute error
-**1.5e-2** vs 5.5e-2 (3.5x lower).
+| Shape (M,N,K) | mixed FP8 | mixed INT8 | fp32 | vs fp32† | tf32 | bf16* |
+|---|---|---|---|---|---|---|
+| 16, 4096, 4096 | 96.3µs | 103.4µs | 122.9µs | **1.28x** | 117.8µs | 61.4µs |
+| 64, 4096, 4096 | 100.4µs | 109.6µs | 130.8µs | **1.30x** | 122.9µs | 65.5µs |
+| 256, 4096, 4096 | 151.6µs | 145.4µs | 245.8µs | **1.69x** | 210.8µs | 86.8µs |
+| 1024, 4096, 4096 | 511.0µs | 440.4µs | 935.0µs | **2.12x** | 602.1µs | 296.6µs |
+| 4096, 4096, 4096 | 1730.6µs (79.4 TF) | 1374.2µs (100.0 TF) | 3449.9µs | **2.51x** | 2188.3µs | 1044.5µs |
+| 512, 4096, 256 | 30.8µs | 29.7µs | 56.3µs | **1.90x** | 45.9µs | 19.5µs |
+
+Accuracy (4096³, vs the fp32 golden reference; FP8 and INT8 backends measure
+identically): mean rel-err mixed **8.0e-3** vs bf16 1.2e-2; RMS error **1.7e-3**
+vs 4.0e-3 (2.3x lower); max absolute error **1.6e-2** vs 6.1e-2 (3.9x lower).
+
+Backend selection notes:
+
+- **FP8 is slightly faster on small M (≤64)** (7–10%, simpler quantization
+  kernel); **INT8 is faster on large M** (up to 21%); `vs fp32†` takes the better
+  backend per row. `backend="auto"` picks FP8 when available (identical
+  accuracy, no per-channel scale storage); for maximum large-M throughput pass
+  `backend="int8"` explicitly
+- The two residual backends are accuracy-identical: the weight-rounding bias is
+  eliminated either way, and the dominant remaining error is the unbiased bf16
+  rounding noise of the activations (both quantization grids are fine enough)
+- Building with CUDA 11.8 makes the same INT8 kernel ~17% slower on large shapes
+  (nvcc codegen differences; 4096³ measures 1658µs) — small shapes are
+  unaffected; prefer a recent CUDA toolkit
 
 > \* The bf16 column is `bf16(x) @ bf16(W)^T` (weights pre-cast offline, on par
 > with mixed_gemm's offline weight split) + fp32 epilogue: 1.3–1.7x faster (a
 > single GEMM vs the main-plus-correction dual GEMM) but with fully uncompensated
-> weight-rounding error. The FP8 backend (CUDA >= 12.4 + SM89+) has higher
-> residual precision.
+> weight-rounding error.
 
 ## Requirements
 
@@ -296,7 +314,8 @@ against SDPA.
 
 ```bash
 # mixed_gemm: latency and accuracy vs fp32 / tf32 / bf16 matmul
-python benchmark/benchmark_mixed_gemm.py
+python benchmark/benchmark_mixed_gemm.py                       # backend auto (FP8 if available)
+python benchmark/benchmark_mixed_gemm.py --backend int8        # pick the residual backend
 python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
 ```
 
