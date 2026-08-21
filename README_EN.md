@@ -35,8 +35,14 @@ with two core operators:
 - **Accuracy ≈ fp32, faster than tf32**: weights are split offline into a bf16
   main term plus an fp8/int8 residual correction term, eliminating the systematic
   weight-rounding bias (**2.3x lower RMS error** and **3.9x lower max error** than
-  plain bf16); **1.3–2.5x** over fp32 matmul and **1.2–1.6x** over tf32 on
-  RTX 4090D, up to **100 TFLOPS** effective on large shapes
+  plain bf16); **1.7–2.6x** over fp32 matmul on RTX 5090D (sm120a TMA path,
+  another **1.6–3.0x** over the generic path) and **1.3–2.5x** on RTX 4090D,
+  up to **118 TFLOPS** effective on large shapes
+- **sm120a TMA path**: enabled automatically on RTX 5090-class GPUs — all four
+  operand streams are moved via TMA (automatic OOB zero-fill, no per-thread
+  predicates) with an mbarrier double-barrier pipeline and a bulk TMA-store
+  epilogue; numerically identical to the generic path, with automatic fallback
+  whenever alignment constraints are not met
 - **Epilogue fusion**: bias addition and silu/gelu activation are fused into the
   GEMM kernel — no extra kernels, no intermediate buffers
 - **Dual residual backends**: FP8 e4m3 (SM89+, requires CUDA >= 12.4 at build
@@ -129,17 +135,65 @@ For reference: without Split-KV, small-grid long-sequence shapes are processed
 by a single CTA serially walking all KV blocks, taking 234–935µs — with
 Split-KV enabled automatically this drops to 19–53µs (**10–18x**).
 
-### mixed_gemm (RTX 4090D, FP8 / INT8 residual backends)
+### mixed_gemm (FP8 / INT8 residual backends)
 
 Recommendation MLP layer `silu(x @ W^T + b)` with fp32 weights/activations.
+
+#### RTX 5090D (sm120a TMA path)
+
+Test setup: RTX 5090D / PyTorch 2.11 / CUDA 12.8, FP8 backend. On sm120a the
+TMA + mbarrier data path is enabled automatically (numerically identical to the
+generic path); the `generic` column is a same-machine A/B run with the path
+forced off (`GEMM_MIXED_FORCE_SM80=1`).
+
+The sm120a path is **1.6–3.0x** faster than the generic path and **1.7–2.6x**
+faster than fp32 matmul, reaching **118 TFLOPS** effective on 4096³ (72% of a
+bf16 matmul on the same shape).
+
+| Shape (M,N,K) | mixed (sm120a) | generic | speedup | fp32 | vs fp32 | tf32 | bf16* |
+|---|---|---|---|---|---|---|---|
+| 16, 4096, 4096 | 53.2µs | 91.7µs | 1.72x | 112.6µs | **2.11x** | 71.7µs | 53.2µs |
+| 64, 4096, 4096 | 57.3µs | 93.9µs | 1.64x | 98.3µs | **1.71x** | 108.5µs | 55.3µs |
+| 256, 4096, 4096 | 104.5µs | 313.3µs | **3.00x** | 184.4µs | **1.76x** | 127.3µs | 69.7µs |
+| 1024, 4096, 4096 | 337.9µs | 985.1µs | **2.92x** | 598.0µs | **1.77x** | 405.9µs | 219.1µs |
+| 4096, 4096, 4096 | 1163.3µs (118.1 TF) | 2198.5µs | 1.89x | 2521.8µs | **2.17x** | 1453.1µs | 843.7µs |
+| 16, 16384, 1024 | 53.2µs | 90.1µs | 1.69x | 137.2µs | **2.58x** | 73.7µs | 41.0µs |
+| 128, 1000, 2048 | 18.4µs | 43.0µs | **2.34x** | 30.8µs | **1.67x** | 28.6µs | 26.6µs |
+| 512, 4096, 256 | 22.5µs | 65.5µs | **2.91x** | 47.1µs | **2.09x** | 31.2µs | 16.4µs |
+
+> \* The bf16 column uses the same methodology as the RTX 4090D section below:
+> `bf16(x) @ bf16(W)^T` (weights pre-cast offline) + fp32 epilogue.
+
+Design highlights of the sm120a path (see the file-header comment in
+`csrc/mixed_gemm/gemm_bf16xfp32_sm120.cu`):
+
+- All four operand streams (bf16 main + 1-byte residual, for both X and W) are
+  moved via TMA: single-thread bulk issue with automatic OOB zero-fill replaces
+  per-thread predication, removing the predicate-register and address
+  arithmetic overhead of the generic path (sm120 has no wgmma, so the compute
+  skeleton stays on `mma.sync`)
+- A `full`/`empty` mbarrier double-barrier pipeline replaces cp.async waits +
+  `__syncthreads`: fully asynchronous producer/consumer, with barrier phases
+  continuing naturally across tiles
+- The epilogue uses a bulk TMA store when Y is aligned (automatic clipping of
+  out-of-range rows/columns), falling back to bounds-checked elementwise stores
+  otherwise; sY aliases the operand smem (protected by a proxy fence)
+- Cache-hint split: W (reused across M-tiles) EVICT_LAST, X (streaming)
+  EVICT_FIRST
+- Routing constraints: k%16==0 and 16B-aligned pointers (TMA global-stride
+  requirement); otherwise the op falls back to the generic path with identical
+  numerics
+
+#### RTX 4090D (generic path)
+
 Test setup: RTX 4090D / PyTorch 2.11 / CUDA 12.8 (FP8 and INT8 backends measured
 on the same machine); when built with CUDA < 12.4, FP8 falls back to INT8
 automatically (identical accuracy).
 
-The best backend per shape runs at **1.3–2.5x** over fp32 matmul and **1.2–1.6x**
-over tf32, up to **100 TFLOPS** effective on large shapes; accuracy is close to
-fp32 (the systematic weight-rounding bias is fully eliminated — the remaining
-error is just unbiased activation rounding noise).
+The best generic-path backend per shape runs at **1.3–2.5x** over fp32 matmul
+and **1.2–1.6x** over tf32, up to **100 TFLOPS** effective on large shapes;
+accuracy is close to fp32 (the systematic weight-rounding bias is fully
+eliminated — the remaining error is just unbiased activation rounding noise).
 
 | Shape (M,N,K) | mixed FP8 | mixed INT8 | fp32 | vs fp32† | tf32 | bf16* |
 |---|---|---|---|---|---|---|
@@ -175,11 +229,12 @@ Backend selection notes:
 
 ## Requirements
 
-- NVIDIA GPU: sm120 (RTX 5090D, TMA main path, extensively tested) or sm89
+- NVIDIA GPU: sm120 (RTX 5090D, both the FA TMA main path and the mixed_gemm
+  sm120a TMA path extensively tested) or sm89
   (RTX 4090D, cp.async path with Split-KV ported from sm120, tested); other sm80+
   architectures should compile but are unverified
 - CUDA >= 11.8 (FA sm89 path / mixed_gemm INT8 backend) / >= 12.4 (mixed_gemm FP8
-  backend, SM89+) / >= 12.8 (FA sm120a), GCC >= 9
+  backend, SM89+) / >= 12.8 (FA / mixed_gemm sm120a paths), GCC >= 9
 - PyTorch >= 2.1 (CUDA build), bf16
 
 ## Quick Start
@@ -337,7 +392,9 @@ custom_ops/
 │   └── mixed_gemm/                # mixed-precision GEMM kernel (ported from a TRT plugin)
 │       ├── mixed_gemm_op.cu       # torch operator entry: validation / workspace / dispatch
 │       ├── gemm_bf16xfp32_sm80.cu # kernel: tile/split-K heuristics + bf16 main + fp8/int8 residual dual GEMM
-│       └── gemm_bf16xfp32_sm80.h  # kernel entry declarations + FP8 compile-time guard
+│       ├── gemm_bf16xfp32_sm80.h  # kernel entry declarations + FP8 compile-time guard
+│       ├── gemm_bf16xfp32_sm120.cu # sm120a TMA+mbarrier kernel (auto-routed, decoupled from the sm80 path)
+│       └── gemm_bf16xfp32_sm120.h # sm120a path entry declarations (support/alignment checks)
 ├── thirdparty/            # CUTLASS / CuTe (header-only dependencies)
 ├── benchmark/             # performance benchmark
 ├── examples/              # usage examples

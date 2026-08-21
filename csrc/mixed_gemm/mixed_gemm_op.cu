@@ -25,6 +25,7 @@
 
 #include "mixed_gemm_op.h"
 #include "gemm_bf16xfp32_sm80.h"
+#include "gemm_bf16xfp32_sm120.h"
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -284,12 +285,21 @@ torch::Tensor mixed_gemm_cuda(
     TORCH_CHECK(quantized, "activation quantization kernel launch failed");
 
     // ── 主 GEMM launcher ──────────────────────────────────────────────────────
+    // sm120a（RTX 5090 系）优先走 TMA + mbarrier 专用路径（数值语义与 sm80
+    // 路径一致）；数据面对齐不满足（k%16!=0 或指针未 16B 对齐）时整体回退
+    // sm80 路径。GEMM_MIXED_FORCE_SM80=1 可强制回退（A/B 对比用）。
     const float scale_f = static_cast<float>(scale);
     const float* bias_ptr = has_bias ? bias->data_ptr<float>() : nullptr;
+    const bool use_sm120 = mixed_gemm_sm120_supported() &&
+        mixed_gemm_sm120_ptrs_ok(x_bf16_ptr, w_high.data_ptr(), w_low.data_ptr(),
+                                 x_res_ptr, k);
     bool launched = false;
     if (use_int8) {
-        auto launcher = resolve_gemm_bf16xfp32_int8_launcher(
-            static_cast<int>(activation), has_bias);
+        auto launcher = use_sm120
+            ? resolve_gemm_bf16xfp32_int8_launcher_sm120(
+                  static_cast<int>(activation), has_bias)
+            : resolve_gemm_bf16xfp32_int8_launcher(
+                  static_cast<int>(activation), has_bias);
         TORCH_CHECK(launcher != nullptr, "INT8 launcher resolution failed");
         launched = launcher(y.data_ptr(), split_y_ptr, split_flag_ptr,
                             x_bf16_ptr, w_high.data_ptr(), w_low.data_ptr(),
@@ -299,8 +309,11 @@ torch::Tensor mixed_gemm_cuda(
                             sm_count, stream);
     } else {
 #if MIXED_GEMM_FP8_ENABLED
-        auto launcher = resolve_gemm_bf16xfp32_epilogue_launcher(
-            static_cast<int>(activation), has_bias);
+        auto launcher = use_sm120
+            ? resolve_gemm_bf16xfp32_epilogue_launcher_sm120(
+                  static_cast<int>(activation), has_bias)
+            : resolve_gemm_bf16xfp32_epilogue_launcher(
+                  static_cast<int>(activation), has_bias);
         TORCH_CHECK(launcher != nullptr, "FP8 launcher resolution failed");
         launched = launcher(y.data_ptr(), split_y_ptr, split_flag_ptr,
                             x_bf16_ptr, w_high.data_ptr(), w_low.data_ptr(),

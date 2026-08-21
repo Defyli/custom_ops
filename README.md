@@ -30,8 +30,12 @@
 
 - **精度 ≈ fp32，速度 > tf32**：权重离线拆分为 bf16 主项 + fp8/int8
   residual 补偿项，消除权重的系统性舍入偏差（RMS 误差比纯 bf16 低 **2.3 倍**，
-  最大误差低 **3.9 倍**），RTX 4090D 上为 fp32 matmul 的 **1.3~2.5x**、
-  tf32 的 **1.2~1.6x**，大 shape 有效算力 **100 TFLOPS**
+  最大误差低 **3.9 倍**），RTX 5090D 上为 fp32 matmul 的 **1.7~2.6x**（sm120a
+  TMA 专用路径，较通用路径再快 **1.6~3.0x**），RTX 4090D 上为 **1.3~2.5x**，
+  大 shape 有效算力最高 **118 TFLOPS**
+- **sm120a TMA 专用路径**：RTX 5090 系自动启用——4 路 operand 全 TMA 搬运
+  （OOB 自动补零，无谓词开销）+ mbarrier 双屏障流水线 + bulk TMA store
+  epilogue，数值语义与通用路径完全一致，不对齐等不满足约束时自动回退
 - **Epilogue 融合**：bias 相加 + silu/gelu 激活融合在 GEMM kernel 内，
   不产生额外 kernel 与中间显存
 - **双 residual 后端**：FP8 e4m3（SM89+，需编译期 CUDA >= 12.4，小 M 略快、
@@ -116,13 +120,54 @@ sm89 路径为 cp.async 实现，同样具备自适应 Split-KV（自 sm120 移�
 作为参照：未启用 Split-KV 时，小 grid 长序列 shape 只能由单个 CTA 串行处理全部
 KV 块，耗时 234~935µs；Split-KV 自动生效后降至 19~53µs（**10~18x**）。
 
-### mixed_gemm（RTX 4090D，FP8 / INT8 residual 双后端）
+### mixed_gemm（FP8 / INT8 residual 双后端）
 
-推荐 MLP 层 `silu(x @ W^T + b)`（fp32 权重/输入）。测试环境：RTX 4090D /
+推荐 MLP 层 `silu(x @ W^T + b)`（fp32 权重/输入）。
+
+#### RTX 5090D（sm120a TMA 专用路径）
+
+测试环境：RTX 5090D / PyTorch 2.11 / CUDA 12.8，FP8 后端。sm120a 上自动
+启用 TMA + mbarrier 专用数据通路（数值语义与通用路径完全一致）；`sm80 路径`
+列为同机强制回退的 A/B 对照（`GEMM_MIXED_FORCE_SM80=1`）。
+
+sm120a 专用路径较通用路径提升 **1.6~3.0x**，为 fp32 matmul 的 **1.7~2.6x**；
+4096³ 大 shape 有效算力 **118 TFLOPS**（同 shape bf16 matmul 的 72%）。
+
+| Shape (M,N,K) | mixed (sm120a) | sm80 路径 | 提升 | fp32 | vs fp32 | tf32 | bf16* |
+|---|---|---|---|---|---|---|---|
+| 16, 4096, 4096 | 53.2µs | 91.7µs | 1.72x | 112.6µs | **2.11x** | 71.7µs | 53.2µs |
+| 64, 4096, 4096 | 57.3µs | 93.9µs | 1.64x | 98.3µs | **1.71x** | 108.5µs | 55.3µs |
+| 256, 4096, 4096 | 104.5µs | 313.3µs | **3.00x** | 184.4µs | **1.76x** | 127.3µs | 69.7µs |
+| 1024, 4096, 4096 | 337.9µs | 985.1µs | **2.92x** | 598.0µs | **1.77x** | 405.9µs | 219.1µs |
+| 4096, 4096, 4096 | 1163.3µs (118.1 TF) | 2198.5µs | 1.89x | 2521.8µs | **2.17x** | 1453.1µs | 843.7µs |
+| 16, 16384, 1024 | 53.2µs | 90.1µs | 1.69x | 137.2µs | **2.58x** | 73.7µs | 41.0µs |
+| 128, 1000, 2048 | 18.4µs | 43.0µs | **2.34x** | 30.8µs | **1.67x** | 28.6µs | 26.6µs |
+| 512, 4096, 256 | 22.5µs | 65.5µs | **2.91x** | 47.1µs | **2.09x** | 31.2µs | 16.4µs |
+
+> \* bf16 列口径与下方 4090D 小节相同：`bf16(x) @ bf16(W)^T`（权重离线预转）
+> + fp32 epilogue。
+
+sm120a 专用路径的设计要点（实现见
+`csrc/mixed_gemm/gemm_bf16xfp32_sm120.cu` 文件头注释）：
+
+- 4 路 operand（bf16 主项 + 1 字节 residual 的 X/W）全部 TMA 搬运：单线程
+  发射 bulk 拷贝，OOB 自动补零取代逐线程谓词，消除 sm80 路径的谓词寄存器
+  开销与地址计算开销（sm120 无 wgmma，计算骨架沿用 `mma.sync`）
+- `full`/`empty` mbarrier 双屏障流水线取代 `cp.async` wait +
+  `__syncthreads`：producer/consumer 全异步，跨 tile 相位自然延续
+- Epilogue 在 Y 对齐时用 bulk TMA store（自动裁剪越界行列），不满足时
+  降级 bounds-checked elementwise；sY 与 operand 共享 smem（代理栅栏保护）
+- Cache hint 分流：W（跨 M-tile 复用）EVICT_LAST，X（流式）EVICT_FIRST
+- 路由约束：k%16==0 且各指针 16B 对齐（TMA 全局 stride 要求）；不满足时
+  整体回退 sm80 通用路径，数值语义不变
+
+#### RTX 4090D（通用路径）
+
+测试环境：RTX 4090D /
 PyTorch 2.11 / CUDA 12.8（FP8 与 INT8 后端同机对照）；编译期 CUDA < 12.4 时
 FP8 自动降级 INT8（精度相同）。
 
-mixed_gemm 最优后端为 fp32 matmul 的 **1.3~2.5x**、tf32 的 **1.2~1.6x**，
+通用路径最优后端为 fp32 matmul 的 **1.3~2.5x**、tf32 的 **1.2~1.6x**，
 大 shape 有效算力 **100 TFLOPS**；精度接近 fp32（权重舍入误差被完全消除，
 误差仅剩激活的无偏舍入噪声）。
 
@@ -156,11 +201,11 @@ mixed **8.0e-3** vs bf16 1.2e-2；RMS 误差 **1.7e-3** vs 4.0e-3（低 2.3x）�
 
 ## 环境要求
 
-- NVIDIA GPU：sm120（RTX 5090D，TMA 主路径，充分测试）或 sm89（RTX 4090D，
-  cp.async 路径（含自 sm120 移植的 Split-KV），已测试）；其余 sm80+ 架构理论上
-  可编译运行，未验证
+- NVIDIA GPU：sm120（RTX 5090D，FA TMA 主路径与 mixed_gemm sm120a TMA 路径
+  均充分测试）或 sm89（RTX 4090D，cp.async 路径（含自 sm120 移植的
+  Split-KV），已测试）；其余 sm80+ 架构理论上可编译运行，未验证
 - CUDA >= 11.8（FA sm89 路径 / mixed_gemm INT8 后端）/ >= 12.4（mixed_gemm FP8
-  后端，SM89+）/ >= 12.8（FA sm120a），GCC >= 9
+  后端，SM89+）/ >= 12.8（FA / mixed_gemm 的 sm120a 路径），GCC >= 9
 - PyTorch >= 2.1（CUDA 版本），bf16
 
 ## 快速开始
@@ -314,7 +359,9 @@ custom_ops/
 │   └── mixed_gemm/                # 混合精度 GEMM kernel（自 TRT 插件移植）
 │       ├── mixed_gemm_op.cu       # torch 算子入口：校验 / workspace / 分发
 │       ├── gemm_bf16xfp32_sm80.cu # kernel：tile/split-K 启发式 + bf16 主项 + fp8/int8 补偿双 GEMM
-│       └── gemm_bf16xfp32_sm80.h  # kernel 入口声明 + FP8 编译期守卫
+│       ├── gemm_bf16xfp32_sm80.h  # kernel 入口声明 + FP8 编译期守卫
+│       ├── gemm_bf16xfp32_sm120.cu # sm120a TMA+mbarrier 专用 kernel（自动路由，与 sm80 路径解耦）
+│       └── gemm_bf16xfp32_sm120.h # sm120a 路径入口声明（supported/对齐检查）
 ├── thirdparty/            # CUTLASS / CuTe（头文件依赖）
 ├── benchmark/             # 性能基准测试
 ├── examples/              # 使用示例

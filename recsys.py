@@ -87,6 +87,7 @@ class RecsysOps(CustomOps):
             os.path.join(csrc, "fa",        "fa_fwd_op.cu"),
             os.path.join(mixed, "mixed_gemm_op.cu"),
             os.path.join(mixed, "gemm_bf16xfp32_sm80.cu"),
+            os.path.join(mixed, "gemm_bf16xfp32_sm120.cu"),
         ]
 
     def get_include_dirs(self) -> list:
