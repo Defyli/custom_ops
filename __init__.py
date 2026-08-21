@@ -519,6 +519,7 @@ class CustomOps:
 # ─────────────────────────────────────────────────────────────────────────────
 
 from custom_ops.recsys import RecsysOps  # noqa: E402  (避免循环导入，置于类定义之后)
+from custom_ops.recsys import split_mixed_precision_weight  # noqa: E402
 
 #: 推荐系统算子库的包级全局单例，import 时自动完成编译加载及 fake 注册。
 #:
@@ -526,6 +527,5 @@ from custom_ops.recsys import RecsysOps  # noqa: E402  (避免循环导入，置
 #:
 #:     from custom_ops import ops
 #:     out  = ops.mha_fwd_with_mask(q, k, v, mask)
-#:     outs = ops.pack_and_prepare_b1(...)
-#:     pool = ops.jagged_pool_and_collect(...)
+#:     y    = ops.mixed_gemm(x, w_high, w_low, w_scale, activation="silu")
 ops: RecsysOps = RecsysOps().load()

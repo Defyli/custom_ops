@@ -1,12 +1,20 @@
-# custom_ops — 支持任意 Mask 的 FlashAttention-2
+# custom_ops — 面向生成式推荐的高性能 CUDA 算子库
 
 中文 | [English](README_EN.md)
 
-面向生成式推荐系统的高性能 CUDA 注意力算子库。核心算子 `mha_fwd_with_mask`
-是支持**任意加法 mask**（0=可见 / -inf=屏蔽）的 FlashAttention-2 前向实现，
-深度适配消费级 GPU（sm120 / sm89），带 mask 性能显著优于 PyTorch SDPA。
+面向生成式推荐系统的高性能 CUDA 算子库，包含两个核心算子：
+
+- **`mha_fwd_with_mask`**：支持**任意加法 mask**（0=可见 / -inf=屏蔽）的
+  FlashAttention-2 前向，深度适配消费级 GPU（sm120 / sm89），带 mask 性能
+  显著优于 PyTorch SDPA
+- **`mixed_gemm`**：混合精度 GEMM，解决推荐模型 **bf16 权重精度损失大、
+  tf32 性能不足**的问题——bf16 tensor core 算主项 + 低精度 tensor core 算
+  residual 补偿项，以接近 bf16 的开销恢复接近 fp32 的精度，且在 epilogue
+  融合执行 bias 相加与 silu/gelu 激活
 
 **亮点**
+
+**注意力算子 `mha_fwd_with_mask`**
 
 - **任意 mask 直达 softmax**：因果、滑动窗口、padding、随机稀疏（item 级屏蔽）
   等任意形态，无需改 kernel
@@ -17,10 +25,26 @@
 - **原生 GQA**：K/V 头数整除 Q 头数即可，无需手动扩展
 - **自适应 Split-KV**：cost model 自动选择 split 数，大 grid 自动退化为
   单 kernel，零开销、无需调参
+
+**混合精度 GEMM `mixed_gemm`**
+
+- **精度 ≈ fp32，速度 > tf32**：权重离线拆分为 bf16 主项 + fp8/int8
+  residual 补偿项，消除权重的系统性舍入偏差（RMS 误差比纯 bf16 低 **2 倍+**，
+  最大误差低 **3.5 倍**），RTX 4090D 上为 fp32 matmul 的 **1.2~2.1x**、
+  tf32 的 **1.1~1.6x**，大 shape 有效算力 **82.9 TFLOPS**
+- **Epilogue 融合**：bias 相加 + silu/gelu 激活融合在 GEMM kernel 内，
+  不产生额外 kernel 与中间显存
+- **双 residual 后端**：FP8 e4m3（SM89+，需编译期 CUDA >= 12.4）与
+  INT8 动态量化（SM80+，CUDA 11.8 即可），编译期自动选择
+- **自适应 tile/split-K**：沿用原 TensorRT 插件的 wall-clock 启发式，
+  小 M 自动 split-K，无需调参
+
+**通用能力**
+
 - **JIT 自动编译**：首次 import 自动构建，多进程安全，支持
   `torch.compile`/AOTI
 
-> 完整的移植与优化过程记录见
+> FA 算子完整的移植与优化过程记录见
 > [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md)。
 
 ## 性能
@@ -91,12 +115,36 @@ sm89 路径为 cp.async 实现，同样具备自适应 Split-KV（自 sm120 移�
 作为参照：未启用 Split-KV 时，小 grid 长序列 shape 只能由单个 CTA 串行处理全部
 KV 块，耗时 234~935µs；Split-KV 自动生效后降至 19~53µs（**10~18x**）。
 
+### mixed_gemm（RTX 4090D，INT8 residual 后端）
+
+推荐 MLP 层 `silu(x @ W^T + b)`（fp32 权重/输入）：mixed_gemm 为 fp32 matmul 的
+**1.2~2.1x**、tf32 的 **1.1~1.6x**，大 shape 有效算力 **82.9 TFLOPS**；精度接近
+fp32（权重舍入误差被完全消除，误差仅剩激活的无偏舍入噪声，RMS 误差比纯 bf16
+低 2 倍+）。
+
+| Shape (M,N,K) | mixed | TFLOPS | fp32 | vs fp32 | tf32 | vs tf32 | bf16* |
+|---|---|---|---|---|---|---|---|
+| 16, 4096, 4096 | 103.4µs | 5.2 | 126.0µs | **1.22x** | 112.6µs | **1.09x** | 60.4µs |
+| 64, 4096, 4096 | 110.5µs | 19.4 | 140.3µs | **1.27x** | 119.8µs | **1.08x** | 70.7µs |
+| 256, 4096, 4096 | 142.7µs | 60.2 | 275.5µs | **1.93x** | 211.6µs | **1.48x** | 96.3µs |
+| 1024, 4096, 4096 | 445.6µs | 77.1 | 859.1µs | **1.93x** | 513.0µs | **1.15x** | 317.4µs |
+| 4096, 4096, 4096 | 1657.9µs | 82.9 | 3487.7µs | **2.10x** | 2248.0µs | **1.36x** | 1114.1µs |
+| 512, 4096, 256 | 31.7µs | 33.8 | 58.4µs | **1.84x** | 50.2µs | **1.58x** | 24.6µs |
+
+精度（4096³，相对 fp32 金标准）：mean rel-err mixed **8.0e-3** vs bf16 1.2e-2；
+RMS 误差 **1.7e-3** vs 3.6e-3（低 2.1x）；最大绝对误差 **1.5e-2** vs 5.5e-2（低 3.5x）。
+
+> \* bf16 列为 `bf16(x) @ bf16(W)^T`（权重离线预转，与 mixed_gemm 的离线权重拆分
+> 对等）+ fp32 epilogue：速度快 1.3~1.7x（单次 GEMM vs 主项+补偿双 GEMM），但
+> 权重舍入误差完全未补偿。FP8 后端（需 CUDA >= 12.4 + SM89+）residual 精度更高。
+
 ## 环境要求
 
 - NVIDIA GPU：sm120（RTX 5090D，TMA 主路径，充分测试）或 sm89（RTX 4090D，
   cp.async 路径（含自 sm120 移植的 Split-KV），已测试）；其余 sm80+ 架构理论上
   可编译运行，未验证
-- CUDA >= 11.8（sm89 路径）/ >= 12.8（sm120a），GCC >= 9
+- CUDA >= 11.8（FA sm89 路径 / mixed_gemm INT8 后端）/ >= 12.4（mixed_gemm FP8
+  后端，SM89+）/ >= 12.8（FA sm120a），GCC >= 9
 - PyTorch >= 2.1（CUDA 版本），bf16
 
 ## 快速开始
@@ -121,6 +169,17 @@ mask = torch.zeros(B, 1, Sq, Sk, device="cuda", dtype=torch.bfloat16)
 mask[..., 512:] = float("-inf")   # 任意加法 mask：0=可见，-inf=屏蔽
 
 out = ops.mha_fwd_with_mask(q, k, v, mask)   # (B, H, Sq, d) bf16
+
+# ── 混合精度 GEMM：y = silu(x @ W^T + b) ──────────────────────────
+from custom_ops import split_mixed_precision_weight
+
+x = torch.randn(4096, 4096, device="cuda")              # fp32 激活
+w = torch.randn(4096, 4096, device="cuda") * 0.05      # fp32 权重
+b = torch.randn(4096, device="cuda") * 0.1
+
+w_high, w_low, w_scale = split_mixed_precision_weight(w)  # 模型加载时一次性拆分
+y = ops.mixed_gemm(x, w_high, w_low, w_scale, bias=b,
+                   activation="silu")                   # fp32 输出，精度 ≈ fp32
 ```
 
 编译缓存默认在 `~/.cache/torch_extensions`，可用 `TORCH_EXTENSIONS_DIR` 指定；
@@ -146,6 +205,38 @@ FlashAttention-2 前向，支持任意 bf16 加法 mask。
 - 仅前向，不支持 dropout / causal 标志位 / alibi / RoPE / KV-cache
   （causal 可通过 mask 表达，见 examples）
 
+### `ops.mixed_gemm(x, w_high, w_low, w_scale, *, scale, bias, activation, out_dtype, force_splitk) -> Tensor`
+
+混合精度 GEMM：`y = activation(x @ (w_high + w_low * scale)^T + bias)`。
+bf16 tensor core 算主项 + 低精度 tensor core 算 residual 补偿项，以接近
+bf16 的开销恢复接近 fp32 的精度；bias 与激活在 epilogue 融合执行。
+
+| 参数 | shape | 说明 |
+|---|---|---|
+| `x` | (..., K) | fp32 / bf16 CUDA 连续张量，前导维度折叠为 M |
+| `w_high` | (N, K) | bf16 主项权重（`split_mixed_precision_weight` 产出） |
+| `w_low` | (N, K) | residual 权重：`float8_e4m3fn`（FP8 后端）或 `int8`（INT8 后端） |
+| `w_scale` | (N,) | fp32，INT8 后端的 per-channel 量化 scale（FP8 后端传 `None`） |
+| `scale` | float | residual 补偿 scale，须与权重拆分时一致（默认 1/256） |
+| `bias` | (N,) | fp32，可选，epilogue 融合相加 |
+| `activation` | str | `"identity"` / `"silu"` / `"gelu"`（tanh 近似） |
+| `out_dtype` | dtype | `None`（fp32，推荐）或 `torch.bfloat16` |
+| 返回 | (..., N) | 输出，dtype 由 `out_dtype` 决定 |
+
+residual 后端由 `w_low.dtype` 决定，`mixed_gemm_fp8_available()` 可查询
+FP8 后端可用性（编译期 CUDA >= 12.4 且 GPU 为 SM89+）。
+
+限制：
+
+- `K % 8 == 0`
+- FP8 后端需 SM89+；INT8 后端需 SM80+
+
+### `split_mixed_precision_weight(w, scale=1/256, backend="auto") -> (w_high, w_low, w_scale)`
+
+离线（模型加载时一次性）将 fp32 权重拆分为 mixed_gemm 所需的三元组：
+`w ≈ w_high + w_low * scale`。`backend="auto"` 时当前机器可用 FP8 则选 FP8，
+否则降级 INT8。纯 PyTorch 实现，无需编译算子库。
+
 ### 调优环境变量（默认 auto 即接近最优，仅调优/调试用）
 
 | 环境变量 | 作用 |
@@ -153,6 +244,7 @@ FlashAttention-2 前向，支持任意 bf16 加法 mask。
 | `FA_NUM_SPLITS=n` | 强制 split KV 的 split 数（0=auto cost model） |
 | `FA_SPLITKV=0` | 禁用 split KV |
 | `FA_PERSISTENT=1` | 启用 persistent kernel（d128 部分场景 +2~5%） |
+| `GEMM_MIXED_FORCE_SPLITK=n` | 强制 mixed_gemm 的 split-K 值（1/2/4/8/16，调试用） |
 
 ## Examples
 
@@ -160,6 +252,7 @@ FlashAttention-2 前向，支持任意 bf16 加法 mask。
 python examples/basic_usage.py        # 最小示例：调用 + 与 SDPA 校验
 python examples/custom_mask_demo.py   # 4 种典型 mask：causal / 滑窗 / padding / 随机稀疏
 python examples/gqa_example.py        # GQA：无需扩展 K/V 头
+python examples/mixed_gemm_demo.py    # 混合精度 GEMM：权重拆分 + epilogue 融合 + 精度对比
 ```
 
 ## Benchmark
@@ -180,24 +273,35 @@ python benchmark/benchmark_fa.py --warmup 20 --iters 100 --mask-ratio 0.3 --csv 
 输出每组 shape 的 custom / SDPA+mask / SDPA flash（参照）耗时、TFLOPS 与加速比，
 并对每个 shape 做一次 SDPA 数值校验。
 
+```bash
+# mixed_gemm：对比 fp32 / tf32 / bf16 matmul 的耗时与精度
+python benchmark/benchmark_mixed_gemm.py
+python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
+```
+
 ## 仓库结构
 
 ```
 custom_ops/
 ├── __init__.py            # CustomOps 通用 JIT 算子加载框架（基类）
-├── recsys.py              # RecsysOps：mha_fwd_with_mask 算子封装
+├── recsys.py              # RecsysOps：mha_fwd_with_mask / mixed_gemm 封装 + 权重拆分 helper
 ├── csrc/
 │   ├── recsys_bindings.cpp        # torch.ops 注册入口
-│   └── fa/                        # FA2 + mask kernel（sm89 + sm120 双路径，互不依赖）
-│       ├── fa_fwd_op.cu           # 算子入口 / 架构分发
-│       ├── fa_fwd_launch.h        # 各架构 launcher + Split-KV cost model
-│       ├── sm89/fa_fwd_kernel.h   # sm89 cp.async kernel：base / splitkv / combine
-│       ├── sm120/fa_fwd_sm120.h   # sm120 TMA 流水线 kernel / splitkv / persistent / combine
-│       ├── cpu/                   # CPU 参考实现（未接入算子分发，仅供参考）
-│       └── common/                # 两路共用的参数包 / softmax / utils
+│   ├── fa/                        # FA2 + mask kernel（sm89 + sm120 双路径，互不依赖）
+│   │   ├── fa_fwd_op.cu           # 算子入口 / 架构分发
+│   │   ├── fa_fwd_launch.h        # 各架构 launcher + Split-KV cost model
+│   │   ├── sm89/fa_fwd_kernel.h   # sm89 cp.async kernel：base / splitkv / combine
+│   │   ├── sm120/fa_fwd_sm120.h   # sm120 TMA 流水线 kernel / splitkv / persistent / combine
+│   │   ├── cpu/                   # CPU 参考实现（未接入算子分发，仅供参考）
+│   │   └── common/                # 两路共用的参数包 / softmax / utils
+│   └── mixed_gemm/                # 混合精度 GEMM kernel（自 TRT 插件移植）
+│       ├── mixed_gemm_op.cu       # torch 算子入口：校验 / workspace / 分发
+│       ├── gemm_bf16xfp32_sm80.cu # kernel：tile/split-K 启发式 + bf16 主项 + fp8/int8 补偿双 GEMM
+│       └── gemm_bf16xfp32_sm80.h  # kernel 入口声明 + FP8 编译期守卫
 ├── thirdparty/            # CUTLASS / CuTe（头文件依赖）
 ├── benchmark/             # 性能基准测试
 ├── examples/              # 使用示例
+├── tests/                 # 数值正确性测试
 └── docs/                  # 移植与优化全记录（含 roofline / NCU 分析）
 ```
 
