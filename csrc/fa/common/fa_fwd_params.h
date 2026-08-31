@@ -37,12 +37,13 @@ struct FA_mask_params {
     int64_t o_row_stride;
     int64_t o_head_stride;
 
-    // Additive mask: (B, mask_seqlen_q, mask_seqlen_k), row-major，bf16
+    // Additive mask: (B, mask_seqlen_q, mask_seqlen_k), row-major，fp16/bf16（与输入同 dtype）
+    // 无 pad 契约（对齐要求仅 8：16-bit × 8 = 128-bit cp.async / TMA 16B 行对齐）：
     // mask_seqlen_q ∈ [seqlen_q, 任意]：q 维无需 pad——越界行的输出会被 epilogue 丢弃，
-    //   sm89 用 cute copy_if 谓词跳过越界行，sm120 由 TMA 原生 OOB zero-fill 处理
-    // mask_seqlen_k（= mask_row_stride，连续时即列数）∈ {seqlen_k} ∪ [≥seqlen_k_rounded 且对齐]
-    //   k 维越界列必须填 -inf（语义必需：可见的越界列会污染 softmax 分母），
-    //   由 host 侧 pad 或调用方预 pad 保证
+    //   sm89/sm70 用谓词跳过越界行，sm120 由 TMA 原生 OOB zero-fill 处理
+    // mask_seqlen_k（= mask_row_stride，连续时即列数）∈ [seqlen_k, 任意] 且 %8==0
+    //   （== Sk 零拷贝；或调用方预 pad）。kernel 语义：col ≥ seqlen_k 恒为屏蔽
+    //   （-inf）——mask 越界列的内容被忽略，预 pad 的 -inf 列不再是正确性依赖
     void *__restrict__ mask_ptr;
     int64_t mask_batch_stride;    // stride over batch dim
     int64_t mask_row_stride;      // stride over q 维 = mask 实际列数
@@ -52,8 +53,8 @@ struct FA_mask_params {
     int b, h, h_k;
     int h_h_k_ratio;              // h / h_k
     int seqlen_q, seqlen_k;
-    int seqlen_k_rounded;         // = ceil(seqlen_k, kBlockN) * kBlockN
-    int seqlen_q_rounded;         // = ceil(seqlen_q, kBlockM) * kBlockM
+    int mask_seqlen_k;            // mask k 维实际列数（≥ seqlen_k，%8==0；列越界内容被忽略）
+    int seqlen_q_rounded;         // = ceil(seqlen_q, kBlockM) * kBlockM（split-KV partial 缓冲行数）
     int d;                        // head dim
 
     float scale_softmax;          // 1 / sqrt(d)

@@ -4,7 +4,7 @@
  * 从 FA2 的 compute_attn_1rowblock 移植，专为 prefill（非 causal）+ 外部 mask 场景精简：
  *   - 删除 dropout / rotary / KV-cache / alibi / local window / softcap 逻辑
  *   - 删除 split-KV 路径
- *   - 新增：通过 cute GmemTiledCopyMask + smem 缓冲读取 bf16 additive mask，
+ *   - 新增：通过 cute GmemTiledCopyMask + smem 缓冲读取 fp16/bf16 additive mask，
  *           在 gemm 后对 acc_s 做 smem→reg copy + 逐元素加法（零分支，无 warp divergence）
  *   - 保留 Is_even_MN / Is_even_K 分支以保证边界正确性
  *
@@ -14,16 +14,22 @@
  *   有限值    → 任意加法偏置（ALiBi 风格）；实现上 mask 先于 scale 加到 acc_s，
  *               应用点乘 1/scale_softmax 预还原（见 apply_mask_from_smem）
  *
- * Mask tensor 的 global mem 格式：(B, mask_seqlen_q, mask_seqlen_k)，row-major，bf16
+ * Mask tensor 的 global mem 格式：(B, mask_seqlen_q, mask_seqlen_k)，row-major，fp16/bf16（与输入同 dtype）
  *   - q 维：mask_seqlen_q ∈ [seqlen_q, 任意]，无需 pad——copy_g2s_mask 用 cute copy_if
  *     按行谓词跳过越界行（这些行的输出反正被 epilogue 丢弃）
- *   - k 维：越界列已由调用方/host pad 成 -inf，kBlockN（64 或 128）是 8 的倍数，
- *     保证 cp.async 128-bit 无越界且整 tile 无越界
- *   - 通过 params.mask_ptr / mask_batch_stride / mask_row_stride / mask_seqlen_q 寻址
+ *   - k 维：mask_seqlen_k ∈ [seqlen_k, 任意] 且 %8==0（128-bit cp.async 行对齐），
+ *     无需 pad 到 kBlockN——边界 tile 的越界列由列谓词跳过拷贝、smem 预清 -inf
+ *     （语义：col ≥ Sk 恒为屏蔽，mask 越界列内容被忽略）
+ *   - 通过 params.mask_ptr / mask_batch_stride / mask_row_stride / mask_seqlen_q / mask_seqlen_k 寻址
  *
- * copy_g2s_mask 只需行谓词（列方向已由 -inf pad 保证）：
+ * copy_g2s_mask 行/列联合谓词（Sk%8==0 保证 128-bit 向量不跨 Sk 边界）：
  *   行坐标 >= params.mask_seqlen_q - m_block*kBlockM 的 copy 向量被 copy_if 跳过，
  *   对应 smem 行在 prologue 一次性清 0（防止未初始化 smem 的 NaN 垃圾模式）。
+ *   列坐标 >= Sk - n_block*kBlockN 的向量（仅全局边界 tile 非平凡）同样跳过，
+ *   对应 smem 列一次性预清 -inf（softmax 语义屏蔽位）。清零与 cp.async 写入位置
+ *   不重叠（谓词为假的向量从不被写入），无 race；非边界 tile 的整块拷贝发生在
+ *   边界 tile 消费完成之后（迭代间 __syncthreads 分隔），覆写安全。
+ *   Is_even_MN（Sk%kBlockN==0 且 Sq%kBlockM==0）时列谓词编译期全部消除。
  *
  * Smem 布局：
  *   [sQ (kBlockM × kHeadDim, swizzled)]
@@ -40,6 +46,8 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/array.h"
 #include "cutlass/numeric_types.h"
+
+#include <c10/cuda/CUDAException.h>   // C10_CUDA_CHECK（launcher 的 cudaFuncSetAttribute 检查）
 
 #include "fa_fwd_mask.h"
 
@@ -140,11 +148,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
     auto gmem_thr_copy_Mask = gmem_tiled_copy_Mask.get_thread_slice(tidx);
 
     // gMask：全局 mask tensor for this batch，用 local_tile 按 n_block 索引
-    // 行数 = mask 实际行数（≥ seqlen_q，无需对齐）；越界行的 copy 由行谓词跳过
+    // 行数 = mask 实际行数（≥ seqlen_q，无需对齐）；越界行的 copy 由行谓词跳过。
+    // 列数 = mask 实际列数（≥ seqlen_k 且 %8==0，无需对齐到 kBlockN）；边界 tile 的
+    // 越界列向量由列谓词跳过（见 copy_g2s_mask），不发生 gmem 越界读
     Tensor mMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<const Element*>(params.mask_ptr)
                       + bidb * params.mask_batch_stride),
-        make_shape(params.mask_seqlen_q, params.seqlen_k_rounded),
+        make_shape(params.mask_seqlen_q, params.mask_seqlen_k),
         make_stride(params.mask_row_stride, _1{})
     );
     Tensor gMask = local_tile(mMask, Shape<Int<kBlockM>, Int<kBlockN>>{},
@@ -178,6 +188,31 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
                 #pragma unroll
                 for (int n = 0; n < size<2>(tQsMask); ++n) {
                     if (!tMpMask(m, n)) { clear(tQsMask(_, m, n)); }
+                }
+            }
+        }
+    }
+
+    // ── mask 列谓词（k 维不 pad）：Sk 非 kBlockN 倍数时，全局边界 tile 的越界列 ───
+    // 由 copy 列谓词跳过拷贝（见 copy_g2s_mask），其 smem 一次性预清 -inf——softmax
+    // 语义屏蔽位（col ≥ Sk 恒为 -inf）。Sk%8==0 → 128-bit 向量整段落在界内/界外，
+    // 向量粒度谓词即可。与 cp.async 写入位置不重叠（谓词为假的向量从不被写入）；
+    // 非边界 tile 的整块拷贝在边界 tile 消费之后（迭代间 __syncthreads 分隔）。
+    // Is_even_MN（Sk%kBlockN==0）时编译期消除。
+    if constexpr (!Is_even_MN) {
+        const int mask_k_tail = actual_seqlen_k % kBlockN;
+        if (mask_k_tail != 0) {
+            const Element mask_neg_inf(static_cast<float>(-INFINITY));
+            #pragma unroll
+            for (int m = 0; m < size<1>(tQsMask); ++m) {
+                #pragma unroll
+                for (int n = 0; n < size<2>(tQsMask); ++n) {
+                    if (get<1>(tMcMask(_0{}, m, n)) >= mask_k_tail) {
+                        #pragma unroll
+                        for (int v = 0; v < size<0>(tQsMask); ++v) {
+                            tQsMask(v, m, n) = mask_neg_inf;
+                        }
+                    }
                 }
             }
         }
@@ -228,16 +263,37 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
     }
 
-        // ── copy_g2s_mask：将一个 mask tile 从 gmem 搬到 smem（行谓词跳过越界行）──────
-    // 列方向：seqlen_k_rounded 已由调用方对齐到 8（128bit / sizeof(bf16) = 8），
-    // gmem 中越界列已填 -inf，cp.async 128-bit 直接搬整个 tile，越界列的 -inf 自然流入 smem。
-    // 行方向：tMpMask 谓词跳过 mask 实际行数之外的行（q 维无需 pad）。
+        // ── copy_g2s_mask：将一个 mask tile 从 gmem 搬到 smem（行/列联合谓词）──────
+    // 行方向（!kMaskQFull）：越界行的向量被跳过（smem 已预清 0）。
+    // 列方向（!Is_even_MN）：仅全局边界 tile（n_block_id == n_block_max-1）且
+    // Sk%kBlockN!=0 时存在越界列——联合谓词跳过（smem 已预清 -inf）；其余 tile
+    // 整块在界内，走无谓词/行谓词原路径（Is_even_MN 时编译期全部消除列谓词）。
 auto copy_g2s_mask = [&](int n_block_id) {
     // tQsMask 是 3D (COPY_V, COPY_M, COPY_N)；tQgMask(_, _, _, n_block_id) rank 匹配
-    if constexpr (Kernel_traits::kMaskQFull) {
-        cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
+    const bool cols_full = Is_even_MN || (n_block_id < n_block_max - 1) ||
+                           (actual_seqlen_k % kBlockN == 0);
+    if (cols_full) {
+        if constexpr (Kernel_traits::kMaskQFull) {
+            cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
+        } else {
+            cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
+                          tQgMask(_, _, _, n_block_id), tQsMask);
+        }
     } else {
-        cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
+        // 行+列联合谓词（分支 CTA-uniform，无 warp divergence；谓词向量的 smem
+        // 位置已预清 -inf/0，跳过即保持语义）
+        const int cols_left = actual_seqlen_k - n_block_id * kBlockN;  // 8 对齐
+        Tensor predK = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+        #pragma unroll
+        for (int m = 0; m < size<0>(predK); ++m) {
+            #pragma unroll
+            for (int n = 0; n < size<1>(predK); ++n) {
+                predK(m, n) = (get<1>(tMcMask(_0{}, m, n)) < cols_left)
+                           && (Kernel_traits::kMaskQFull ||
+                               get<0>(tMcMask(_0{}, m, n)) < mask_rows_left);
+            }
+        }
+        cute::copy_if(gmem_tiled_copy_Mask, predK,
                       tQgMask(_, _, _, n_block_id), tQsMask);
     }
 };
@@ -248,7 +304,7 @@ auto copy_g2s_mask = [&](int n_block_id) {
     //   mask=0    → 可见，score 不变（acc_s += 0）
     //   mask=-inf → 屏蔽，score → -inf（acc_s += -inf）
     //
-    // 由于 copy_g2s_mask 已将越界列的 -inf 搬入 sMask，这里只需纯加法，
+    // 由于越界列已由 prologue 预清 -inf（列谓词跳过拷贝）、越界行清 0，这里只需纯加法，
     // 无任何分支，SIMD 效率最优，零 warp divergence。
     // 注意：acc_s 此时尚未乘 softmax_scale，mask 需乘 1/scale 预先还原
     // （0/-inf mask 行为不变；有限值 mask 此前被错误地乘了 scale）。
@@ -528,7 +584,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
     Tensor mMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<const Element*>(params.mask_ptr)
                       + bidb * params.mask_batch_stride),
-        make_shape(params.mask_seqlen_q, params.seqlen_k_rounded),
+        make_shape(params.mask_seqlen_q, params.mask_seqlen_k),
         make_stride(params.mask_row_stride, _1{})
     );
     Tensor gMask = local_tile(mMask, Shape<Int<kBlockM>, Int<kBlockN>>{},
@@ -558,6 +614,30 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
                 #pragma unroll
                 for (int n = 0; n < size<2>(tQsMask); ++n) {
                     if (!tMpMask(m, n)) { clear(tQsMask(_, m, n)); }
+                }
+            }
+        }
+    }
+
+    // ── mask 列谓词（k 维不 pad，与 base kernel 同策略；仅含全局边界 tile 的 split）──
+    // 守卫 n_end == n_block_max：边界 tile 只属于最后一个 split。其余 split 的所有
+    // tile 均整块在界内，首轮即整块拷贝——若也预清 -inf 会与跨线程的清零构成
+    // write-after-write race（拷贝在首个 __syncthreads 之前发射），必须跳过。
+    // 本 split 首个处理块恰为边界 tile（倒序遍历），列谓词拷贝与预清不重叠，无 race。
+    if constexpr (!Is_even_MN) {
+        const int mask_k_tail = actual_seqlen_k % kBlockN;
+        if (mask_k_tail != 0 && n_end == n_block_max) {
+            const Element mask_neg_inf(static_cast<float>(-INFINITY));
+            #pragma unroll
+            for (int m = 0; m < size<1>(tQsMask); ++m) {
+                #pragma unroll
+                for (int n = 0; n < size<2>(tQsMask); ++n) {
+                    if (get<1>(tMcMask(_0{}, m, n)) >= mask_k_tail) {
+                        #pragma unroll
+                        for (int v = 0; v < size<0>(tQsMask); ++v) {
+                            tQsMask(v, m, n) = mask_neg_inf;
+                        }
+                    }
                 }
             }
         }
@@ -604,12 +684,31 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
     }
 
-    // ── copy_g2s_mask（与 base kernel 一致：行谓词跳过越界行，列由 -inf pad 保证）──
+    // ── copy_g2s_mask（行/列联合谓词，与 base kernel 同策略）──────────────────
+    // 仅全局边界 tile（落在包含它的那个 split）且 Sk%kBlockN!=0 时存在列越界
     auto copy_g2s_mask = [&](int n_block_id) {
-        if constexpr (Kernel_traits::kMaskQFull) {
-            cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
+        const bool cols_full = Is_even_MN || (n_block_id < n_block_max - 1) ||
+                               (actual_seqlen_k % kBlockN == 0);
+        if (cols_full) {
+            if constexpr (Kernel_traits::kMaskQFull) {
+                cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
+            } else {
+                cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
+                              tQgMask(_, _, _, n_block_id), tQsMask);
+            }
         } else {
-            cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
+            const int cols_left = actual_seqlen_k - n_block_id * kBlockN;  // 8 对齐
+            Tensor predK = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+            #pragma unroll
+            for (int m = 0; m < size<0>(predK); ++m) {
+                #pragma unroll
+                for (int n = 0; n < size<1>(predK); ++n) {
+                    predK(m, n) = (get<1>(tMcMask(_0{}, m, n)) < cols_left)
+                               && (Kernel_traits::kMaskQFull ||
+                                   get<0>(tMcMask(_0{}, m, n)) < mask_rows_left);
+                }
+            }
+            cute::copy_if(gmem_tiled_copy_Mask, predK,
                           tQgMask(_, _, _, n_block_id), tQsMask);
         }
     };
@@ -918,7 +1017,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
     Tensor mMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<const Element*>(params.mask_ptr)
                       + bidb * params.mask_batch_stride),
-        make_shape(params.mask_seqlen_q, params.seqlen_k_rounded),
+        make_shape(params.mask_seqlen_q, params.mask_seqlen_k),
         make_stride(params.mask_row_stride, _1{})
     );
     Tensor gMask = local_tile(mMask, Shape<Int<kBlockM>, Int<kBlockN>>{},
@@ -950,6 +1049,34 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
                     #pragma unroll
                     for (int n = 0; n < size<2>(tQsMask); ++n) {
                         if (!tMpMask(m, n)) { clear(tQsMask(_, m, n, st)); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── mask 列谓词（k 维不 pad，与单缓冲版同策略；仅含全局边界 tile 的 split）──
+    // 边界 tile 是本 split 首个处理块（j=0 → stage 0），所有 stage 一并预清
+    //（stage 1 的预清随后即被首个整块拷贝覆写，无害）；stage 0 的 -inf 列在
+    // 迭代 j=0 消费完毕（尾部 __syncthreads）之后才会被流水回绕的整块拷贝覆写，
+    // 无 race。其余 split 必须跳过（其 tile 全部整块在界内，预清会与首轮整块
+    // 拷贝构成跨线程 write-after-write race，见单缓冲版注释）。
+    if constexpr (!Is_even_MN) {
+        const int mask_k_tail = actual_seqlen_k % kBlockN;
+        if (mask_k_tail != 0 && n_end == n_block_max) {
+            const Element mask_neg_inf(static_cast<float>(-INFINITY));
+            #pragma unroll
+            for (int st = 0; st < kStages; ++st) {
+                #pragma unroll
+                for (int m = 0; m < size<1>(tQsMask); ++m) {
+                    #pragma unroll
+                    for (int n = 0; n < size<2>(tQsMask); ++n) {
+                        if (get<1>(tMcMask(_0{}, m, n)) >= mask_k_tail) {
+                            #pragma unroll
+                            for (int v = 0; v < size<0>(tQsMask); ++v) {
+                                tQsMask(v, m, n, st) = mask_neg_inf;
+                            }
+                        }
                     }
                 }
             }
@@ -1025,10 +1152,29 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
     };
     auto copy_g2s_mask = [&](int nb, int stage) {
         Tensor tQsMask_st = tQsMask(_, _, _, stage);
-        if constexpr (Kernel_traits::kMaskQFull) {
-            cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, nb), tQsMask_st);
+        // 列谓词（k 维不 pad）：仅全局边界 tile 且 Sk%kBlockN!=0 时非平凡
+        const bool cols_full = Is_even_MN || (nb < n_block_max - 1) ||
+                               (actual_seqlen_k % kBlockN == 0);
+        if (cols_full) {
+            if constexpr (Kernel_traits::kMaskQFull) {
+                cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, nb), tQsMask_st);
+            } else {
+                cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
+                              tQgMask(_, _, _, nb), tQsMask_st);
+            }
         } else {
-            cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
+            const int cols_left = actual_seqlen_k - nb * kBlockN;  // 8 对齐
+            Tensor predK = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+            #pragma unroll
+            for (int m = 0; m < size<0>(predK); ++m) {
+                #pragma unroll
+                for (int n = 0; n < size<1>(predK); ++n) {
+                    predK(m, n) = (get<1>(tMcMask(_0{}, m, n)) < cols_left)
+                               && (Kernel_traits::kMaskQFull ||
+                                   get<0>(tMcMask(_0{}, m, n)) < mask_rows_left);
+                }
+            }
+            cute::copy_if(gmem_tiled_copy_Mask, predK,
                           tQgMask(_, _, _, nb), tQsMask_st);
         }
     };

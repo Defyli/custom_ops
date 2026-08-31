@@ -1,27 +1,33 @@
 /*
- * Flash Attention Forward with Multiplicative Mask — Kernel Traits
+ * Flash Attention Forward with Additive Mask — Kernel Traits（sm89 基线）
  *
  * 在 FA2 Flash_fwd_kernel_traits 的基础上新增：
- *   - SmemLayoutMask    : (kBlockM, kBlockN, kStages=1)，swizzled
+ *   - SmemLayoutMask    : (kBlockM, kBlockN, kStages)，swizzled
  *   - GmemTiledCopyMask : cp.async 128-bit
  *   - SmemCopyAtomMask  : smem → register 的 copy atom（与 rab 相同）
  *
  * kSmemSize（覆盖基类）= 基类 kSmemSize + mask tile，供 run_flash_fwd_with_mask 使用。
  *
- * Mask tensor 的 global mem 布局：(B, seqlen_q, seqlen_k_rounded)，row-major，bf16
- * seqlen_k_rounded = ceil(seqlen_k / kBlockN) * kBlockN（由调用方保证对齐）
+ * Mask tensor 的 global mem 布局（无 pad 契约，详见 fa_fwd_params.h / fa_fwd_kernel.h）：
+ *   (B, mask_seqlen_q, mask_seqlen_k)，row-major，fp16/bf16（与输入同 dtype）
+ *   - q 维：mask_seqlen_q ∈ [seqlen_q, 任意]，无需对齐——kernel 行谓词跳过越界行，
+ *     这些行的输出被 epilogue 丢弃
+ *   - k 维：mask_seqlen_k ∈ [seqlen_k, 任意] 且 %8==0（128-bit cp.async 行对齐），
+ *     无需 pad 到 kBlockN——边界 tile 的越界列由列谓词跳过拷贝、smem 预清 -inf
+ *     （语义：col ≥ Sk 恒为屏蔽，mask 越界列内容被忽略）
  *
- * Mask 语义：乘法 mask
- *   0.0  → 屏蔽（乘 0，softmax 后 weight → 0，等效 -inf）
- *   1.0  → 可见
+ * Mask 语义：加法 mask（与 PyTorch SDPA 对齐，softmax(S·scale + mask)）
+ *   0 → 可见，-inf → 屏蔽，有限值 → 任意偏置（ALiBi 风格）
  *
  * 参数
  * ----
  * kHeadDim_  : attention head dim（64 或 128）
  * kBlockM_   : Q tile 行数
  * kBlockN_   : K/V tile 行数
- * kNWarps_   : warp 数（固定 4）
- * elem_type  : bf16 -> cutlass::bfloat16_t
+ * kNWarps_   : warp 数（128×128 tile 需 8，其余 4）
+ * MaskQFull_ : host 保证 mask_seqlen_q % kBlockM == 0 时置 true（编译期裁行谓词）
+ * elem_type  : fp16 → cutlass::half_t / bf16 → cutlass::bfloat16_t
+ * kStages_   : K/V/Mask 多级缓冲级数（splitkv 双缓冲路径用 2，默认 1 = 单缓冲）
  */
 
 #pragma once

@@ -12,8 +12,8 @@
 
 namespace mixed_gemm {
 
-// sm120 kernel 是否编入本编译单元（编译目标含 >= sm120a 的 arch；
-// 与 FA 的 fa_mask_sm120_supported 同一判定方式，编译期/运行期双重检查）。
+// sm120 kernel 是否编入本编译单元（编译目标含 sm120a 家族；判定宏来自
+// csrc/arch_targets.h 标准入口，与 FA 的分发同一判定，编译期/运行期双重检查）。
 bool mixed_gemm_sm120_compiled() noexcept;
 
 // 设备是否可走 sm120 路径：major == 12 且 kernel 已编入。

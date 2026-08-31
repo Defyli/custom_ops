@@ -7,7 +7,8 @@ with two core operators:
 
 - **`mha_fwd_with_mask`**: a FlashAttention-2 forward implementation supporting
   **arbitrary additive masks** (0 = visible / -inf = masked), deeply optimized for
-  consumer GPUs (sm120 / sm89) and significantly faster than PyTorch SDPA with a mask
+  consumer GPUs (sm120 / sm89, bf16 / fp16) and Volta data-center GPUs (sm70 /
+  V100, fp16), significantly faster than PyTorch SDPA with a mask
 - **`mixed_gemm`**: a mixed-precision GEMM that solves the **bf16 weight-precision
   loss vs tf32 speed** dilemma of recommendation models — a bf16 tensor-core main
   term plus a low-precision tensor-core residual correction term restores
@@ -20,15 +21,28 @@ with two core operators:
 
 - **Arbitrary masks go straight into softmax**: causal, sliding-window, padding,
   random-sparse (item-level masking) — any pattern, no kernel changes
-- **sm120 (RTX 5090D)**: **160–197 TFLOPS** on standard shapes (70–85% of the
-  measured cuBLAS bf16 peak), **2–2.7x** over SDPA+mask; up to **53x** on
-  small-grid long-sequence shapes
-- **sm89 (RTX 4090D)**: works out of the box — **1.1–1.9x** over SDPA+mask on
-  standard shapes, up to **34x** on small-grid long-sequence shapes
+- **sm120 (RTX 5090D)**: **160–180 TFLOPS** on standard shapes (68–76% of the
+  measured cuBLAS bf16 peak), **1.62–2.48x** over SDPA+mask and **1.5–3.5x**
+  over official FlexAttention in the same mask setting; up to **60x** on
+  small-grid long-sequence shapes (**104x** vs FlexAttention); ragged shapes
+  (Sk%8≠0 auto-pad / arbitrary Sq) at **1.65–7.8x** over SDPA+mask
+- **sm89 (RTX 4090D)**: works out of the box — **1.15–1.86x** over SDPA+mask
+  and **1.3–4.5x** over FlexAttention on standard shapes, up to **31x** on
+  small-grid long-sequence shapes (**51x** vs FlexAttention); most ragged
+  shapes keep their speedup
+- **sm70 (Tesla V100)**: a dedicated fp16 path (V100 has no bf16 tensor cores)
+  with a fully hand-built data path — WMMA m16n16k16 plus a conflict-free
+  swizzle (sm70 has no ldmatrix / cp.async / TMA); standard shapes reach
+  **16–24 TFLOPS at d=128 / 11–17 TFLOPS at d=64** (13–29% of the measured
+  cuBLAS fp16 peak), **1.07–1.82x** over SDPA+mask; on the mask-free
+  equivalent it beats the open-source flash-attention-v100 reference by
+  **1.23–1.31x** at d=128; no Split-KV yet (small-grid long-sequence shapes
+  are a known gap)
 - **Native GQA**: K/V head count only needs to divide Q head count,
   no manual expansion required
-- **Adaptive Split-KV**: a cost model picks the split count automatically;
-  large grids fall back to a single kernel with zero overhead — nothing to tune
+- **Adaptive Split-KV** (sm89/sm120): a cost model picks the split count
+  automatically; large grids fall back to a single kernel with zero overhead —
+  nothing to tune
 
 **Mixed-precision GEMM `mixed_gemm`**
 
@@ -57,37 +71,75 @@ with two core operators:
 - **JIT build**: the first import compiles automatically (multi-process safe),
   `torch.compile`/AOTI compatible
 
-> Full record of the FA porting and optimization journey:
-> [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md) (in Chinese).
+> Full records of the FA porting and optimization journey:
+> [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md)
+> and
+> [docs/fa_sm70_porting_and_optimization.md](docs/fa_sm70_porting_and_optimization.md)
+> (in Chinese).
 
 ## Performance
 
 ### RTX 5090D (sm120, bf16)
 
-Standard shapes: **160–197 TFLOPS** (70–85% of the measured cuBLAS bf16 peak),
-**2–2.7x** over SDPA+mask:
+Test setup: RTX 5090D / PyTorch 2.11 / CUDA 12.8, default benchmark settings
+(see the [Benchmark](#benchmark) section), with a 10% random -inf mask.
 
-| Shape | custom | SDPA+mask | Speedup |
-|---|---|---|---|
-| d64 B=4 H=16 S=2048 | 377.4µs (182.1 TF) | 749.3µs | **1.99x** |
-| d64 B=32 H=16 S=1024 | 697.2µs (197.1 TF) | 1388.2µs | **1.99x** |
-| d128 B=4 H=16 S=2048 | 776.4µs (177.0 TF) | 1873.7µs | **2.41x** |
-| d128 B=4 H=16 Hk=4 S=2048 (GQA) | 772.1µs (178.0 TF) | 1877.7µs | **2.43x** |
+Standard shapes: **160–180 TFLOPS** (68–76% of the measured cuBLAS bf16 peak),
+**1.62–2.48x** over SDPA+mask and **1.5–3.5x** over official FlexAttention
+(same mask setting):
+
+| Shape | custom | SDPA+mask | Speedup | FlexAtt | vs Flex |
+|---|---|---|---|---|---|
+| d64 B=4 H=16 S=2048 | 387.1µs (177.5 TF) | 754.6µs | **1.95x** | 1355.6µs | **3.50x** |
+| d64 B=32 H=16 S=1024 | 858.8µs (160.0 TF) | 1394.8µs | **1.62x** | 2339.3µs | **2.72x** |
+| d64 B=1 H=8 S=8192 | 853.9µs (161.0 TF) | 1672.2µs | **1.96x** | 2996.2µs | **3.51x** |
+| d128 B=4 H=16 S=2048 | 775.9µs (177.1 TF) | 1870.9µs | **2.41x** | 1710.8µs | **2.20x** |
+| d128 B=4 H=16 Hk=4 S=2048 (GQA) | 775.9µs (177.1 TF) | 1925.9µs | **2.48x** | 1711.1µs | **2.21x** |
+| d128 B=32 H=16 S=1024 | 1527.1µs (180.0 TF) | 3572.7µs | **2.34x** | 3101.1µs | **2.03x** |
 
 Small-grid + long-sequence shapes (Split-KV kicks in automatically):
-**15–53x** over SDPA+mask:
+**13–60x** over SDPA+mask and **22–104x** over FlexAttention:
 
-| Shape | custom | SDPA+mask | Speedup |
-|---|---|---|---|
-| d128 Sq=128 Sk=8192 | 24.7µs | 553.5µs | **22.4x** |
-| d128 Sq=128 Sk=32768 | 41.2µs | 2199.0µs | **53.3x** |
-| d128 Sq=1024 Sk=8192 | 36.2µs (118.6 TF) | 555.0µs | **15.3x** |
-| d64 Sq=128 Sk=8192 | 20.7µs | 432.6µs | **20.9x** |
+| Shape | custom | SDPA+mask | Speedup | FlexAtt | vs Flex |
+|---|---|---|---|---|---|
+| d128 Sq=128 Sk=8192 | 22.5µs | 558.1µs | **24.8x** | 962.5µs | **42.7x** |
+| d128 Sq=128 Sk=32768 | 36.9µs | 2202.6µs | **59.8x** | 3823.6µs | **103.7x** |
+| d128 Sq=1024 Sk=8192 | 43.0µs (99.9 TF) | 558.1µs | **13.0x** | 960.5µs | **22.3x** |
+| d64 Sq=128 Sk=8192 | 16.4µs | 436.3µs | **26.6x** | 1053.7µs | **64.3x** |
+
+Ragged shapes (`--suite ragged`, Sk%8!=0 auto-padding / arbitrary Sq; the
+"aligned equiv." column quantifies the auto-pad overhead; **1.17–19.7x** vs
+FlexAttention):
+
+| Shape (B,H,Hk,Sq,Sk,d) | custom | aligned equiv. (pad overhead) | SDPA+mask | Speedup | vs Flex |
+|---|---|---|---|---|---|
+| d64 Sq=2048 Sk=2053 | 100.4µs (85.8 TF) | 57.7µs (+74%) | 184.3µs | 1.83x | 2.57x |
+| d128 Sq=1024 Sk=1031 | 98.3µs (88.0 TF) | 67.9µs (+45%) | 178.3µs | 1.81x | 1.17x |
+| d128 B=4 Sq=2048 Sk=4099 | 2003.7µs (137.3 TF) | 1485.1µs (+35%) | 3983.4µs | 1.99x | 1.30x |
+| d64 Sq=8192 Sk=8195 | 1214.5µs (113.2 TF) | 853.9µs (+42%) | 2006.0µs | 1.65x | 2.27x |
+| d64 Sq=1000 Sk=1024 (any Sq) | 32.7µs (128.1 TF) | ≈zero | 80.9µs | 2.47x | 4.44x |
+| d64 B=2 Sq=333 Sk=1024 | 30.7µs (90.9 TF) | ≈zero | 79.8µs | 2.60x | 4.59x |
+| d128 Sq=127 Sk=2048 | 18.4µs | ≈zero | 143.4µs | 7.78x | 19.7x |
+| d128 Sq=1000 Sk=4099 (both ragged) | 301.1µs (111.5 TF) | — | 620.4µs | 2.06x | 1.28x |
+| d128 B=4 Hk=4 Sq=2048 Sk=2053 (GQA) | 896.7µs (153.6 TF) | 775.9µs (+16%) | 2094.1µs | 2.34x | 1.49x |
+
+> Note: the absolute pad-copy cost for ragged Sk is on the same order as sm89,
+but the sm120 kernel is faster, so the relative overhead is higher (+35–72%);
+GQA drops to +16% (smaller K/V). For latency-critical paths with a fixed Sk,
+pre-align to a multiple of 8 (zero-copy main path).
 
 > Note: with an arbitrary `attn_mask`, PyTorch SDPA can only use the MemEfficient
 > backend (the FlashAttention backend does not support arbitrary masks). On some
 > shapes this operator **with a mask is even faster than SDPA's mask-free Flash
 > backend**.
+>
+> FlexAtt = `torch.nn.attention.flex_attention` (PyTorch's official operator for
+> custom masks, torch≥2.5): `create_block_mask` pre-building + `torch.compile`;
+> block-mask construction and Triton compilation happen during warmup and are
+> excluded from timing, mirroring this operator's "mask pre-built, straight into
+> the kernel". With a 10% random -inf mask almost every block is partial, so
+> FlexAttention cannot exploit block sparsity. It has no Split-KV, hence the
+> largest gaps on small-grid long-sequence shapes (22–104x).
 
 ### RTX 4090D (sm89, bf16)
 
@@ -96,44 +148,125 @@ ported from sm120: small-grid long-sequence shapes split along the K dimension
 to fill the SMs automatically, while large grids fall back to a single kernel —
 zero configuration needed.
 
-Test setup: RTX 4090D / PyTorch 2.6.0 / CUDA 11.8, default benchmark settings
+Test setup: RTX 4090D / PyTorch 2.11 / CUDA 12.8, default benchmark settings
 (see the [Benchmark](#benchmark) section).
 
-Standard shapes (large grid):
+Standard shapes (large grid): **1.15–1.86x** over SDPA+mask and **1.30–4.50x**
+over FlexAttention:
 
-| Shape | custom | SDPA+mask | Speedup |
-|---|---|---|---|
-| d64 B=1 H=16 S=1024 | 73.7µs (58.3 TF) | 84.0µs | **1.14x** |
-| d64 B=4 H=16 S=2048 | 587.8µs (116.9 TF) | 782.3µs | **1.33x** |
-| d64 B=1 H=8 S=8192 | 1166.3µs (117.8 TF) | 1686.5µs | **1.45x** |
-| d64 B=32 H=16 S=1024 | 1195.0µs (115.0 TF) | 1508.4µs | **1.26x** |
-| d128 B=1 H=16 S=1024 | 103.4µs (83.1 TF) | 170.0µs | **1.64x** |
-| d128 B=4 H=16 S=2048 | 1103.8µs (124.5 TF) | 1936.4µs | **1.75x** |
-| d128 B=1 H=8 S=8192 | 2172.9µs (126.5 TF) | 3811.3µs | **1.75x** |
-| d128 B=4 H=16 Hk=4 S=2048 (GQA) | 1099.7µs (125.0 TF) | 2040.8µs | **1.86x** |
-| d128 B=32 H=16 S=1024 | 2269.2µs (121.1 TF) | 3866.6µs | **1.70x** |
+| Shape | custom | SDPA+mask | Speedup | FlexAtt | vs Flex |
+|---|---|---|---|---|---|
+| d64 B=1 H=16 S=1024 | 72.7µs (59.1 TF) | 84.0µs | **1.15x** | 94.2µs | **1.30x** |
+| d64 B=4 H=16 S=2048 | 582.7µs (117.9 TF) | 784.3µs | **1.35x** | 2363.5µs | **4.06x** |
+| d64 B=1 H=8 S=8192 | 1121.2µs (122.6 TF) | 1644.5µs | **1.47x** | 5047.3µs | **4.50x** |
+| d64 B=32 H=16 S=1024 | 1266.7µs (108.5 TF) | 1469.4µs | **1.16x** | 4751.4µs | **3.75x** |
+| d128 B=1 H=16 S=1024 | 100.4µs (85.6 TF) | 164.9µs | **1.64x** | 246.8µs | **2.46x** |
+| d128 B=4 H=16 S=2048 | 1175.5µs (116.9 TF) | 1874.9µs | **1.60x** | 2734.1µs | **2.33x** |
+| d128 B=1 H=8 S=8192 | 2133.0µs (128.9 TF) | 3701.8µs | **1.74x** | 5029.9µs | **2.36x** |
+| d128 B=4 H=16 Hk=4 S=2048 (GQA) | 1069.2µs (128.5 TF) | 1983.4µs | **1.86x** | 2446.3µs | **2.29x** |
+| d128 B=32 H=16 S=1024 | 2215.9µs (124.0 TF) | 3768.3µs | **1.70x** | 5006.7µs | **2.26x** |
 
 Small-grid + long-sequence shapes (Split-KV kicks in automatically):
+**7.1–31.3x** over SDPA+mask and **9.6–50.8x** over FlexAttention:
 
-| Shape | custom | SDPA+mask | Speedup | SDPA flash* |
-|---|---|---|---|---|
-| d128 Sq=128 Sk=8192 | 22.5µs (23.8 TF) | 462.8µs | **20.55x** | 29.7µs |
-| d128 Sq=128 Sk=32768 | 53.2µs (40.3 TF) | 1824.8µs | **34.27x** | 52.2µs |
-| d128 Sq=512 Sk=8192 | 39.9µs (53.8 TF) | 429.1µs | **10.74x** | 37.9µs |
-| d128 Sq=1024 Sk=8192 | 55.3µs (77.7 TF) | 428.3µs | **7.74x** | 52.2µs |
-| d128 H=2 Hk=1 Sq=512 Sk=16384 | 96.3µs (89.2 TF) | 840.8µs | **8.73x** | 122.9µs |
-| d64 Sq=128 Sk=8192 | 19.5µs (13.8 TF) | 412.6µs | **21.21x** | 16.4µs |
-| d64 Sq=1024 Sk=8192 | 41.8µs (51.3 TF) | 415.7µs | **9.94x** | 33.8µs |
-| d64 H=2 Hk=1 Sq=512 Sk=16384 | 57.3µs (74.9 TF) | 809.0µs | **14.11x** | 69.6µs |
+| Shape | custom | SDPA+mask | Speedup | SDPA flash* | FlexAtt | vs Flex |
+|---|---|---|---|---|---|---|
+| d128 Sq=128 Sk=8192 | 23.5µs (22.9 TF) | 417.8µs | **17.81x** | 29.7µs | 621.8µs | **26.5x** |
+| d128 Sq=128 Sk=32768 | 54.3µs (39.6 TF) | 1696.7µs | **31.26x** | 52.9µs | 2226.2µs | **41.0x** |
+| d128 Sq=512 Sk=8192 | 36.9µs (58.3 TF) | 414.7µs | **11.25x** | 39.1µs | 622.7µs | **16.9x** |
+| d128 Sq=1024 Sk=8192 | 58.4µs (73.6 TF) | 414.7µs | **7.11x** | 48.5µs | 562.2µs | **9.6x** |
+| d128 H=2 Hk=1 Sq=512 Sk=16384 | 94.2µs (91.2 TF) | 818.1µs | **8.68x** | 123.9µs | 1233.9µs | **13.1x** |
+| d64 Sq=128 Sk=8192 | 20.5µs (13.1 TF) | 444.4µs | **21.70x** | 17.2µs | 1039.6µs | **50.8x** |
+| d64 Sq=1024 Sk=8192 | 41.0µs (52.4 TF) | 403.5µs | **9.85x** | 33.8µs | 1044.5µs | **25.5x** |
+| d64 H=2 Hk=1 Sq=512 Sk=16384 | 55.3µs (77.7 TF) | 774.4µs | **14.00x** | 66.4µs | 2012.2µs | **36.4x** |
 
 > \* The SDPA flash column is the mask-free FlashAttention backend, shown for
 > reference only (it does not support arbitrary masks); the fair comparison is
 > the SDPA+mask column. Thanks to Split-KV, some small-grid shapes now match or
-> beat even this reference (e.g. d128 H=2 Hk=1 Sq=512 Sk=16384: 96.3µs vs 122.9µs).
+> beat even this reference (e.g. d128 H=2 Hk=1 Sq=512 Sk=16384: 94.2µs vs 123.9µs).
 
 For reference: without Split-KV, small-grid long-sequence shapes are processed
 by a single CTA serially walking all KV blocks, taking 234–935µs — with
 Split-KV enabled automatically this drops to 19–53µs (**10–18x**).
+
+Ragged shapes (`Sk % 8 != 0` auto-padding / arbitrary `Sq`, `--suite ragged`).
+The "aligned equiv." column shows the custom time of the same shape with Sk
+rounded down to the multiple of 8, quantifying the auto-pad overhead;
+**1.30–12.8x** vs FlexAttention:
+
+| Shape (B,H,Hk,Sq,Sk,d) | custom | aligned equiv. (pad overhead) | SDPA+mask | Speedup | vs Flex |
+|---|---|---|---|---|---|
+| d64 Sq=2048 Sk=2053 | 179.2µs (48.1 TF) | 120.8µs (+48%) | 178.2µs | 0.99x | 2.31x |
+| d128 Sq=1024 Sk=1031 | 138.2µs (62.6 TF) | 100.4µs (+38%) | 187.4µs | 1.36x | 1.39x |
+| d128 B=4 Sq=2048 Sk=4099 | 2845.7µs (96.7 TF) | 2107.2µs (+35%) | 4064.3µs | 1.43x | 1.30x |
+| d64 Sq=8192 Sk=8195 | 1702.9µs (80.7 TF) | 1121.2µs (+52%) | 2063.4µs | 1.21x | 2.39x |
+| d64 Sq=1000 Sk=1024 (any Sq) | 67.6µs (62.1 TF) | ≈zero | 77.8µs | 1.15x | 3.92x |
+| d64 B=2 Sq=333 Sk=1024 | 37.9µs (73.7 TF) | ≈zero | 66.6µs | 1.76x | 3.89x |
+| d128 Sq=127 Sk=2048 | 31.9µs | ≈zero | 111.6µs | 3.50x | 12.8x |
+| d128 Sq=129 Sk=2048 | 32.8µs | ≈zero | 104.4µs | 3.19x | 4.53x |
+| d128 Sq=1000 Sk=4099 (both ragged) | 477.2µs (70.4 TF) | — | 655.4µs | 1.37x | 1.39x |
+| d128 B=4 Hk=4 Sq=2048 Sk=2053 (GQA) | 1235.0µs (111.6 TF) | 1069.2µs (+16%) | 2154.7µs | 1.74x | 1.52x |
+
+> Note: when `Sk % 8 != 0`, the op internally pads K/V/mask with one copy pass
+> (the `Sq×Sk` mask dominates), and the padded `Sk8` may cross one extra KV-tile
+> boundary; GQA lowers the overhead (smaller K/V). Arbitrary `Sq` is copy-free
+> (row predicates) and scales with the actual Sq. For latency-critical paths with
+> a fixed Sk, pre-align to a multiple of 8 (zero-copy main path).
+>
+> FlexAtt note: FlexAttention's default config (BLOCK_M=128) **fails to compile**
+> on sm89 at d=128 (smem requirement ~112KB exceeds the ~99KB Ada hardware
+> limit; Inductor reports "No valid triton configs"). The tables above use its
+> downgraded `BLOCK_M=64` — the only official config that runs on this
+> architecture. sm120 (Blackwell, 228KB smem) has no such issue and uses the
+> default config throughout.
+
+### Tesla V100 (sm70, fp16)
+
+The sm70 path is **fp16-only** (V100 has no bf16 tensor cores): passing fp16
+tensors to `mha_fwd_with_mask` enables it automatically. The data path is
+built entirely by hand — WMMA m16n16k16 plus a conflict-free swizzle (sm70 has
+no ldmatrix / cp.async / TMA); d=128 opts into the full 96KB of smem. No
+Split-KV yet — small-grid long-sequence shapes are a known gap (porting from
+sm120 is planned).
+
+Test setup: V100-PCIE-32GB / PyTorch 2.0.1 / CUDA 11.7, with a 10% random
+-inf mask.
+
+Standard shapes (large grid): **1.07–1.82x** over SDPA+mask, peaking at
+**24.2 TFLOPS** at d=128 (29% of the measured cuBLAS fp16 peak of 84.2 TF):
+
+| Shape | custom | SDPA+mask | Speedup |
+|---|---|---|---|
+| d64 B=4 H=16 S=1024 | 1001.8µs (17.1 TF) | 1711.6µs | **1.71x** |
+| d64 B=4 H=16 S=2048 | 3982.4µs (17.3 TF) | 6765.7µs | **1.70x** |
+| d64 B=4 H=16 Hk=4 S=2048 (GQA) | 3986.7µs (17.2 TF) | 7268.9µs | **1.82x** |
+| d128 B=1 H=8 S=512 | 65.2µs (16.5 TF) | 92.4µs | **1.42x** |
+| d128 B=4 H=16 S=1024 | 1450.8µs (23.7 TF) | 1864.9µs | **1.29x** |
+| d128 B=4 H=16 S=2048 | 5694.7µs (24.1 TF) | 7313.5µs | **1.28x** |
+| d128 B=4 H=16 Hk=4 S=2048 (GQA) | 5688.6µs (24.2 TF) | 7761.5µs | **1.36x** |
+| d128 B=1 H=8 S=2048 | 878.2µs (19.6 TF) | 938.2µs | **1.07x** |
+
+> Note: on V100 + torch 2.0.1, SDPA with an `attn_mask` can only use the math
+> backend. On the mask-free equivalent (zero additive mask) this operator beats
+> the open-source flash-attention-v100 reference by **1.23–1.31x** across all
+> d=128 shapes (19.1–24.2 TF vs 15.5–19.5 TF — and the reference does not
+> support arbitrary masks); d=64 is on par (0.95–1.07x).
+
+Ragged shapes (`--suite ragged`, Sk%8!=0 auto-padding / arbitrary Sq):
+
+| Shape (B,H,Hk,Sq,Sk,d) | custom | aligned equiv. (pad overhead) | SDPA+mask | Speedup |
+|---|---|---|---|---|
+| d64 Sq=2048 Sk=2053 | 735.4µs (11.7 TF) | 614.3µs (+20%) | 1175.6µs | 1.60x |
+| d128 Sq=1024 Sk=1031 | 558.6µs (15.5 TF) | 446.4µs (+25%) | 764.1µs | 1.37x |
+| d64 B=2 Sq=512 Sk=4099 | 1511.4µs (11.4 TF) | 1211.1µs (+25%) | 2253.6µs | 1.49x |
+| d64 Sq=1000 Sk=1024 (any Sq) | 312.6µs (13.4 TF) | ≈zero | 422.5µs | 1.35x |
+| d128 B=2 Hk=4 Sq=500 Sk=2053 (GQA, both ragged) | 1026.5µs (16.4 TF) | — | 1747.6µs | 1.70x |
+
+> Note: auto-pad overhead on V100 is +20–25% (the kernel itself is slower, so
+> the relative share is lower than on sm89/sm120). Very small-Sq shapes (e.g.
+> Sq=127 d128 → only 16 CTAs) lose to SDPA's math backend without Split-KV —
+> the known gap above. FlexAttention requires torch≥2.5 and is unavailable on
+> this environment (torch 2.0.1, N/A).
 
 ### mixed_gemm (FP8 / INT8 residual backends)
 
@@ -230,12 +363,14 @@ Backend selection notes:
 ## Requirements
 
 - NVIDIA GPU: sm120 (RTX 5090D, both the FA TMA main path and the mixed_gemm
-  sm120a TMA path extensively tested) or sm89
-  (RTX 4090D, cp.async path with Split-KV ported from sm120, tested); other sm80+
-  architectures should compile but are unverified
-- CUDA >= 11.8 (FA sm89 path / mixed_gemm INT8 backend) / >= 12.4 (mixed_gemm FP8
-  backend, SM89+) / >= 12.8 (FA / mixed_gemm sm120a paths), GCC >= 9
-- PyTorch >= 2.1 (CUDA build), bf16
+  sm120a TMA path extensively tested), sm89
+  (RTX 4090D, cp.async path with Split-KV ported from sm120, tested), or sm70
+  (Tesla V100, FA fp16 WMMA path, tested; mixed_gemm is not supported on sm70);
+  other sm80+ architectures should compile but are unverified
+- CUDA >= 11.8 (FA sm89 / sm70 paths / mixed_gemm INT8 backend) / >= 12.4
+  (mixed_gemm FP8 backend, SM89+) / >= 12.8 (FA / mixed_gemm sm120a paths),
+  GCC >= 9
+- PyTorch >= 2.1 (CUDA build), fp16 / bf16
 
 ## Quick Start
 
@@ -272,6 +407,10 @@ y = ops.mixed_gemm(x, w_high, w_low, w_scale, bias=b,
                    activation="silu")                   # fp32 output, accuracy ≈ fp32
 ```
 
+> Dtype note: fp16 works on all supported architectures (sm70 / sm89 / sm120);
+> bf16 requires SM80+ (V100 has no bf16 tensor cores — use fp16 there). On
+> sm89/sm120 either dtype is fine; pick per your model's precision strategy.
+
 Build artifacts are cached in `~/.cache/torch_extensions` by default; override with
 `TORCH_EXTENSIONS_DIR`. Concurrent first-time builds from multiple processes are
 protected by a file lock.
@@ -280,14 +419,16 @@ protected by a file lock.
 
 ### `ops.mha_fwd_with_mask(q, k, v, mask) -> Tensor`
 
-FlashAttention-2 forward with arbitrary bf16 additive mask.
+FlashAttention-2 forward with an arbitrary additive mask. fp16 is supported on
+all architectures (sm70 / sm89 / sm120); bf16 requires SM80+. On V100, fp16
+inputs are auto-routed to the dedicated sm70 path.
 
 | Argument | Shape | Description |
 |---|---|---|
-| `q` | (B, H, Sq, d) | bf16 CUDA contiguous tensor |
-| `k`, `v` | (B, Hk, Sk, d) | bf16 CUDA contiguous tensors |
-| `mask` | (B, 1, Sq, Sk) | bf16 additive mask: 0 = visible / -inf = masked |
-| Returns | (B, H, Sq, d) | bf16 |
+| `q` | (B, H, Sq, d) | fp16 (all archs) or bf16 (SM80+) CUDA contiguous tensor |
+| `k`, `v` | (B, Hk, Sk, d) | CUDA contiguous tensors, same dtype as `q` |
+| `mask` | (B, 1, Sq, Sk) | additive mask, same dtype as `q`: 0 = visible / -inf = masked |
+| Returns | (B, H, Sq, d) | same dtype as the input |
 
 Limitations:
 
@@ -354,18 +495,27 @@ python examples/mixed_gemm_demo.py    # mixed-precision GEMM: weight split + epi
 # Full run: standard shapes + small-grid long-sequence (Split-KV) shapes
 python benchmark/benchmark_fa.py
 
+# V100 (sm70, fp16): standard + small-grid + ragged shapes (vs SDPA+mask / SDPA reference)
+python benchmark/benchmark_sm70.py
+
 # A specific suite / a single shape
 python benchmark/benchmark_fa.py --suite standard
 python benchmark/benchmark_fa.py --suite splitkv
+python benchmark/benchmark_fa.py --suite ragged   # Sk%8!=0 auto-pad / arbitrary Sq
 python benchmark/benchmark_fa.py --shape 4 16 16 2048 2048 128
 
-# Tune iterations and output
+# Tune iterations and output; --no-flex skips the FlexAttention comparison
+# (saves per-shape Triton compilation)
 python benchmark/benchmark_fa.py --warmup 20 --iters 100 --mask-ratio 0.3 --csv result.csv
+python benchmark/benchmark_fa.py --no-flex
 ```
 
 For each shape the script reports latency, TFLOPS and speedup for
-custom / SDPA+mask / SDPA flash (reference), and runs a numerical check
-against SDPA.
+custom / SDPA+mask / FlexAttention / SDPA flash (reference), and runs a
+numerical check against SDPA. For the FlexAttention comparison (torch≥2.5),
+block-mask construction and Triton compilation happen during warmup and are
+excluded from timing; on torch<2.5 or when the default config fails to compile
+(sm89 d=128) it auto-degrades (BLOCK_M=64) or reports N/A.
 
 ```bash
 # mixed_gemm: latency and accuracy vs fp32 / tf32 / bf16 matmul
@@ -382,9 +532,11 @@ custom_ops/
 ├── recsys.py              # RecsysOps: mha_fwd_with_mask / mixed_gemm wrappers + weight-split helper
 ├── csrc/
 │   ├── recsys_bindings.cpp        # torch.ops registration entry
-│   ├── fa/                        # FA2 + mask kernel (sm89 + sm120 paths, decoupled)
-│   │   ├── fa_fwd_op.cu           # operator entry / arch dispatch
-│   │   ├── fa_fwd_launch.h        # per-arch launchers + Split-KV cost model
+│   ├── arch_targets.h             # arch conditional-compilation entry: FA_TARGETS → FA_HAS_SM70/SM8X/SM120 + gpu_major()
+│   ├── fa/                        # FA2 + mask kernel (sm70 / sm89 / sm120 paths, decoupled)
+│   │   ├── fa_fwd_op.cu           # operator entry: validate / auto-pad / fill params (arch-agnostic)
+│   │   ├── fa_fwd_launch.h        # arch dispatch entry: fa_launch_smXX policies + Split-KV cost model
+│   │   ├── sm70/fa_fwd_sm70.h     # sm70 WMMA m16n16k16 kernel (fp16, no split-KV)
 │   │   ├── sm89/fa_fwd_kernel.h   # sm89 cp.async kernel: base / splitkv / combine
 │   │   ├── sm120/fa_fwd_sm120.h   # sm120 TMA pipeline kernel / splitkv / persistent / combine
 │   │   ├── cpu/                   # CPU reference implementation (not wired into dispatch)

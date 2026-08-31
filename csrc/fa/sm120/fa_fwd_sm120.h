@@ -25,11 +25,14 @@
  *   0=可见，-inf=屏蔽，支持任意有限值偏置（ALiBi 风格）。
  *   实现上 mask 加到未缩放的 acc_s 再统一乘 scale，因此应用点需乘 1/scale 预还原
  *   （见各 kernel 内 mask_inv_scale；0/-inf mask 不受此影响）。
- * Mask gmem 布局：(B, mask_seqlen_q, mask_seqlen_k)，row-major，bf16。
+ * Mask gmem 布局：(B, mask_seqlen_q, mask_seqlen_k)，row-major，fp16/bf16（与输入同 dtype）。
  *   q 维无需 pad（mask_seqlen_q ∈ [seqlen_q, 任意]）：TMA 原生 OOB zero-fill +
- *   gmem 直读路径的 copy_if 行谓词处理越界行（输出反正被 epilogue 丢弃）；
- *   k 维越界列由 host/调用方 pad 成 -inf（语义必需：可见的越界列会污染 softmax 分母）
- */
+ *   gmem 直读路径的行谓词处理越界行（输出反正被 epilogue 丢弃）；
+ *   k 维也无需 pad 到 kBlockN（mask_seqlen_k ∈ [seqlen_k, 任意] 且 %8==0，
+ *   16-bit × 8 = TMA 16B 行对齐）：语义 col ≥ Sk 恒为屏蔽，mask 越界列内容被忽略。
+ *   TMA 路径：OOB 列 zero-fill ≠ -inf，apply 点按列坐标强制 -inf（仅边界 tile）；
+ *   gmem 直读路径：逐对列谓词 + -inf 回写（仅边界 tile）
+*/
 
 #pragma once
 
@@ -37,6 +40,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/numeric_types.h"
+#include <c10/cuda/CUDAException.h>   // C10_CUDA_CHECK（launcher 的 cudaFuncSetAttribute 检查）
 
 #include "../common/kernel_traits.h"   // Flash_kernel_traits（MMA atom、ldmatrix copy atom）
 #include "../common/fa_fwd_params.h"   // FA_mask_params（sm89/sm120 共享）
@@ -65,10 +69,11 @@ struct FA_mask_kernel_traits_sm120 : public Base {
     static constexpr int kBlockN  = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
     static constexpr int kStages  = kStages_;
-    // MaskInSmem_=false 时，mask 不经 smem/TMA，由 consumer 线程按 C fragment 布局
-    // 直接从 gmem 读入寄存器（mask 已由 host 双向 pad，无需 predicate）。
-    // 收益：省下的 smem 可提高 occupancy（d64 → 2 CTA/SM）或加大 kBlockM。
-    // mask 在 gmem 中被同 batch 的所有 head 复用，L2 命中率高。
+// MaskInSmem_=false 时，mask 不经 smem/TMA，由 consumer 线程按 C fragment 布局
+// 直接从 gmem 读入寄存器（行/列逐对谓词：越界行跳过，越界列回写 -inf，
+// 仅边界 tile 非平凡；MaskQFull_ 时行谓词编译期裁掉）。
+// 收益：省下的 smem 可提高 occupancy（d64 → 2 CTA/SM）或加大 kBlockM。
+// mask 在 gmem 中被同 batch 的所有 head 复用，L2 命中率高。
     static constexpr bool kMaskInSmem = MaskInSmem_;
 // MaskQFull_=true：host 保证 mask_seqlen_q % kBlockM == 0，gmem 直读路径编译期裁掉
 // 边界谓词分支（ ushort2 逐对谓词 + 坐标张量不生成代码），消除 ~14 寄存器开销
@@ -135,7 +140,7 @@ static constexpr bool kMaskQFull = MaskQFull_;
     // gmem 逻辑视图：(seqlen, d, head, batch)，仅 d 维连续（stride=1）
     using ShapeQKV  = cute::Shape<int32_t, int32_t, int32_t, int32_t>;
     using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
-    // mask：(seqlen_q_rounded, seqlen_k_rounded, batch)
+    // mask：(mask_seqlen_q, mask_seqlen_k, batch)
     using ShapeMask  = cute::Shape<int32_t, int32_t, int32_t>;
     using StrideMask = cute::Stride<int64_t, _1, int64_t>;
 
@@ -242,7 +247,7 @@ flash_fwd_mask_kernel_sm120(
     // ── TMA 分区 ─────────────────────────────────────────────────────────
     auto shape_Q  = make_shape(p.seqlen_q, p.d, p.h, p.b);
     auto shape_KV = make_shape(p.seqlen_k, p.d, p.h_k, p.b);
-    auto shape_Mask = make_shape(p.mask_seqlen_q, p.seqlen_k_rounded, p.b);
+    auto shape_Mask = make_shape(p.mask_seqlen_q, p.mask_seqlen_k, p.b);
 
     Tensor mQ = params.tma_load_Q.get_tma_tensor(shape_Q)(_, _, bidh, bidb);
     Tensor gQ = local_tile(mQ, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, _0{}));  // (bM, bD)
@@ -271,7 +276,7 @@ flash_fwd_mask_kernel_sm120(
     // mask gmem 直读路径（kMaskInSmem=false）：不经 TMA/smem，直接 ldg 到 C fragment
     Tensor mMaskG = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element const*>(p.mask_ptr) + bidb * p.mask_batch_stride),
-        make_shape(p.mask_seqlen_q, p.seqlen_k_rounded),
+        make_shape(p.mask_seqlen_q, p.mask_seqlen_k),
         make_stride(p.mask_row_stride, _1{}));
     Tensor gMaskG = local_tile(mMaskG, Shape<Int<kBlockM>, Int<kBlockN>>{}, make_coord(m_block, _));
 
@@ -321,10 +326,13 @@ flash_fwd_mask_kernel_sm120(
     auto smem_thr_copy_mask   = smem_tiled_copy_mask.get_thread_slice(tidx);
     Tensor tSsMask = smem_thr_copy_mask.partition_S(sMask);  // (CPY, M, N, stage)
 
-    // mask gmem 直读（kMaskInSmem=false 路径）：q 维不 pad。
-    //  - 整块在界内（主场景）：cute tiled_copy 32-bit 向量直拷（与原路径完全一致，零开销）
-    //  - 边界 CTA（mask_rows_left < kBlockM）：C fragment 相邻两元素同列对、偶数列起始，
-    //    逐对谓词 ushort2 直读（4B 对齐），越界行保持 clear 的 0
+    // mask gmem 直读（kMaskInSmem=false 路径）：q/k 维均不 pad。
+    //  - 整块在界内（主场景，含全部非边界 tile）：cute tiled_copy 32-bit 向量直拷
+    //   （与原路径完全一致，零开销）
+    //  - 行边界 CTA（mask_rows_left < kBlockM）：C fragment 相邻两元素同列对、偶数列
+    //    起始，逐对谓词 ushort2 直读（4B 对齐），越界行保持 clear 的 0
+    //  - 列边界 tile（全局末 tile 且 Sk%kBlockN!=0）：行+列联合逐对谓词；列越界对
+    //    回写 -inf（Sk%8==0 → 列对不跨 Sk 边界；上一轮残留值来自其它 tile，必须覆写）
     // 不用 copy_if：运行期谓词会把 32-bit 向量拆成 16-bit 粒度，奇数列地址触发 misaligned
     auto gmem_tiled_copy_mask = make_tiled_copy_C(
         Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, Element>{}, tiled_mma);
@@ -341,39 +349,74 @@ flash_fwd_mask_kernel_sm120(
         clear(rMaskG);   // 边界路径下谓词关闭的元素恒为 0（这些行的输出被 epilogue 丢弃）
     }
     auto load_mask_gmem = [&](int nb) {
-        if constexpr (Kernel_traits::kMaskQFull) {
-            // host 保证 mask_seqlen_q % kBlockM == 0：编译期裁掉边界路径，寄存器零开销
-            cute::copy(gmem_tiled_copy_mask, tMgMask(_, _, _, nb), tMrMaskG_view);
-        } else {
-        if (mask_rows_left >= kBlockM) {   // 主场景：无谓词 32-bit 向量直拷
-            cute::copy(gmem_tiled_copy_mask, tMgMask(_, _, _, nb), tMrMaskG_view);
-        } else {                           // 边界 CTA：逐对谓词 ushort2 直读
+        const int cols_left = p.seqlen_k - nb * kBlockN;
+        if (cols_left >= kBlockN) {          // 主场景：整块列在界内（含全部非边界 tile）
+            if constexpr (Kernel_traits::kMaskQFull) {
+                // host 保证 mask_seqlen_q % kBlockM == 0：编译期裁掉行边界路径，寄存器零开销
+                cute::copy(gmem_tiled_copy_mask, tMgMask(_, _, _, nb), tMrMaskG_view);
+            } else if (mask_rows_left >= kBlockM) {   // 无谓词 32-bit 向量直拷
+                cute::copy(gmem_tiled_copy_mask, tMgMask(_, _, _, nb), tMrMaskG_view);
+            } else {                           // 行边界 CTA：逐对行谓词 ushort2 直读
+                Tensor tMgMaskG_nb = tMgMaskG(_, _, _, nb);
+                #pragma unroll
+                for (int i = 0; i < size(rMaskG); i += 2) {
+                    if (get<0>(tMcMaskG(i)) < mask_rows_left) {
+                        *reinterpret_cast<ushort2*>(&rMaskG(i)) =
+                            *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                    }
+                }
+            }
+        } else {                               // 列边界 tile：行+列联合逐对谓词
             Tensor tMgMaskG_nb = tMgMaskG(_, _, _, nb);
+            const Element neg_inf(static_cast<float>(-INFINITY));
             #pragma unroll
             for (int i = 0; i < size(rMaskG); i += 2) {
-                if (get<0>(tMcMaskG(i)) < mask_rows_left) {
-                    *reinterpret_cast<ushort2*>(&rMaskG(i)) =
-                        *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                if (get<1>(tMcMaskG(i)) < cols_left) {          // 列对在界内
+                    if (Kernel_traits::kMaskQFull ||
+                        get<0>(tMcMaskG(i)) < mask_rows_left) {
+                        *reinterpret_cast<ushort2*>(&rMaskG(i)) =
+                            *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                    }
+                    // 行越界（列在界内）：保持 clear/残留（行被 epilogue 丢弃）
+                } else {                                        // 列对越界：强制 -inf
+                    rMaskG(i) = neg_inf;
+                    rMaskG(i + 1) = neg_inf;
                 }
             }
         }
-        }
     };
 
-    // mask → acc_s 纯加法（越界列已由 host pad 成 -inf）
-    // smem 版：TMA 已全 tile 搬运；gmem 版：调用前需先 issue 对应 n_block 的 ldg
+    // mask → acc_s 纯加法（无 pad 契约下列边界在 apply 点强制 -inf）
+    // smem 版：TMA 已全 tile 搬运（OOB 列 zero-fill，非 -inf）→ 边界 tile（cols_left <
+    //   kBlockN）按列坐标覆写 -inf；gmem 版：调用前需先 issue 对应 n_block 的 ldg
+    //（越界列已在 load_mask_gmem 中回写 -inf，此处保持纯加法）
     // mask 语义对齐 SDPA：softmax(S·scale + mask)。mask 在 scale 之前加到未缩放的 acc_s 上，
     // 因此必须乘 1/scale（-inf × 正数仍为 -inf，0/-inf mask 行为不变；有限值 mask 此前被错误缩放）
     const float mask_inv_scale = 1.f / p.scale_softmax;
-    auto apply_mask_from_smem = [&](auto &acc_s, int stage) {
+    // 列坐标张量（与 acc_s 的 C fragment 同构，index-lockstep；边界 tile 列判定用）
+    Tensor cMaskS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor tMcMaskS = thr_mma.partition_C(cMaskS);
+    auto apply_mask_from_smem = [&](auto &acc_s, int stage, int cols_left) {
         Tensor rMask = make_tensor<Element>(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
         auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
     cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, stage), tSrMask_view);
-    #pragma unroll
-    for (int i = 0; i < size(acc_s); ++i) {
-            acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
-        }
+    if (cols_left >= kBlockN) {
+        // 整块列在界内（主场景）：纯加法，与原路径指令流完全一致
+        #pragma unroll
+        for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
+            }
+    } else {
+        // 边界 tile：列 ≥ Sk 强制 -inf（直接覆写，避免 inf + (-inf) = NaN）；
+        // 其余列纯加法（-inf mask 依赖 acc_s 有限，K 的 OOB 行已由 TMA 补 0）
+        #pragma unroll
+        for (int i = 0; i < size(acc_s); ++i) {
+            acc_s(i) = (get<1>(tMcMaskS(i)) < cols_left)
+                ? acc_s(i) + static_cast<float>(rMask(i)) * mask_inv_scale
+                : -INFINITY;
+            }
+    }
     };
     auto apply_mask_from_gmem = [&](auto &acc_s) {
         #pragma unroll
@@ -454,9 +497,9 @@ flash_fwd_mask_kernel_sm120(
         // V（smem 版 Mask）在 QK 之后消费
         full_vm_bar[stage].wait(phase);
 
-        // 加法 mask
+        // 加法 mask（smem 版传列界：cols_left = Sk - j*kBlockN，≥ kBlockN 表示整块在界内）
         if constexpr (Kernel_traits::kMaskInSmem) {
-            apply_mask_from_smem(acc_s, stage);
+            apply_mask_from_smem(acc_s, stage, p.seqlen_k - j * kBlockN);
         } else {
             apply_mask_from_gmem(acc_s);
         }
@@ -551,7 +594,7 @@ void run_flash_fwd_mask_sm120(const FA_mask_params &params, cudaStream_t stream)
         make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride));
     Tensor mMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element const*>(params.mask_ptr)),
-        make_shape(params.mask_seqlen_q, params.seqlen_k_rounded, params.b),
+        make_shape(params.mask_seqlen_q, params.mask_seqlen_k, params.b),
         make_stride(params.mask_row_stride, _1{}, params.mask_batch_stride));
     Tensor mO = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)),
@@ -651,7 +694,7 @@ flash_fwd_mask_kernel_sm120_persistent(
         // TMA & MMA handles (与原始 kernel 相同，使用局部的 m_block/bidh/bidb)
         auto shape_Q  = make_shape(p.seqlen_q, p.d, p.h, p.b);
         auto shape_KV = make_shape(p.seqlen_k, p.d, p.h_k, p.b);
-        auto shape_Mask = make_shape(p.mask_seqlen_q, p.seqlen_k_rounded, p.b);
+        auto shape_Mask = make_shape(p.mask_seqlen_q, p.mask_seqlen_k, p.b);
 
         Tensor mQ = params.tma_load_Q.get_tma_tensor(shape_Q)(_, _, bidh, bidb);
         Tensor gQ = local_tile(mQ, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, _0{}));
@@ -679,7 +722,7 @@ flash_fwd_mask_kernel_sm120_persistent(
 
         Tensor mMaskG = make_tensor(
             make_gmem_ptr(reinterpret_cast<Element const*>(p.mask_ptr) + bidb * p.mask_batch_stride),
-            make_shape(p.mask_seqlen_q, p.seqlen_k_rounded),
+            make_shape(p.mask_seqlen_q, p.mask_seqlen_k),
             make_stride(p.mask_row_stride, _1{}));
         Tensor gMaskG = local_tile(mMaskG, Shape<Int<kBlockM>, Int<kBlockN>>{}, make_coord(m_block, _));
 
@@ -721,7 +764,7 @@ flash_fwd_mask_kernel_sm120_persistent(
         auto smem_tiled_copy_mask = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
         auto smem_thr_copy_mask   = smem_tiled_copy_mask.get_thread_slice(threadIdx.x);
         Tensor tSsMask = smem_thr_copy_mask.partition_S(sMask);
-    // mask gmem 直读：主场景用原 tiled_copy 32-bit 直拷；边界 CTA 逐对谓词（同主 kernel 说明）
+    // mask gmem 直读：行/列联合逐对谓词（同主 kernel 的说明；列越界对回写 -inf）
     auto gmem_tiled_copy_mask = make_tiled_copy_C(
         Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, Element>{}, tiled_mma);
     auto gmem_thr_copy_mask   = gmem_tiled_copy_mask.get_thread_slice(tidx);
@@ -737,32 +780,62 @@ flash_fwd_mask_kernel_sm120_persistent(
         clear(rMaskG);
     }
     auto load_mask_gmem = [&](int nb) {
-        if constexpr (Kernel_traits::kMaskQFull) {
-            // host 保证 mask_seqlen_q % kBlockM == 0：编译期裁掉边界路径，寄存器零开销
-            cute::copy(gmem_tiled_copy_mask, tMgMask(_, _, _, nb), tMrMaskG_view);
-        } else {
-        if (mask_rows_left >= kBlockM) {
-            cute::copy(gmem_tiled_copy_mask, tMgMask(_, _, _, nb), tMrMaskG_view);
-        } else {
-            Tensor tMgMaskG_nb = tMgMaskG(_, _, _, nb);
-            #pragma unroll
-            for (int i = 0; i < size(rMaskG); i += 2) {
-                if (get<0>(tMcMaskG(i)) < mask_rows_left) {
-                    *reinterpret_cast<ushort2*>(&rMaskG(i)) =
-                        *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+        const int cols_left = p.seqlen_k - nb * kBlockN;   // ≥ kBlockN → 整块列在界内
+        if (cols_left >= kBlockN) {
+            if constexpr (Kernel_traits::kMaskQFull) {   // 编译期裁掉行边界路径（同主 kernel）
+                cute::copy(gmem_tiled_copy_mask, tMgMask(_, _, _, nb), tMrMaskG_view);
+            } else if (mask_rows_left >= kBlockM) {      // 整块在界内（主场景）：无谓词直拷
+                cute::copy(gmem_tiled_copy_mask, tMgMask(_, _, _, nb), tMrMaskG_view);
+            } else {                           // 行边界 CTA：逐对行谓词（越界行保持 clear 的 0）
+                Tensor tMgMaskG_nb = tMgMaskG(_, _, _, nb);
+                #pragma unroll
+                for (int i = 0; i < size(rMaskG); i += 2) {
+                    if (get<0>(tMcMaskG(i)) < mask_rows_left) {
+                        *reinterpret_cast<ushort2*>(&rMaskG(i)) =
+                            *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                    }
                 }
             }
-        }
+        } else {                               // 列边界 tile：行+列联合逐对谓词
+            Tensor tMgMaskG_nb = tMgMaskG(_, _, _, nb);
+            const Element neg_inf(static_cast<float>(-INFINITY));
+            #pragma unroll
+            for (int i = 0; i < size(rMaskG); i += 2) {
+                if (get<1>(tMcMaskG(i)) < cols_left) {          // 列对在界内
+                    if (Kernel_traits::kMaskQFull ||
+                        get<0>(tMcMaskG(i)) < mask_rows_left) {
+                        *reinterpret_cast<ushort2*>(&rMaskG(i)) =
+                            *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                    }
+                    // 行越界（列在界内）：保持 clear/残留（行被丢弃）
+                } else {                                        // 列对越界：强制 -inf
+                    rMaskG(i) = neg_inf;
+                    rMaskG(i + 1) = neg_inf;
+                }
+            }
         }
     };
 
         const float mask_inv_scale = 1.f / p.scale_softmax;
-        auto apply_mask_from_smem = [&](auto &acc, int s) {
+        // 列坐标张量（与 acc 的 C fragment 同构，index-lockstep；边界 tile 列判定用）
+        Tensor cMaskS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+        Tensor tMcMaskS = thr_mma.partition_C(cMaskS);
+        auto apply_mask_from_smem = [&](auto &acc, int s, int cols_left) {
             Tensor rM = make_tensor<Element>(partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
             auto tV = smem_thr_copy_mask.retile_D(rM);
             cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, s), tV);
-            #pragma unroll
-            for (int i = 0; i < size(acc); ++i) { acc(i) += static_cast<float>(rM(i)) * mask_inv_scale; }
+            if (cols_left >= kBlockN) {
+                #pragma unroll
+                for (int i = 0; i < size(acc); ++i) { acc(i) += static_cast<float>(rM(i)) * mask_inv_scale; }
+            } else {
+                // 边界 tile：列 ≥ Sk 强制 -inf（TMA OOB zero-fill / 预 pad 列内容均非屏蔽）
+                #pragma unroll
+                for (int i = 0; i < size(acc); ++i) {
+                    acc(i) = (get<1>(tMcMaskS(i)) < cols_left)
+                        ? acc(i) + static_cast<float>(rM(i)) * mask_inv_scale
+                        : -INFINITY;
+                }
+            }
         };
         auto apply_mask_from_gmem = [&](auto &acc) {
             #pragma unroll
@@ -825,8 +898,9 @@ flash_fwd_mask_kernel_sm120_persistent(
 
             full_vm_bar[stage].wait(phase);
 
-            if constexpr (Kernel_traits::kMaskInSmem) apply_mask_from_smem(acc_s, stage);
-            else apply_mask_from_gmem(acc_s);
+            if constexpr (Kernel_traits::kMaskInSmem) {
+                apply_mask_from_smem(acc_s, stage, p.seqlen_k - j * kBlockN);
+            } else { apply_mask_from_gmem(acc_s); }
 
             if (j == 0) softmax.template softmax_rescale_o<true, true>(acc_s, acc_o, p.scale_softmax_log2);
             else softmax.template softmax_rescale_o<false, true>(acc_s, acc_o, p.scale_softmax_log2);
@@ -903,7 +977,7 @@ void run_flash_fwd_mask_sm120_persistent(const FA_mask_params &params, cudaStrea
         make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride));
     Tensor mMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element const*>(params.mask_ptr)),
-        make_shape(params.mask_seqlen_q, params.seqlen_k_rounded, params.b),
+        make_shape(params.mask_seqlen_q, params.mask_seqlen_k, params.b),
         make_stride(params.mask_row_stride, _1{}, params.mask_batch_stride));
     Tensor mO = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)),
@@ -1009,7 +1083,7 @@ flash_fwd_mask_kernel_sm120_splitkv(
 
     auto shape_Q  = make_shape(p.seqlen_q, p.d, p.h, p.b);
     auto shape_KV = make_shape(p.seqlen_k, p.d, p.h_k, p.b);
-    auto shape_Mask = make_shape(p.mask_seqlen_q, p.seqlen_k_rounded, p.b);
+    auto shape_Mask = make_shape(p.mask_seqlen_q, p.mask_seqlen_k, p.b);
 
     Tensor mQ = params.tma_load_Q.get_tma_tensor(shape_Q)(_, _, bidh, bidb);
     Tensor gQ = local_tile(mQ, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, _0{}));
@@ -1037,7 +1111,7 @@ flash_fwd_mask_kernel_sm120_splitkv(
 
     Tensor mMaskG = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element const*>(p.mask_ptr) + bidb * p.mask_batch_stride),
-        make_shape(p.mask_seqlen_q, p.seqlen_k_rounded),
+        make_shape(p.mask_seqlen_q, p.mask_seqlen_k),
         make_stride(p.mask_row_stride, _1{}));
     Tensor gMaskG = local_tile(mMaskG, Shape<Int<kBlockM>, Int<kBlockN>>{}, make_coord(m_block, _));
 
@@ -1079,7 +1153,7 @@ flash_fwd_mask_kernel_sm120_splitkv(
     auto smem_tiled_copy_mask = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_mask   = smem_tiled_copy_mask.get_thread_slice(tidx);
     Tensor tSsMask = smem_thr_copy_mask.partition_S(sMask);
-    // mask gmem 直读：行谓词逐对直读（同主 kernel 的说明）
+    // mask gmem 直读：行/列联合逐对谓词（同主 kernel 的说明；列越界对回写 -inf）
     Tensor rMaskG  = make_tensor<Element>(
         partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
     Tensor cMaskG   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
@@ -1092,37 +1166,70 @@ flash_fwd_mask_kernel_sm120_splitkv(
     auto load_mask_gmem = [&](int nb) {
         Tensor tMgMaskG_nb = tMgMaskG(_, _, _, nb);
         // C fragment 相邻两元素同列对、偶数列起始 → 4B 对齐的 32-bit 向量 load
-        if constexpr (Kernel_traits::kMaskQFull) {   // 编译期裁掉边界路径（同主 kernel）
-            #pragma unroll
-            for (int i = 0; i < size(rMaskG); i += 2) {
-                *reinterpret_cast<ushort2*>(&rMaskG(i)) =
-                    *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
-            }
-        } else if (mask_rows_left >= kBlockM) {   // 整块在界内（主场景）：无谓词直拷
-            #pragma unroll
-            for (int i = 0; i < size(rMaskG); i += 2) {
-                *reinterpret_cast<ushort2*>(&rMaskG(i)) =
-                    *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
-            }
-        } else {                           // 边界 CTA：逐对谓词（越界行保持 clear 的 0）
-            #pragma unroll
-            for (int i = 0; i < size(rMaskG); i += 2) {
-                if (get<0>(tMcMaskG(i)) < mask_rows_left) {
+        const int cols_left = p.seqlen_k - nb * kBlockN;   // ≥ kBlockN → 整块列在界内
+        if (cols_left >= kBlockN) {
+            if constexpr (Kernel_traits::kMaskQFull) {   // 编译期裁掉行边界路径（同主 kernel）
+                #pragma unroll
+                for (int i = 0; i < size(rMaskG); i += 2) {
                     *reinterpret_cast<ushort2*>(&rMaskG(i)) =
                         *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                }
+            } else if (mask_rows_left >= kBlockM) {      // 整块在界内（主场景）：无谓词直拷
+                #pragma unroll
+                for (int i = 0; i < size(rMaskG); i += 2) {
+                    *reinterpret_cast<ushort2*>(&rMaskG(i)) =
+                        *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                }
+            } else {                           // 行边界 CTA：逐对行谓词（越界行保持 clear 的 0）
+                #pragma unroll
+                for (int i = 0; i < size(rMaskG); i += 2) {
+                    if (get<0>(tMcMaskG(i)) < mask_rows_left) {
+                        *reinterpret_cast<ushort2*>(&rMaskG(i)) =
+                            *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                    }
+                }
+            }
+        } else {                               // 列边界 tile：行+列联合逐对谓词
+            const Element neg_inf(static_cast<float>(-INFINITY));
+            #pragma unroll
+            for (int i = 0; i < size(rMaskG); i += 2) {
+                if (get<1>(tMcMaskG(i)) < cols_left) {          // 列对在界内
+                    if (Kernel_traits::kMaskQFull ||
+                        get<0>(tMcMaskG(i)) < mask_rows_left) {
+                        *reinterpret_cast<ushort2*>(&rMaskG(i)) =
+                            *reinterpret_cast<const ushort2*>(&tMgMaskG_nb(i));
+                    }
+                    // 行越界（列在界内）：保持 clear/残留（行被丢弃）
+                } else {                                        // 列对越界：强制 -inf
+                    rMaskG(i) = neg_inf;
+                    rMaskG(i + 1) = neg_inf;
                 }
             }
         }
     };
 
     const float mask_inv_scale = 1.f / p.scale_softmax;   // 见主 kernel 同名注释
-    auto apply_mask_from_smem = [&](auto &acc_s, int stage) {
+    // 列坐标张量（与 acc_s 的 C fragment 同构，index-lockstep；边界 tile 列判定用）
+    Tensor cMaskS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor tMcMaskS = thr_mma.partition_C(cMaskS);
+    auto apply_mask_from_smem = [&](auto &acc_s, int stage, int cols_left) {
         Tensor rMask = make_tensor<Element>(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
         auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
         cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, stage), tSrMask_view);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s); ++i) { acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale; }
+        if (cols_left >= kBlockN) {
+            // 整块列在界内（主场景）：纯加法，与原路径指令流完全一致
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) { acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale; }
+        } else {
+            // 边界 tile：列 ≥ Sk 强制 -inf（TMA OOB zero-fill / 预 pad 列内容均非屏蔽）
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) = (get<1>(tMcMaskS(i)) < cols_left)
+                    ? acc_s(i) + static_cast<float>(rMask(i)) * mask_inv_scale
+                    : -INFINITY;
+            }
+        }
     };
     auto apply_mask_from_gmem = [&](auto &acc_s) {
         #pragma unroll
@@ -1192,8 +1299,9 @@ flash_fwd_mask_kernel_sm120_splitkv(
 
             full_vm_bar[stage].wait(phase);
 
-            if constexpr (Kernel_traits::kMaskInSmem) { apply_mask_from_smem(acc_s, stage); }
-            else { apply_mask_from_gmem(acc_s); }
+            if constexpr (Kernel_traits::kMaskInSmem) {
+                apply_mask_from_smem(acc_s, stage, p.seqlen_k - n_block * kBlockN);
+            } else { apply_mask_from_gmem(acc_s); }
 
             if (j == 0) {
                 softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/true>(
@@ -1454,7 +1562,7 @@ void run_flash_fwd_mask_sm120_splitkv(const FA_mask_params &params, cudaStream_t
         make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride));
     Tensor mMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element const*>(params.mask_ptr)),
-        make_shape(params.mask_seqlen_q, params.seqlen_k_rounded, params.b),
+        make_shape(params.mask_seqlen_q, params.mask_seqlen_k, params.b),
         make_stride(params.mask_row_stride, _1{}, params.mask_batch_stride));
     Tensor mO = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)),

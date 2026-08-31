@@ -42,7 +42,7 @@
 // 因此 tile 边界无需复位任何 mbarrier 状态。
 //
 // 路由条件（见 mixed_gemm_op.cu）：设备 major==12 且二进制含 sm120a 编译
-// 目标（__CUDA_ARCH_LIST__，与 FA 的 fa_mask_sm120_supported 同一判定），
+// 目标（FA_HAS_SM120，见 csrc/arch_targets.h 标准入口；与 FA 的分发同一判定），
 // 且 k%16==0（1 字节 residual 张量的 TMA 全局行 stride 需 16B 对齐——
 // sm80 路径只需 k%8）+ 各输入指针 16B 对齐；否则整体回退 sm80 路径（数值
 // 语义完全一致）。TMA store 额外要求 n*sizeof(TY)%16==0 且 y 指针 16B
@@ -66,6 +66,7 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/fast_math.h"
 
+#include "arch_targets.h"   // FA_HAS_SM120（架构条件编译标准入口）
 #include "gemm_bf16xfp32_sm80.h"
 #include "gemm_bf16xfp32_sm120.h"
 #include "utils.cuh"
@@ -902,9 +903,10 @@ bool launch_fixed_epilogue_sm120_int8(void *y_ptr, void *splitk_y_ptr,
 // ── 对外路由入口（声明见 gemm_bf16xfp32_sm120.h）─────────────────────────────
 namespace mixed_gemm {
 
-// sm120 kernel 是否编入本编译单元（编译目标含 >= sm120a 的 arch）。
+// sm120 kernel 是否编入本编译单元（编译目标含 sm120a 家族；判定宏来自
+// csrc/arch_targets.h 标准入口，与 FA 的分发共用同一套 FA_HAS_* 语义）。
 bool mixed_gemm_sm120_compiled() noexcept {
-#if defined(__CUDA_ARCH_LIST__) && (__CUDA_ARCH_LIST__ >= 1200)
+#if FA_HAS_SM120
   return true;
 #else
   return false;
@@ -915,13 +917,8 @@ bool mixed_gemm_sm120_compiled() noexcept {
 bool mixed_gemm_sm120_supported() noexcept {
   static const bool supported = []() {
     if (std::getenv("GEMM_MIXED_FORCE_SM80") != nullptr) return false;
-#if defined(__CUDA_ARCH_LIST__) && (__CUDA_ARCH_LIST__ >= 1200)
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return false;
-    int major = 0;
-    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess)
-      return false;
-    return major == 12;
+#if FA_HAS_SM120
+    return arch_targets::gpu_major() == 12;
 #else
     return false;
 #endif

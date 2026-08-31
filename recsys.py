@@ -3,7 +3,7 @@ custom_ops/recsys.py — RecsysOps：推荐系统核心 CUDA 算子库
 
 算子列表
 --------
-- mha_fwd_with_mask      Flash Attention 2 前向，支持任意 bf16 加法 mask
+- mha_fwd_with_mask      Flash Attention 2 前向，支持任意 fp16/bf16 加法 mask
 - mixed_gemm             混合精度 GEMM：bf16 主项 + fp8/int8 residual 精度补偿，
                          epilogue 融合 bias 与 silu/gelu 激活
 
@@ -105,22 +105,30 @@ class RecsysOps(CustomOps):
 
     def mha_fwd_with_mask(
         self,
-        q:    torch.Tensor,   # (B, H,  Sq, d)  bfloat16 CUDA
-        k:    torch.Tensor,   # (B, Hk, Sk, d)  bfloat16 CUDA
-        v:    torch.Tensor,   # (B, Hk, Sk, d)  bfloat16 CUDA
-        mask: torch.Tensor,   # (B, 1,  Sq, Sk) bfloat16 CUDA，0=可见 / -inf=屏蔽
+        q:    torch.Tensor,   # (B, H,  Sq, d)   fp16/bf16 CUDA
+        k:    torch.Tensor,   # (B, Hk, Sk, d)   fp16/bf16 CUDA
+        v:    torch.Tensor,   # (B, Hk, Sk, d)   fp16/bf16 CUDA
+        mask: torch.Tensor,   # (B, 1, ≥Sq, ≥Sk) 与 q 同 dtype，0=可见 / -inf=屏蔽
     ) -> torch.Tensor:
         """
-        Flash Attention 2 前向，支持任意 bf16 加法 mask。
+        Flash Attention 2 前向，支持任意 fp16/bf16 加法 mask。
 
         参数
         ----
-        q, k, v : (B, H, S, d) bfloat16 CUDA，连续
-        mask    : (B, 1, Sq, Sk) bfloat16 CUDA，加法 mask（0=可见，-inf=屏蔽）
+        q, k, v : (B, H, S, d) fp16/bf16 CUDA，连续（四者同 dtype）
+        mask    : (B, 1, Sq_mask, Sk_mask) 与 q 同 dtype，加法 mask
+                  （0=可见，-inf=屏蔽，有限值=偏置）。维度要求：
+                  - Sq_mask ≥ Sq、Sk_mask ≥ Sk（等值即零拷贝，也接受预 pad）
+                  - col ≥ Sk 恒为屏蔽：mask 中 k 维越界列的内容被忽略
+
+        dtype 支持：fp16 全架构（sm70 V100 / sm89+ Ampere 及更新）；
+        bf16 仅 SM80+（V100 无 bf16 tensor core）。
 
                 限制
         ----
-        - d ∈ {64, 128}
+        - d ∈ {64, 128}，Sq 任意
+        - Sk % 8 != 0 时算子自动 pad 到 8 倍数（一次内部拷贝，对上层透明；
+          Sk % 8 == 0 时零拷贝）
         - H % Hk == 0（支持 GQA）
         - 不支持 dropout / causal / alibi / RoPE / KV-cache
         """

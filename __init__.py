@@ -111,38 +111,94 @@ def setup_compiler(
         )
 
 
-def get_cuda_arch_flags() -> list:
+def _parse_arch_list(env_val: str) -> list:
+    """从 TORCH_CUDA_ARCH_LIST 环境变量解析出 arch 列表（如 '7.0 8.0' → [70, 80]）。"""
+    archs = []
+    for tok in env_val.replace(";", " ").split():
+        tok = tok.strip()
+        if not tok:
+            continue
+        # 支持 '7.0'、'7.0+PTX'、'compute_70' 等格式
+        digits = ""
+        for ch in tok:
+            if ch.isdigit() or ch == ".":
+                digits += ch
+            else:
+                break
+        if "." in digits:
+            parts = digits.split(".")
+            if len(parts) >= 2:
+                archs.append(int(parts[0]) * 10 + int(parts[1]))
+    return archs
+
+def _detect_archs() -> list:
     """
-    自动探测当前可见 GPU 的 compute capability，生成 nvcc -gencode 参数列表。
+    解析/探测本地目标架构，返回两位整数编码列表（如 7.0 → 70、8.9 → 89、12.0 → 120）。
 
     优先级：
-      1. TORCH_CUDA_ARCH_LIST 已设置 → 返回空列表，让 PyTorch 自行解析。
-      2. torch.cuda 可用 → 探测所有可见 GPU。
+      1. TORCH_CUDA_ARCH_LIST 已设置 → 解析之。
+         （显式编译其它架构用，如无 GPU 机器预编译、开发机上 "7.0 8.9"
+          同时编入 V100 fp16 路径做旁路测试）
+      2. torch.cuda 可用 → 探测所有可见 GPU，并回写 TORCH_CUDA_ARCH_LIST
+         （cpp_extension 依赖该环境变量自动生成 gencode，见 get_cuda_arch_flags）。
       3. 无 GPU → 返回空列表。
     """
     if os.environ.get("TORCH_CUDA_ARCH_LIST"):
-        return []
+        return _parse_arch_list(os.environ["TORCH_CUDA_ARCH_LIST"])
     if not torch.cuda.is_available():
         return []
 
-    seen: set = set()
-    flags = []
-    arch_list = []
+    archs: list = []
+    caps: set = set()
     for i in range(torch.cuda.device_count()):
         cap = torch.cuda.get_device_capability(i)
-        if cap not in seen:
-            seen.add(cap)
-            sm = f"{cap[0]}{cap[1]}"
-            # arch-specific 变体：sm90a（wgmma）、sm120a（Blackwell consumer 的
-            # TMA/STSM 等特性在该变体下才会被 cutlass/cute 启用）
-            suffix = "a" if cap in ((9, 0), (12, 0)) else ""
-            flags += ["-gencode", f"arch=compute_{sm}{suffix},code=sm_{sm}{suffix}"]
-            arch_list.append(f"{cap[0]}.{cap[1]}{suffix}")
+        if cap not in caps:
+            caps.add(cap)
+            archs.append(cap[0] * 10 + cap[1])
 
-    if arch_list:
-        os.environ["TORCH_CUDA_ARCH_LIST"] = " ".join(arch_list)
+    # 回写环境变量：arch-specific 变体（sm90a/sm120a 的 wgmma/TMA 等特性仅在
+    # 'a' 变体下才会被 cutlass/cute 启用），cpp_extension 由此生成 gencode
+    arch_list = [
+        f"{a // 10}.{a % 10}" + ("a" if a in (90, 120) else "") for a in archs
+    ]
+    os.environ["TORCH_CUDA_ARCH_LIST"] = " ".join(arch_list)
+    return archs
 
-    return flags
+
+def _arch_flags_from(archs: list) -> list:
+    """
+    生成本次构建的目标架构掩码宏：-DFA_TARGETS=<bits>（唯一的注入宏）。
+
+    位约定（与 csrc/arch_targets.h 标准入口严格一致，修改任一侧须同步）：
+      bit0 (0x1) = sm70   （V100，fp16 专用 WMMA 路径）
+      bit1 (0x2) = sm8x   （sm_80/86/89/90，cp.async 通用路径）
+      bit2 (0x4) = sm120+ （sm_120a，Blackwell consumer TMA 路径）
+
+    host 侧「二进制含哪些 kernel 家族」全部由这一个宏承载（解码见
+    arch_targets.h，禁止其它代码自行发明判定宏）；gencode 仍由
+    cpp_extension 从 TORCH_CUDA_ARCH_LIST（由 _detect_archs 回写）自动生成，
+    不要在此重复传 -gencode（nvcc 会对同一架构编两遍）。
+    """
+    mask = 0
+    for a in set(archs):
+        if a == 70:
+            mask |= 0x1
+        elif 80 <= a < 120:
+            mask |= 0x2
+        elif a >= 120:
+            mask |= 0x4
+    return [f"-DFA_TARGETS={mask}"] if mask else []
+
+
+def get_cuda_arch_flags() -> list:
+    """
+    自动探测当前可见 GPU 的 compute capability，生成架构裁剪宏。
+
+    只编译本地 GPU 对应架构（gencode 由 cpp_extension 从 TORCH_CUDA_ARCH_LIST
+    自动生成），并注入唯一的 FA_TARGETS 位掩码宏供 host 侧做编译期裁剪
+    （解码与语义见 csrc/arch_targets.h 标准入口）。无 GPU 时返回空列表。
+    """
+    return _arch_flags_from(_detect_archs())
 
 
 def get_build_dir(
@@ -301,8 +357,37 @@ class CustomOps:
         )
         so_path = os.path.join(build_dir, f"{self.so_name}.so") if build_dir else ""
 
-        # 快速路径：.so 已存在，直接 dlopen
-        if so_path and os.path.isfile(so_path):
+        # 构建签名（目标 arch 列表 + 全部源文件指纹）：编译时写入 .build_stamp，
+        # 快速加载前校验，防两类静默错误：
+        #   ① 缓存目录被跨机器/跨 GPU 共享时 dlopen 错误架构的 .so
+        #     （kernel 缺失 → 静默跑空 stub 或直接崩溃）
+        #   ② 源码已修改但 .so 还是旧版本（快速路径绕过了 cpp_extension
+        #     的版本检查，必须自行承担源码指纹比对）
+        def _build_signature() -> str:
+            try:
+                import hashlib
+                h = hashlib.sha1()
+                for src in sorted(self.get_sources()):
+                    st = os.stat(src)
+                    h.update(f"{src}|{st.st_size}|{st.st_mtime_ns}\n".encode())
+                arch = " ".join(f"{a // 10}.{a % 10}" for a in _detect_archs())
+                return f"{arch}|{h.hexdigest()[:12]}"
+            except Exception:
+                return "unknown"
+
+        stamp_path = os.path.join(build_dir, ".build_stamp") if build_dir else ""
+
+        def _stamp_ok() -> bool:
+            if not stamp_path or not os.path.isfile(stamp_path):
+                return False  # 旧缓存无 stamp（或格式已升级）→ 重建（一次性成本，换安全）
+            try:
+                with open(stamp_path) as f:
+                    return f.read().strip() == _build_signature()
+            except OSError:
+                return False
+
+        # 快速路径：.so 已存在且架构匹配，直接 dlopen
+        if so_path and os.path.isfile(so_path) and _stamp_ok():
             warnings.warn(
                 f"[{type(self).__name__}] pid={os.getpid()} "
                 f"fast-loading {self.so_name}.so via dlopen: {so_path}"
@@ -337,7 +422,7 @@ class CustomOps:
 
         try:
             # 再次检查（等待锁期间可能已被其他进程编译完）
-            if so_path and os.path.isfile(so_path):
+            if so_path and os.path.isfile(so_path) and _stamp_ok():
                 torch.ops.load_library(so_path)
                 return True
 
@@ -364,6 +449,14 @@ class CustomOps:
             if lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 lock_fd.close()
+
+        # 编译成功后写入构建 stamp（架构 + 源码指纹，供快速加载路径校验）
+        if stamp_path:
+            try:
+                with open(stamp_path, "w") as f:
+                    f.write(_build_signature())
+            except OSError:
+                pass
 
         warnings.warn(
             f"[{type(self).__name__}] pid={os.getpid()} "

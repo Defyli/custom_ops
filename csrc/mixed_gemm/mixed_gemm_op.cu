@@ -112,7 +112,13 @@ torch::Tensor mixed_gemm_cuda(
     TORCH_CHECK(x.dtype() == torch::kFloat32 || x.dtype() == torch::kBFloat16,
                 "x must be float32 or bfloat16");
     TORCH_CHECK(w_high.dtype() == torch::kBFloat16, "w_high must be bfloat16");
+    // torch < 2.1 无 fp8 dtype（kFloat8_e4m3fn）：FP8 后端在旧版 torch 上
+    // 不可用，w_low 只能走 int8 路径（mixed_gemm_fp8_available 会如实上报 false）。
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 1)
     const bool w_low_is_fp8 = (w_low.dtype() == torch::kFloat8_e4m3fn);
+#else
+    const bool w_low_is_fp8 = false;
+#endif
     const bool w_low_is_int8 = (w_low.dtype() == torch::kInt8);
     TORCH_CHECK(w_low_is_fp8 || w_low_is_int8,
                 "w_low must be float8_e4m3fn (FP8 backend) or int8 (INT8 backend); "
