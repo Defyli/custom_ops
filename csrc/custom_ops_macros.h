@@ -123,7 +123,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // 两层宏展开技巧：先把 CUSTOM_OPS_NAMESPACE 展开为实际值，
 // 再传给 _CUSTOM_OPS_LIBRARY_BEGIN_IMPL，确保 TORCH_LIBRARY 拿到展开后的命名空间名。
-#define _CUSTOM_OPS_LIBRARY_BEGIN_IMPL(ns)   TORCH_LIBRARY(ns, m) {
+//
+// TORCH_LIBRARY_FRAGMENT（非 TORCH_LIBRARY）：允许多个 .so（分组懒加载，
+// 每组一个独立扩展）向同一 namespace 贡献算子定义——PyTorch 限制单个
+// TORCH_LIBRARY 每 namespace 只能注册一次。各分组 def 的算子集合不相交；
+// 单 .so 场景（旧用法）下 FRAGMENT 行为与 TORCH_LIBRARY 完全一致。
+#define _CUSTOM_OPS_LIBRARY_BEGIN_IMPL(ns)   TORCH_LIBRARY_FRAGMENT(ns, m) {
 #define CUSTOM_OPS_LIBRARY_BEGIN             _CUSTOM_OPS_LIBRARY_BEGIN_IMPL(CUSTOM_OPS_NAMESPACE)
 #define CUSTOM_OPS_LIBRARY_END               }
 

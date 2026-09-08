@@ -1,0 +1,199 @@
+# fuse_moe 在 sm89 / sm120 上的移植与优化全记录
+
+> **硬件**：RTX 5090D（GB202，sm_120a，170 SMs，L2 96MB，mma.sync bf16 峰值 **209.5 TFLOPS**，cuBLAS bf16 峰值 235 TFLOPS）；对照机 RTX 4090D（sm_89，128 SMs）
+> **软件**：CUDA 12.8 / PyTorch / CUTLASS+CuTe（thirdparty）
+> **算子**：MoE FFN 前向融合——`y[s] = Σ_j topk_scale[s,j] · (Down_ej @ silu(GateUp_ej @ x[s]))`，bf16/fp16 输入、fp32 累加，单 GPU，无 fp8 量化
+> **最终结果**：大 shape 有效算力 **170~190 TFLOPS**（mma.sync 峰值的 81~91%）；vs PyTorch eager **1.9~22.9x**，vs `torch.compile` **1.6~2.4x**，vs compile+CUDA graph **最高 159.6x**（小 batch 大 E 场景）；流水线 kernel 数 6 → 4，workspace 537 → 268 MB
+
+---
+
+## 目录
+
+1. [背景与目标](#1-背景与目标)
+2. [数据流与整体设计](#2-数据流与整体设计)
+3. [优化历程时间线](#3-优化历程时间线)
+   - [Phase 1：从 hpc-ops (sm90) 移植——padded 布局 + TMA](#phase-1从-hpc-ops-sm90-移植padded-布局--tma)
+   - [Phase 2：kTileK=128 与深流水的解锁](#phase-2ktilek128-与深流水的解锁)
+   - [Phase 3：TMA 任意行坐标——padded 布局的终结](#phase-3tma-任意行坐标padded-布局的终结)
+   - [Phase 4：连续流水 cp.async——引擎逆转](#phase-4连续流水-cpasync引擎逆转)
+   - [Phase 5：gemm1 融合——gate/up 配对 N-tile](#phase-5gemm1-融合gateup-配对-n-tile)
+   - [Phase 6：kTileM=128——W 面板流量减半](#phase-6ktilem128w-面板流量减半)
+4. [最终性能全景](#4-最终性能全景)
+5. [踩坑实录（可复用的教训）](#5-踩坑实录可复用的教训)
+6. [经验总结](#6-经验总结)
+
+---
+
+## 1. 背景与目标
+
+推荐系统的 MoE 层（如 DeepSeek/Mixtral 风格 FFN）在单卡推理中是纯访存+算力混合瓶颈：每个 token 经 top-k 路由到 k 个专家，每个专家一次 gate_up GEMM + 一次 down GEMM。PyTorch eager 的实现需要 gather → 2×E 个小 GEMM（或 loop 逐 expert）→ scatter → 加权求和，中间物化大量临时缓冲；`torch.compile` 的 fusion 无法穿透 GEMM。
+
+上游参考 [hpc-ops](https://github.com/meituan-hpc/hpc-ops) 的 `src/fuse_moe/sm90` 实现（wgmma + TMA + fp8），本仓库的目标是：
+
+- **移植到 sm89（RTX 4090D）与 sm120（RTX 5090D）**——两者都没有 wgmma（sm120 consumer 砍掉了），计算骨架统一为 sm80 `mma.sync` 16x8x16；
+- **去掉 fp8**：x/权重 bf16/fp16 直入，MMA fp32 累加（推荐场景精度优先）；
+- **架构分层**：仿本仓库 FA 的 `common/ smXX/ launch.h` 四层结构，方便后续加新架构；
+- **单 GPU 全场景最优**：从小 batch（S=128, E=64 的极端倾斜）到大批量（S=16384）。
+
+---
+
+## 2. 数据流与整体设计
+
+```
+① count/build_indices    topk_ids (S,K) → seqlens/cu_seqlens (E)、row_indices (T)、
+                         topk_pos (S,K)、tiles (E)        [T = S×K，expert 有序 compact 布局]
+② gemm1 融合 (cp.async)  x[row_indices] @ W1[e]ᵀ 的 gate/up 两个 N 半区配对计算，
+                         epilogue 直接 silu(gate)·up → act_out (T, I)
+③ gemm2 (cp.async)       act_out @ W2[e]ᵀ → down_out (T, H)
+④ reduce                 y[s] = Σ_j topk_scale[s,j]·down_out[topk_pos[s,j]] → (S, H)
+```
+
+架构分层（`csrc/fuse_moe/`）：
+
+| 层 | 文件 | 职责 |
+|---|---|---|
+| op | `fuse_moe_op.cu` | 校验 / workspace / 填 `FMOE_params` / 调 launch，零架构感知 |
+| 分发 | `fuse_moe_launch.h` | 编译期 `FA_HAS_*` × 运行期 `gpu_major()` 双重校验，策略内封家族入口 |
+| common | `common/` | count/act/reduce kernels、GEMM traits、params、PDL 工具 |
+| sm89 | `sm89/group_gemm_sm89.cuh` | cp.async 家族（sm80+ 通用，sm120 默认引擎亦复用） |
+| sm120 | `sm120/group_gemm_sm120.cuh` | TMA + mbarrier 家族（`FUSE_MOE_TMA=1` 可选引擎） |
+
+关键设计决策（后文按时间线展开其来历）：
+
+- **compact 直读**：激活始终按 expert 有序 compact 布局流动，无 padded 空洞；
+- **gemm1 gate/up 配对融合**：同一 CTA 同时算 W1 的 gate 面板与 up 面板（共享 X tile），epilogue 直接完成 silu·mul；
+- **跨 tile 连续流水**：slab 发射流全局计数，task（tile）边界不排空；
+- **swapAB MMA**：`mma(W, Xᵀ)`，A=W（每 expert 独立权重，EVICT_LAST 跨 m-tile 复用）、B=X（流式）。
+
+---
+
+## 3. 优化历程时间线
+
+### Phase 1：从 hpc-ops (sm90) 移植——padded 布局 + TMA
+
+sm90 原版的关键机制是 **device 侧 tensormap 修改**（`fence.proxy.tensormap` / `tensormap.replace`）：每个 expert 一个 TMA descriptor，extent 恰为 `(m_g, k)`，OOB 补零天然按 expert 边界生效。
+
+**sm120a 实测堵死了这条路**：ptxas 接受这些 PTX 的语法，但硬件执行 illegal instruction。替代方案是 **padded 布局**：gather 阶段把激活物化成「每 expert 区间从 kTileM 对齐行开始」的布局（区间间留洞），A 用一个覆盖全局的全局 descriptor，坐标恒为整数 tile 索引。
+
+这一版跑通后（**152 TFLOPS 峰值**），分段计时暴露了主要开销：`gather_pad` 227µs（2×T×H×2B 的额外 DRAM 往返）+ `act_mul_scatter` 170µs。
+
+> 为什么不直接用 TMA 的 OOB？——OOB 相对的是 descriptor 里整张张量的 shape，不是每个 expert 的边界；expert 行数 `m_g` 是 count kernel 在 GPU 上才算出来的运行期数据，host 构建 descriptor 时不存在。「pad 换坐标表达能力」详见 [第 5 节](#51-tma-oob-补零救不了-per-group-的尾部)。
+
+### Phase 2：kTileK=128 与深流水的解锁
+
+SW128 swizzle atom 是 (8, 64)：kTileK=128 时 K 模式被 `tile_to_shape` 分解成嵌套 (64, 2)，TMA 坐标同样分解，直接 partition raw tensor 会 rank-mismatch。解法（FA sm120 同款模式的推广）：先 `local_tile` 展开自由 tile 模式，再 `partition_S/D`，最后 `group_modes<0,3>` 收敛坐标子模式——K=64/128 双 case 通用。
+
+配 kStage 按 smem 预算自适应（96KB / 每 stage operand 尺寸，cap 6）：每 slab mma 工作量翻倍、barrier 发射开销减半，峰值 **152 → 157.4 TFLOPS**。
+
+> 一个 host 端 layout 探针技巧：`make_tma_copy` + `partition` 全是 constexpr 可在 CPU 上跑——写小 cpp 用 g++ 编译，直接打印 TMA 坐标张量的 layout/坐标语义，比在 GPU 上盲调快一个量级。本项目用它先后裁决了「B 的模式顺序是 `(TMA,nn,nk,E)`（E 在最后！）」和「row-shift 的坐标 = `(itile_k·kTileK, r0+itile_m·kTileM)`」两个关键问题。
+
+### Phase 3：TMA 任意行坐标——padded 布局的终结
+
+重新审视「为什么要 pad」后发现了被忽视的自由度：**TMA 坐标本身就是元素单位，box 起点可以是任意行**。原实现用 tile 索引只是 `partition` 代数的产物，不是硬件约束。实现是每 group 一次坐标基平移：
+
+```cpp
+// 机制与 cute::tma_partition 内部 multicast 的 domain_offset 同源
+Tensor tAg_g = make_tensor(tAg.data() + make_coord(_0{}, start_token), tAg.layout());
+```
+
+host 探针逐 case 验证坐标后落地：gemm2 的 A=act_out（流水线自己写出的 compact 中间量）恒走 TMA 直读，`act_mul_scatter` 退回普通 `act_mul`，padded workspace 与 `cu_seqlens_pad` 全部删除。gemm1 的 A=x 是 token 序（group 行按 row_indices 散列），TMA 矩形 box 无法间接寻址——这是本质约束，物化（gather）与不物化（cp.async 查表）的取舍后来在 Phase 4 有了明确答案。
+
+### Phase 4：连续流水 cp.async——引擎逆转
+
+把 gemm1 切到 cp.async scatter（gather-on-load）后与 TMA 引擎做全 shape 对照，发现 cp.async 落后的根源不在指令本身，而在 **task（tile）边界流水排空**：旧实现每 task 串行重填 prologue 的 kStage-1 个 slab、row_indices 走 smem 往返、双 sync。TMA 版的 mbarrier 相位天然跨 tile 连续，这正是它此前的优势来源。
+
+对齐该语义重写 cp.async kernel：
+
+- slab 发射流全局计数（`stage = cnt % kStage`），task 边界不排空——epilogue 期间下一 task 的 slab 已在途；
+- scatter 行索引驻留寄存器（cur/next 两组滚动预取），消灭 smem 往返；
+- sC 独立 smem 区 + 16B 向量化 epilogue。
+
+结果 **cp.async 全面反超 TMA 引擎 3~15%**（92 vs 108µs @S=128 … 2557 vs 2645µs @S=16384），sm120 默认引擎随之切换（TMA 保留为 `FUSE_MOE_TMA=1` 可选路径）。教训：**比较两种引擎前，先确认两者的流水线连续性等价**——TMA 早期领先的一部分其实是「cp.async 的 task 边界没做好」贡献的。
+
+### Phase 5：gemm1 融合——gate/up 配对 N-tile
+
+GEMM 本体到 ~180 TFLOPS（mma.sync 峰值的 86%）后，转向结构性省流量：gate 与 up 是同一输出行的两个 N 半区（W1 行 `[0, I)` 与 `[I, 2I)`），**配对计算**让同一 CTA 共享同一 X tile（X 装载量减半、task 数减半），双累加器在 epilogue 直接 `silu(tYr_g(i)) · tYr_u(i)`——fragment 索引 i 在同一 tiled_mma + 同一 B 分区的两次 gemm 中恒映射相同 (m_row, n_col)。
+
+`gate_up_out (T, 2I)` 缓冲与独立 act_mul kernel 整体消灭（省 2×T×I×2B DRAM 往返），16384 case 端到端 **2585 → 2351µs**，峰值 **176.2 TFLOPS**。
+
+### Phase 6：kTileM=128——W 面板流量减半
+
+当年 TMA 版的 kTileM=128 存在「输出 ~6 个元素恒 0」的悬案（S=128 复现、S=129 反常通过）。将其加到连续流水 cp.async 结构上后发现**不复现**——且大 shape 的 6 个 ~0.15 误差元素经 M64 对照判定为合法 bf16 量化尾部（M64 强制运行给出逐位相同输出）。
+
+kTileM=128 将每 M-tile 装载的 W 复用面扩大一倍（W 流量随 task 数减半），avg≥256 启用后：
+
+- 16384 case：2322 → **2187µs**（gemm1_fused 1432 → 1322µs）
+- 4096×4096×1408：1633 → **1490.8µs，190.1 TFLOPS**（mma.sync 峰值的 91%）
+
+![优化演进](assets/fuse_moe_evolution.png)
+
+---
+
+## 4. 最终性能全景
+
+![流水线分段对比](assets/fuse_moe_pipeline.png)
+
+RTX 5090D（sm_120a，bf16，PyTorch 2.6 / CUDA 12.8；`vs FG` 为 `torch.compile(fullgraph) + reduce-overhead` 即 CUDA graph 路径）：
+
+| Shape (S,H,I,E,K) | custom µs | TFLOPS | eager µs | vs eager | comp µs | comp+RO µs | FG+graph µs | vs FG |
+|---|---|---|---|---|---|---|---|---|
+| (128,2048,1024,8,2) | 53 | 60.7 | 1215 | **22.9x** | 1727 | 1630 | 8465 | **159.6x** |
+| (128,2048,1024,64,2) | 635 | 5.1 | 8095 | **12.7x** | 12803 | 12385 | 9580 | 15.1x |
+| (1024,2048,1024,8,2) | 178 | 146.3 | 1084 | 6.1x | 1766 | 1637 | — | — |
+| (1024,4096,1024,8,2) | 339 | 151.6 | 1192 | 3.4x | 1741 | 1637 | — | — |
+| (4096,2048,1024,8,2) | 590 | 174.7 | 1432 | 2.4x | 1901 | 1961 | — | — |
+| (4096,2048,1024,64,8) | 2415 | 170.7 | 9294 | 3.8x | 13955 | 13173 | — | — |
+| (4096,4096,1408,8,2) | 1491 | **190.1** | 3212 | 2.1x | 3541 | 3293 | — | — |
+| (16384,2048,1024,8,2) | 2189 | 188.4 | 4196 | **1.9x** | 4424 | 4629 | — | — |
+
+引擎与 tile 策略的实测依据（详见 [第 3 节](#3-优化历程时间线)）：
+
+![引擎与 tile 选择](assets/fuse_moe_engines.png)
+
+各环节效率水位（16384 case）：gemm1_fused ~208 TFLOPS（mma.sync 峰值 209.5 的 ~99%）、gemm2 ~185（88%）、reduce 1.54TB/s（DRAM 峰值的 86%）——三者均接近各自瓶颈，剩余可优化空间主要在 reduce 与 gemm2 epilogue 的融合（需接受 bf16 累加精度权衡，未启用）。
+
+---
+
+## 5. 踩坑实录（可复用的教训）
+
+### 5.1 TMA OOB 补零救不了 per-group 的尾部
+
+OOB 相对的是 descriptor 编码的整张张量 shape；expert 行数是运行期数据，单一静态 descriptor 无法表达「越过 m_g 补零」。hpc sm90 用 per-expert descriptor + device 侧 tensormap 修改解决——sm120a 不支持该指令（语法通过、硬件 illegal instruction）。两条出路：padded 布局（Phase 1，后被 Phase 3 的任意行坐标取代）或坐标基平移。
+
+### 5.2 local_tile 的「中间模式后置」行为
+
+对 3D 张量 `(n, k, E)` 做 `local_tile(_, (N,K), (_, _))` 时，未参与 tile 的中间模式 E 被排到**自由 tile 模式之后**：`gB = (N, K, nn, nk, E)` → `tBg = (TMA, nn, nk, E)`，而非直觉的 `(TMA, E, nn, nk)`。索引错位后测试可能「侥幸」通过小 shape（S=7 的 RNG 恰好没触发），大 shape 全崩——用 host 探针打印真实 layout 才裁决。此行为已写入 `sm120/group_gemm_sm120.cuh` 注释。
+
+### 5.3 调度器耗尽后的 -1 越界扫描
+
+`get_next_tile_horizon` 耗尽时置 `igroup = -1`。旧 while-break 结构耗尽即退出；改成「预取下一 task（Tn）」后，`pull_task` 在耗尽后仍会被调用，从 `i = -1` 开始扫描：`tiles_ptr[-1]` 越界读 + 前缀和污染累积，**当污染和超过 itile_m_total 时会合成一个假任务**（垃圾坐标 → 散射错误写）。该 bug 依赖分配器垃圾值，连续躲过多轮回归，最终靠「S 扫描定位边界（256/384/512 失败、160 通过）+ 失败签名（确定性、路径无关）」锁定。修复：`pull_task` 显式耗尽守卫。
+
+### 5.4 r2s 分区越界：C tile 形状与 kTileM 无关
+
+`make_tiled_copy_C` 的分区覆盖面由 TiledMMA 决定（`Tile<32,64,16>` × thr (2,4,1) → 恒为 64×64），与 kTileM 无关。kTileM=32 时分区写到 sC 逻辑边界外 104 elems——sC 别名在 operand 大区时被 prologue 覆写而侥幸无害，sC 独立成区后即刻越界崩溃。修复：sC 预留按 `(N, max(M, 64))` 分配（`shm_c_alloc`）。host 探针可直接打印分区最大偏移验证。
+
+### 5.5 cp.async 的 issue/fence 顺序是正确性约束
+
+`issue → fence → wait` 的顺序下，slab r 的 commit 到其 wait 之间恰有 kStage-1 个 fence，`wait<kStage-1>` 保证落地。把 issue 挪到 fence 之后，commit 落后一个迭代、计数变 kStage-2，wait 不再保证数据到达——20/21 FAIL。这不是性能问题而是正确性契约，已写入 kernel 注释。
+
+### 5.6 双面板 smem 预算与静默 launch 失败
+
+gate/up 配对融合后 operands 变为 X + 2×W 面板，M64/K128 需 104KB > sm120 每块动态 smem 硬限 101376B——**`cudaLaunchKernel` 静默失败，输出 NaN**。修复：K=128 门控（`k128_fits` 按完整预算计算，超限降级 K64）+ `assert(shm_size <= 101376)` 防回归。教训：smem 预算公式要跟着 operand 数量走，且超限时 CUDA 不一定报错。
+
+### 5.7 精度尾部 vs bug 的判定方法
+
+kTileM=128 验收时出现 6 个 ~0.15 误差元素（输出值高达 26~37）。判定方法：**强制 M64 重跑同 shape——逐位相同输出 → 合法 bf16 量化尾部**（大值三重舍入的期望量级），不同 → tile 尺寸相关 bug。误差阈值也应随输出量级缩放（相对而非绝对）。
+
+---
+
+## 6. 经验总结
+
+1. **host 探针先行**：CuTe 的 layout 代数（`make_tma_copy`/`partition`/`local_tile`）大多是 constexpr，可以在 CPU 上直接编译打印。每个「模式顺序/坐标语义/分区偏移」的疑问都值得一个 30 行的探针——本项目至少裁决了 4 次争议，远快于 GPU 盲调。
+2. **引擎对比要控制变量**：TMA vs cp.async 的比较在「cp.async 的 task 边界流水排空」修复后完全逆转（TMA 领先 → 落后 3~15%）。先修平结构性差距，再下引擎结论。
+3. **中间量布局是免费的结构杠杆**：compact 直读（消 padded 物化）、gate/up 配对（消 gate_up_out 物化 + X 装载减半）都是纯结构性改动，合计贡献了仅次于引擎重写的收益，且零数值风险。
+4. **越界行为的分层兜底**：组尾跨界读（in-bounds 垃圾行）由行谓词丢弃、末组越界由 TMA OOB 补零、cp.async 由 src-size 零填充——每层各管一段，语义清晰且无需额外指令。
+5. **确定性 bug 优先做「路径隔离 + 边界扫描」**：固定输入下可复现的 bug，先确认它与配置开关（PDL/引擎/tile）的相关性，再对最可疑的维度做细粒度扫描（本项目的 S 扫描直接把调度器 bug 定位到多 block count 路径）。
+
+---
+
+*相关实现：`csrc/fuse_moe/`（架构分层见 `fuse_moe_launch.h` 头注释）；测试 `tests/test_fuse_moe.py`（21 用例：双 dtype × 形状 × 分布含 single_expert/sparse/duplicate）；基准 `benchmark/benchmark_fuse_moe.py`。*

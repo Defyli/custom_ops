@@ -3,7 +3,7 @@
 [中文](README.md) | English
 
 A high-performance CUDA operator library for generative recommender systems,
-with two core operators:
+with three core operators:
 
 - **`mha_fwd_with_mask`**: a FlashAttention-2 forward implementation supporting
   **arbitrary additive masks** (0 = visible / -inf = masked), deeply optimized for
@@ -14,6 +14,10 @@ with two core operators:
   term plus a low-precision tensor-core residual correction term restores
   near-fp32 accuracy at near-bf16 cost, with bias addition and silu/gelu
   activation fused into the epilogue
+- **`fuse_moe`**: a fused MoE FFN forward (single GPU) — counting, routing
+  permutation, the gate_up group GEMM, silu·mul, the down group GEMM, and the
+  topk weighted reduction are fused into 4 kernels; bf16/fp16 inputs with fp32
+  accumulation
 
 **Highlights**
 
@@ -66,6 +70,25 @@ with two core operators:
 - **Adaptive tile/split-K**: the wall-clock heuristics of the original
   TensorRT plugin are retained — small-M shapes get split-K automatically
 
+**Fused MoE FFN `fuse_moe`**
+
+- **171–190 effective TFLOPS on large shapes** (82–91% of the mma.sync peak):
+  **188 TF** at 4096×4096×1408 and 16384×2048×1024; **1.9–14.8x** over PyTorch
+  eager, **1.4–2.5x** over `torch.compile`, and up to **98x** over
+  compile + CUDA graph (small-batch large-E shapes)
+- **Fused gemm1 (gate/up N-tile pairing)**: one CTA computes both the gate and
+  up N panels of W1 (sharing the X tile, halving X loads); the epilogue applies
+  `silu(gate)·up` and writes act_out directly — no `gate_up_out (T, 2I)`
+  materialization and no separate activation kernel
+- **Cross-tile continuous pipeline**: the slab issue stream uses global
+  counters and never drains at task (tile) boundaries; scatter row indices live
+  in registers with rolling prefetch; activations stay in the expert-sorted
+  compact layout (no padding holes, no pre-materialization)
+- **Architecture-adaptive**: sm89 / sm120 share one cp.async engine (an optional
+  TMA + mbarrier engine on sm120 via `FUSE_MOE_TMA=1`); kTileM picked from
+  32/64/128 by avg tokens/expert, kStage adapted to the smem budget; the four
+  kernels are chained via PDL
+
 **Common infrastructure**
 
 - **JIT build**: the first import compiles automatically (multi-process safe),
@@ -74,7 +97,9 @@ with two core operators:
 > Full records of the FA porting and optimization journey:
 > [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md)
 > and
-> [docs/fa_sm70_porting_and_optimization.md](docs/fa_sm70_porting_and_optimization.md)
+> [docs/fa_sm70_porting_and_optimization.md](docs/fa_sm70_porting_and_optimization.md);
+> fuse_moe in
+> [docs/fuse_moe_porting_and_optimization.md](docs/fuse_moe_porting_and_optimization.md)
 > (in Chinese).
 
 ## Performance
@@ -360,6 +385,49 @@ Backend selection notes:
 > single GEMM vs the main-plus-correction dual GEMM) but with fully uncompensated
 > weight-rounding error.
 
+### fuse_moe (fused MoE FFN, single GPU)
+
+Test setup: RTX 5090D / PyTorch 2.6 / CUDA 12.8, bf16, uniform routing.
+The sm120 default engine is the continuous-pipeline cp.async kernel
+(outperforms the TMA engine by 3–15% across shapes); `FUSE_MOE_TMA=1`
+optionally selects the TMA + mbarrier engine (2807µs vs 2197µs default,
+S=16384). sm89 (RTX 4090D) uses the same cp.async path.
+
+Large shapes reach **171–190 effective TFLOPS** (82–91% of the mma.sync
+peak): **1.9–14.8x** vs eager, **1.4–2.5x** vs `torch.compile`, and up to
+**98x** vs compile + reduce-overhead (CUDA graph):
+
+| Shape (S,H,I,E,K) | custom µs | TFLOPS | eager µs | vs eager | comp µs | comp+RO µs | FG+graph µs | vs FG |
+|---|---|---|---|---|---|---|---|---|
+| (128,2048,1024,8,2) | 83.6 | 38.5 | 1235 | **14.8x** | 1728 | 1636 | 8198 | **98.0x** |
+| (128,2048,1024,64,2) | 634.4 | 5.1 | 8030 | **12.7x** | 12819 | 12280 | 9565 | 15.1x |
+| (1024,2048,1024,8,2) | 175.3 | 147.0 | 1125 | 6.4x | 1800 | 1676 | — | — |
+| (1024,4096,1024,8,2) | 339.7 | 151.7 | 1183 | 3.5x | 1813 | 1695 | — | — |
+| (4096,2048,1024,8,2) | 577.0 | 178.7 | 1415 | 2.5x | 1866 | 1947 | — | — |
+| (4096,2048,1024,64,8) | 2413.7 | 170.8 | 9301 | **3.9x** | 14236 | 13726 | — | — |
+| (4096,4096,1408,8,2) | 1507.2 | 188.1 | 3191 | 2.1x | 3592 | 3300 | — | — |
+| (16384,2048,1024,8,2) | 2196.6 | 187.7 | 4180 | **1.9x** | 4471 | 4638 | — | — |
+
+Design highlights (implementation under `csrc/fuse_moe/`; full optimization
+log in [docs/fuse_moe_porting_and_optimization.md](docs/fuse_moe_porting_and_optimization.md)):
+
+- **Cross-tile continuous pipeline**: the slab issue stream uses global
+  counters (`stage = cnt % kStage`) and never drains at task (tile)
+  boundaries; scatter row indices live in registers with rolling prefetch;
+  kStage adapts to the 96KB smem budget
+- **Fused gemm1 (gate/up N-tile pairing)**: one CTA computes both the gate
+  and up N panels of W1 (sharing the X tile, halving X loads); the epilogue
+  applies `silu(gate)·up` and writes act_out directly — no `gate_up_out
+  (T, 2I)` materialization and no separate activation kernel
+- **Compact reads**: activations stay in the expert-sorted compact layout
+  (no padding holes); the cp.async scatter path gathers token-ordered x
+  on load
+- **Adaptive tiling**: kTileM = 32/64/128 by avg tokens/expert (128 doubles
+  the W reuse span, enabled at avg≥256); kTileK = 64/128 by k%128
+  (gated by smem)
+- **PDL chaining**: count → gemm1 → gemm2 → reduce chained via
+  Programmatic Dependent Launch (sm89 falls back to stream order)
+
 ## Requirements
 
 - NVIDIA GPU: sm120 (RTX 5090D, both the FA TMA main path and the mixed_gemm
@@ -405,6 +473,16 @@ b = torch.randn(4096, device="cuda") * 0.1
 w_high, w_low, w_scale = split_mixed_precision_weight(w)  # one-time split at model load
 y = ops.mixed_gemm(x, w_high, w_low, w_scale, bias=b,
                    activation="silu")                   # fp32 output, accuracy ≈ fp32
+
+# ── Fused MoE FFN: y[s] = Σ_j scale[s,j]·(Down_ej @ silu(GateUp_ej @ x[s]))
+S, H, I, E, K = 4096, 2048, 1024, 8, 2
+x  = torch.randn(S, H, device="cuda", dtype=torch.bfloat16)
+w1 = torch.randn(E, 2 * I, H, device="cuda", dtype=torch.bfloat16) * 0.05
+w2 = torch.randn(E, H, I, device="cuda", dtype=torch.bfloat16) * 0.05
+topk_ids   = torch.randint(0, E, (S, K), device="cuda", dtype=torch.int32)
+topk_scale = torch.rand(S, K, device="cuda")            # fp32 routing weights
+
+y = ops.fuse_moe(x, w1, w2, topk_ids, topk_scale)       # (S, H) bf16
 ```
 
 > Dtype note: fp16 works on all supported architectures (sm70 / sm89 / sm120);
@@ -464,6 +542,25 @@ Limitations:
 - `K % 8 == 0`
 - FP8 backend requires SM89+; INT8 backend requires SM80+
 
+### `ops.fuse_moe(x, gate_up_weight, down_weight, topk_ids, topk_scale) -> Tensor`
+
+Fused MoE FFN forward:
+`y[s] = Σ_j topk_scale[s,j] · (Down_{e_j} @ silu(GateUp_{e_j} @ x[s]))`.
+Counting, routing permutation, both group GEMMs, activation, and the topk
+weighted reduction are fused into 4 kernels; bf16/fp16 inputs with fp32
+accumulation.
+
+| Param | Shape | Notes |
+|---|---|---|
+| `x` | (S, H) | bf16 / fp16, token order |
+| `gate_up_weight` | (E, 2I, H) | same dtype as x (gate first, up second) |
+| `down_weight` | (E, H, I) | same dtype as x |
+| `topk_ids` | (S, K) | int32, values in [0, E) |
+| `topk_scale` | (S, K) | fp32 topk weights |
+| Returns | (S, H) | same dtype as x |
+
+Constraints: `H % 64 == 0`, `I % 64 == 0`, `K <= 128`, `E <= 512`, SM80+.
+
 ### `split_mixed_precision_weight(w, scale=1/256, backend="auto") -> (w_high, w_low, w_scale)`
 
 Offline (one-time, at model load) split of fp32 weights into the triple needed
@@ -479,6 +576,9 @@ Pure PyTorch — no compiled operator required.
 | `FA_SPLITKV=0` | Disable Split-KV |
 | `FA_PERSISTENT=1` | Enable the persistent kernel (+2–5% for some d128 shapes) |
 | `GEMM_MIXED_FORCE_SPLITK=n` | Force the mixed_gemm split-K value (1/2/4/8/16, debug only) |
+| `FUSE_MOE_TMA=1` | Select the TMA + mbarrier engine on sm120 (default cp.async) |
+| `FUSE_MOE_TILE_M=32/64/128` | Force the fuse_moe kTileM (default adapts to avg tokens) |
+| `FUSE_MOE_TIME=1` | Print per-kernel timings of the fuse_moe pipeline |
 
 ## Examples
 
@@ -487,6 +587,7 @@ python examples/basic_usage.py        # minimal example: invocation + SDPA verif
 python examples/custom_mask_demo.py   # 4 typical masks: causal / sliding-window / padding / random-sparse
 python examples/gqa_example.py        # GQA: no K/V head expansion needed
 python examples/mixed_gemm_demo.py    # mixed-precision GEMM: weight split + epilogue fusion + accuracy
+python tests/test_fuse_moe.py         # fuse_moe: 21-case correctness (single-expert / sparse / duplicate routing)
 ```
 
 ## Benchmark
@@ -522,6 +623,9 @@ excluded from timing; on torch<2.5 or when the default config fails to compile
 python benchmark/benchmark_mixed_gemm.py                       # backend auto (FP8 if available)
 python benchmark/benchmark_mixed_gemm.py --backend int8        # pick the residual backend
 python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
+
+# fuse_moe: vs PyTorch eager / torch.compile / compile+reduce-overhead (CUDA graph)
+python benchmark/benchmark_fuse_moe.py
 ```
 
 ## Repository Structure
@@ -529,11 +633,12 @@ python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
 ```
 custom_ops/
 ├── __init__.py            # CustomOps: generic JIT operator loading framework (base class)
-├── recsys.py              # RecsysOps: mha_fwd_with_mask / mixed_gemm wrappers + weight-split helper
+├── recsys.py              # RecsysOps: lazy group-loading facade (fa/mixed_gemm/fuse_moe) + weight-split helper
 ├── csrc/
-│   ├── recsys_bindings.cpp        # torch.ops registration entry
+│   ├── custom_ops_macros.h       # shared operator registration macros
 │   ├── arch_targets.h             # arch conditional-compilation entry: FA_TARGETS → FA_HAS_SM70/SM8X/SM120 + gpu_major()
 │   ├── fa/                        # FA2 + mask kernel (sm70 / sm89 / sm120 paths, decoupled)
+│   │   ├── fa_bindings.cpp       # FA group registration entry (own .so, lazy-loaded)
 │   │   ├── fa_fwd_op.cu           # operator entry: validate / auto-pad / fill params (arch-agnostic)
 │   │   ├── fa_fwd_launch.h        # arch dispatch entry: fa_launch_smXX policies + Split-KV cost model
 │   │   ├── sm70/fa_fwd_sm70.h     # sm70 WMMA m16n16k16 kernel (fp16, no split-KV)
@@ -541,12 +646,19 @@ custom_ops/
 │   │   ├── sm120/fa_fwd_sm120.h   # sm120 TMA pipeline kernel / splitkv / persistent / combine
 │   │   ├── cpu/                   # CPU reference implementation (not wired into dispatch)
 │   │   └── common/                # shared params / softmax / utils
-│   └── mixed_gemm/                # mixed-precision GEMM kernel (ported from a TRT plugin)
-│       ├── mixed_gemm_op.cu       # torch operator entry: validation / workspace / dispatch
-│       ├── gemm_bf16xfp32_sm80.cu # kernel: tile/split-K heuristics + bf16 main + fp8/int8 residual dual GEMM
-│       ├── gemm_bf16xfp32_sm80.h  # kernel entry declarations + FP8 compile-time guard
-│       ├── gemm_bf16xfp32_sm120.cu # sm120a TMA+mbarrier kernel (auto-routed, decoupled from the sm80 path)
-│       └── gemm_bf16xfp32_sm120.h # sm120a path entry declarations (support/alignment checks)
+│   ├── mixed_gemm/                # mixed-precision GEMM kernel (ported from a TRT plugin)
+│   │   ├── mixed_gemm_op.cu       # torch operator entry: validation / workspace / dispatch
+│   │   ├── gemm_bf16xfp32_sm80.cu # kernel: tile/split-K heuristics + bf16 main + fp8/int8 residual dual GEMM
+│   │   ├── gemm_bf16xfp32_sm80.h  # kernel entry declarations + FP8 compile-time guard
+│   │   ├── gemm_bf16xfp32_sm120.cu # sm120a TMA+mbarrier kernel (auto-routed, decoupled from the sm80 path)
+│   │   └── gemm_bf16xfp32_sm120.h # sm120a path entry declarations (support/alignment checks)
+│   └── fuse_moe/                  # fused MoE FFN kernel (own .so, lazy-loaded)
+│       ├── fuse_moe_bindings.cpp  # fuse_moe group registration entry
+│       ├── fuse_moe_op.cu/.h      # operator entry: validation / workspace / arch dispatch
+│       ├── fuse_moe_launch.h      # arch dispatch entry (gemm engine / tile / PDL policies)
+│       ├── common/                # shared: count/act/reduce kernels, GEMM traits, params
+│       ├── sm89/                  # cp.async family (sm80+; also the sm120 default engine)
+│       └── sm120/                 # TMA + mbarrier family (optional engine via FUSE_MOE_TMA=1)
 ├── thirdparty/            # CUTLASS / CuTe (header-only dependencies)
 ├── benchmark/             # performance benchmark
 ├── examples/              # usage examples
@@ -586,11 +698,15 @@ locking, GPU arch auto-detection, GCC configuration, graceful degradation, and
 
 The kernel implementation in this repository is derived from the official
 FlashAttention source code (the compute skeleton follows FA2, while the data
-movement path adopts the FA3/hopper-style TMA design ported to sm120), and it
-depends on NVIDIA CUTLASS/CuTe (vendored as headers under `thirdparty/`).
-If this project helps you, please also cite the original works:
+movement path adopts the FA3/hopper-style TMA design ported to sm120);
+fuse_moe is ported from the sm90 implementation in
+[hpc-ops](https://github.com/meituan-hpc/hpc-ops) (group GEMM scheduling and
+the count/build_indices flow); and it depends on NVIDIA CUTLASS/CuTe (vendored
+as headers under `thirdparty/`). If this project helps you, please also cite
+the original works:
 
 - FlashAttention official repo: https://github.com/Dao-AILab/flash-attention
+- hpc-ops: https://github.com/meituan-hpc/hpc-ops
 - CUTLASS: https://github.com/NVIDIA/cutlass
 
 ```bibtex

@@ -1,31 +1,27 @@
 """
-custom_ops/recsys.py — RecsysOps：推荐系统核心 CUDA 算子库
+custom_ops/recsys.py — RecsysOps：推荐系统核心 CUDA 算子库（分组懒加载）
 
-算子列表
---------
-- mha_fwd_with_mask      Flash Attention 2 前向，支持任意 fp16/bf16 加法 mask
-- mixed_gemm             混合精度 GEMM：bf16 主项 + fp8/int8 residual 精度补偿，
-                         epilogue 融合 bias 与 silu/gelu 激活
+算子分组（每组独立 .so、独立 JIT 编译/缓存，首次访问时才编译）：
+- fa         mha_fwd_with_mask      Flash Attention 2 前向，任意 fp16/bf16 加法 mask
+- mixed_gemm mixed_gemm (+fp8 查询)  混合精度 GEMM：bf16 主项 + fp8/int8 residual
+- fuse_moe   fuse_moe                MoE 前向融合（group GEMM + silu*mul + reduce）
 
 快速使用
 --------
-    from custom_ops import ops, split_mixed_precision_weight  # 包级单例
+    from custom_ops import ops   # import 零编译
 
-    if ops.is_available():
-        out  = ops.mha_fwd_with_mask(q, k, v, mask)
+    if ops.is_available():       # 仅检查 CUDA 可用性，不触发编译
+        # 首次访问某算子时才编译对应分组（~1-4 分钟，之后秒级缓存加载）
+        out = ops.fuse_moe(x, w1, w2, topk_ids, topk_scale)
+        y   = ops.mixed_gemm(x, w_high, w_low, w_scale, activation="silu")
 
-        # 混合精度 GEMM：离线切分权重，在线一次调用
-        w_high, w_low, w_scale = split_mixed_precision_weight(w_fp32)
-        y = ops.mixed_gemm(x, w_high, w_low, w_scale,
-                           bias=bias, activation="silu")
-    else:
-        # CUDA 不可用或编译失败时做 Python 回退
-        ...
+    ops.ensure_loaded()          # 显式全量加载（旧 eager 行为）
+    ops.ensure_loaded("fa")      # 显式加载单个分组
 
 命名空间
 --------
-    torch.ops.recsys_ops.<name>(...)   — C++ 侧调用接口
-    ops.<name>(...)                    — Python 封装，带类型标注
+    torch.ops.recsys_ops.<name>(...)   — C++ 侧调用接口（需先加载对应分组）
+    ops.<name>(...)                    — Python 门面，带类型标注与自动分组加载
 """
 
 from __future__ import annotations
@@ -50,58 +46,233 @@ _ACTIVATION_TO_ID = {"identity": 0, "silu": 1, "gelu": 2}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RecsysOps — 推荐系统算子库
+# 分组 kernel 库（每组一个 CustomOps 子类 → 独立 .so）
 # ─────────────────────────────────────────────────────────────────────────────
 
-class RecsysOps(CustomOps):
-    """
-    推荐系统核心 CUDA 算子库。
+class FAOps(CustomOps):
+    """FA 分组：mha_fwd_with_mask（FlashAttention-2 + 任意加法 mask）。
 
-    命名空间  : recsys_ops  → torch.ops.recsys_ops.<name>(...)
-    编译产物  : recsys_ops_kernel.so
-    注册算子  :
-      - mha_fwd_with_mask       （必需）Flash Attention 2 前向
-      - mixed_gemm              （必需）混合精度 GEMM（bf16 + fp8/int8 residual）
-      - mixed_gemm_fp8_available（必需）FP8 后端可用性查询
+    sm70 / sm89 / sm120 三路径互不依赖，编译期由 FA_TARGETS 裁剪。
     """
 
-    # ── 配置 ─────────────────────────────────────────────────────────────────
     namespace    = "recsys_ops"
-    so_name      = "recsys_ops_kernel"
-    required_ops = [
-        "mha_fwd_with_mask",
-        "mixed_gemm",
-        "mixed_gemm_fp8_available",
-    ]
+    so_name      = "recsys_fa_kernel"
+    required_ops = ["mha_fwd_with_mask"]
     optional_ops = []
-
-    # 编译缓存回退目录（优先使用 TORCH_EXTENSIONS_DIR 环境变量）
     build_dir_fallback = "./torch_extensions"
 
     def get_sources(self) -> list:
-        """源文件列表：bindings + FA kernel + 混合精度 GEMM kernel。"""
-        csrc = os.path.join(_THIS_DIR, "csrc")
-        mixed = os.path.join(csrc, "mixed_gemm")
+        fa = os.path.join(_THIS_DIR, "csrc", "fa")
         return [
-            os.path.join(csrc, "recsys_bindings.cpp"),
-            os.path.join(csrc, "fa",        "fa_fwd_op.cu"),
+            os.path.join(fa, "fa_bindings.cpp"),
+            os.path.join(fa, "fa_fwd_op.cu"),
+        ]
+
+    def get_include_dirs(self) -> list:
+        csrc       = os.path.join(_THIS_DIR, "csrc")
+        thirdparty = os.path.join(_THIS_DIR, "thirdparty")
+        return [
+            thirdparty,
+            csrc,
+            os.path.join(csrc, "fa"),
+        ]
+
+    def register_fake_impls(self) -> None:
+        self.register_fake_for(
+            "mha_fwd_with_mask",
+            lambda q, k, v, mask: torch.empty_like(q),
+        )
+
+
+class MixedGemmOps(CustomOps):
+    """mixed_gemm 分组：混合精度 GEMM（bf16 主项 + fp8/int8 residual 补偿）。"""
+
+    namespace    = "recsys_ops"
+    so_name      = "recsys_mixed_gemm_kernel"
+    required_ops = ["mixed_gemm", "mixed_gemm_fp8_available"]
+    optional_ops = []
+    build_dir_fallback = "./torch_extensions"
+
+    def get_sources(self) -> list:
+        mixed = os.path.join(_THIS_DIR, "csrc", "mixed_gemm")
+        return [
+            os.path.join(mixed, "mixed_gemm_bindings.cpp"),
             os.path.join(mixed, "mixed_gemm_op.cu"),
             os.path.join(mixed, "gemm_bf16xfp32_sm80.cu"),
             os.path.join(mixed, "gemm_bf16xfp32_sm120.cu"),
         ]
 
     def get_include_dirs(self) -> list:
-        """头文件目录：thirdparty（cutlass/cute）+ csrc 各子目录 + 框架宏目录。"""
         csrc       = os.path.join(_THIS_DIR, "csrc")
         thirdparty = os.path.join(_THIS_DIR, "thirdparty")
         return [
-            thirdparty,                          # cutlass/cute 头文件
-            csrc,                                # custom_ops_macros.h
-            os.path.join(csrc, "fa"),            # fa_fwd_op.h 等
-            os.path.join(csrc, "mixed_gemm"),    # mixed_gemm_op.h 等
+            thirdparty,
+            csrc,
+            os.path.join(csrc, "mixed_gemm"),
         ]
 
-    # ── 显式方法：带类型标注，供 IDE 补全 ────────────────────────────────────
+    def register_fake_impls(self) -> None:
+        self.register_fake_for(
+            "mixed_gemm",
+            lambda x, w_high, w_low, w_scale, scale, bias, activation, \
+                   fp32_output, force_splitk: torch.empty(
+                x.shape[:-1] + (w_high.shape[0],),
+                dtype=torch.float32 if fp32_output else torch.bfloat16,
+                device=x.device),
+        )
+        self.register_fake_for(
+            "mixed_gemm_fp8_available",
+            lambda: True,
+        )
+
+
+class FuseMoeOps(CustomOps):
+    """fuse_moe 分组：MoE 前向融合算子（group GEMM + silu*mul + reduce）。"""
+
+    namespace    = "recsys_ops"
+    so_name      = "recsys_fuse_moe_kernel"
+    required_ops = ["fuse_moe"]
+    optional_ops = []
+    build_dir_fallback = "./torch_extensions"
+
+    def get_sources(self) -> list:
+        moe = os.path.join(_THIS_DIR, "csrc", "fuse_moe")
+        return [
+            os.path.join(moe, "fuse_moe_bindings.cpp"),
+            os.path.join(moe, "fuse_moe_op.cu"),
+        ]
+
+    def get_include_dirs(self) -> list:
+        csrc       = os.path.join(_THIS_DIR, "csrc")
+        thirdparty = os.path.join(_THIS_DIR, "thirdparty")
+        return [
+            thirdparty,
+            csrc,
+            os.path.join(csrc, "fuse_moe"),
+        ]
+
+    def register_fake_impls(self) -> None:
+        self.register_fake_for(
+            "fuse_moe",
+            lambda x, gate_up_weight, down_weight, topk_ids, topk_scale:
+                torch.empty_like(x),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RecsysOps — 分组懒加载门面
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RecsysOps:
+    """
+    推荐系统算子库门面：按算子分组懒加载。
+
+    - ``ops.<op>(...)``：首次访问时 JIT 编译/加载该算子所属分组（独立 .so），
+      之后走缓存（秒级）。分组间互不影响——只测 fuse_moe 不会编译 FA。
+    - ``ops.is_available()``：仅检查 CUDA 可用性（不触发编译）；已加载过分组
+      时同时反映其编译状态。某分组编译失败时，访问该分组算子会抛出带完整
+      错误信息的 RuntimeError（响亮失败，不静默）。
+    - ``ops.ensure_loaded([group])``：显式加载（无参 = 全部分组，等价旧
+      ``RecsysOps().load()`` 的 eager 行为）。
+
+    分组与算子映射
+    --------------
+    fa          : mha_fwd_with_mask
+    mixed_gemm  : mixed_gemm, mixed_gemm_fp8_available
+    fuse_moe    : fuse_moe
+    """
+
+    _GROUP_CLASSES = {
+        "fa": FAOps,
+        "mixed_gemm": MixedGemmOps,
+        "fuse_moe": FuseMoeOps,
+    }
+
+    _OP_TO_GROUP = {
+        "mha_fwd_with_mask": "fa",
+        "mixed_gemm": "mixed_gemm",
+        "mixed_gemm_fp8_available": "mixed_gemm",
+        "fuse_moe": "fuse_moe",
+    }
+
+    def __init__(self) -> None:
+        self._groups: dict = {}   # group name -> CustomOps 实例（已尝试加载）
+
+    # ── 分组管理 ──────────────────────────────────────────────────────────────
+
+    def _group(self, name: str) -> CustomOps:
+        """加载（或取已加载的）分组实例。编译失败时实例保留（is_available
+        为 False、load_error 携带原因），后续访问继续抛出同一信息。"""
+        if name not in self._groups:
+            self._groups[name] = self._GROUP_CLASSES[name]().load()
+        return self._groups[name]
+
+    def ensure_loaded(self, *names) -> "RecsysOps":
+        """显式加载分组。无参 = 全部分组（旧 eager 行为）。返回 self。"""
+        targets = names if names else tuple(self._GROUP_CLASSES)
+        for n in targets:
+            if n not in self._GROUP_CLASSES:
+                raise ValueError(
+                    f"unknown group {n!r}; available: {sorted(self._GROUP_CLASSES)}")
+            self._group(n)
+        return self
+
+    # load() 保持旧 API 兼容：RecsysOps().load() == 全量 eager 加载
+    def load(self) -> "RecsysOps":
+        return self.ensure_loaded()
+
+    @property
+    def groups(self) -> dict:
+        """{分组名: 状态} 视图（loaded/failed/not_loaded）。"""
+        status = {}
+        for n in self._GROUP_CLASSES:
+            if n in self._groups:
+                status[n] = "loaded" if self._groups[n].is_available() else "failed"
+            else:
+                status[n] = "not_loaded"
+        return status
+
+    def is_available(self, group: str | None = None) -> bool:
+        """
+        group 非空：加载该分组并返回其可用性（会触发编译）。
+        group 为空：CUDA 可用 且 所有已尝试加载的分组均成功（不触发编译；
+                    未加载的分组不影响结果——这正是懒加载语义）。
+        """
+        if group is not None:
+            if group not in self._GROUP_CLASSES:
+                raise ValueError(
+                    f"unknown group {group!r}; available: {sorted(self._GROUP_CLASSES)}")
+            return self._group(group).is_available()
+        if not torch.cuda.is_available():
+            return False
+        return all(g.is_available() for g in self._groups.values())
+
+    def load_error(self, group: str | None = None):
+        """返回分组（或首个失败分组）的加载错误信息；无失败返回 None。"""
+        if group is not None:
+            return self._group(group).load_error()
+        for g in self._groups.values():
+            if not g.is_available():
+                return g.load_error()
+        return None
+
+    # ── 算子访问 ──────────────────────────────────────────────────────────────
+
+    def __getattr__(self, name: str):
+        """ops.<op_name> → 懒加载所属分组 → torch.ops.recsys_ops.<op_name>。"""
+        if name.startswith("_"):
+            raise AttributeError(name)
+        group = self._OP_TO_GROUP.get(name)
+        if group is None:
+            raise AttributeError(
+                f"No op '{name}' in recsys_ops. Available ops: "
+                f"{sorted(self._OP_TO_GROUP)} (groups: {sorted(self._GROUP_CLASSES)})")
+        return getattr(self._group(group), name)
+
+    def __repr__(self) -> str:
+        return (f"RecsysOps(lazy, namespace='recsys_ops', groups={self.groups})")
+
+    # ── 显式方法：带类型标注，供 IDE 补全（与门面语义一致，均懒加载）──────
 
     def mha_fwd_with_mask(
         self,
@@ -110,31 +281,8 @@ class RecsysOps(CustomOps):
         v:    torch.Tensor,   # (B, Hk, Sk, d)   fp16/bf16 CUDA
         mask: torch.Tensor,   # (B, 1, ≥Sq, ≥Sk) 与 q 同 dtype，0=可见 / -inf=屏蔽
     ) -> torch.Tensor:
-        """
-        Flash Attention 2 前向，支持任意 fp16/bf16 加法 mask。
-
-        参数
-        ----
-        q, k, v : (B, H, S, d) fp16/bf16 CUDA，连续（四者同 dtype）
-        mask    : (B, 1, Sq_mask, Sk_mask) 与 q 同 dtype，加法 mask
-                  （0=可见，-inf=屏蔽，有限值=偏置）。维度要求：
-                  - Sq_mask ≥ Sq、Sk_mask ≥ Sk（等值即零拷贝，也接受预 pad）
-                  - col ≥ Sk 恒为屏蔽：mask 中 k 维越界列的内容被忽略
-
-        dtype 支持：fp16 全架构（sm70 V100 / sm89+ Ampere 及更新）；
-        bf16 仅 SM80+（V100 无 bf16 tensor core）。
-
-                限制
-        ----
-        - d ∈ {64, 128}，Sq 任意
-        - Sk % 8 != 0 时算子自动 pad 到 8 倍数（一次内部拷贝，对上层透明；
-          Sk % 8 == 0 时零拷贝）
-        - H % Hk == 0（支持 GQA）
-        - 不支持 dropout / causal / alibi / RoPE / KV-cache
-        """
-        return torch.ops.recsys_ops.mha_fwd_with_mask(q, k, v, mask)
-
-    # ── 显式方法：混合精度 GEMM ──────────────────────────────────────────────
+        """Flash Attention 2 前向，支持任意 fp16/bf16 加法 mask（懒加载 FA 分组）。"""
+        return self._group("fa").mha_fwd_with_mask(q, k, v, mask)
 
     def mixed_gemm(
         self,
@@ -143,40 +291,13 @@ class RecsysOps(CustomOps):
         w_low:   torch.Tensor,                      # (N, K) fp8_e4m3 或 int8
         w_scale: torch.Tensor | None = None,        # (N,) fp32，仅 INT8 后端
         *,
-        scale:        float = DEFAULT_RESIDUAL_SCALE,  # residual 补偿 scale
-        bias:         torch.Tensor | None = None,   # (N,) fp32，epilogue 融合 bias
-        activation:   str | int = "identity",       # "identity"/"silu"/"gelu" 或 0/1/2
-        out_dtype:    torch.dtype | None = None,    # None=fp32, 或 torch.bfloat16
-        force_splitk: int = 0,                      # 0=自动；>0 强制 split-K（调试）
+        scale:        float = DEFAULT_RESIDUAL_SCALE,
+        bias:         torch.Tensor | None = None,
+        activation:   str | int = "identity",
+        out_dtype:    torch.dtype | None = None,
+        force_splitk: int = 0,
     ) -> torch.Tensor:
-        """
-        混合精度 GEMM：y = activation(x @ (w_high + w_low*scale)^T + bias)。
-
-        解决生成式推荐中 bf16 权重精度损失大、tf32 性能不足的问题：
-        bf16 tensor core 算主项 + 低精度 tensor core 算 residual 补偿项，
-        以接近 bf16 的速度恢复接近 fp32 的精度。bias 与激活在 epilogue
-        融合执行，不产生额外 kernel 与中间显存。
-
-        参数
-        ----
-        x       : (..., K) fp32 或 bf16，连续。前导维度折叠为 M
-        w_high  : (N, K) bf16，主项权重（split_mixed_precision_weight 产出）
-        w_low   : (N, K) residual 权重，dtype 决定后端：
-                  - float8_e4m3fn → FP8 后端（SM89+，需编译期 CUDA >= 12.4）
-                  - int8          → INT8 动态量化后端（SM80+，需配 w_scale）
-        w_scale : (N,) fp32，INT8 后端的 per-channel 量化 scale
-        scale   : residual 补偿 scale，须与权重切分时一致（默认 1/256）
-        bias    : (N,) fp32，可选，epilogue 融合相加
-        activation : "identity" | "silu" | "gelu"（tanh 近似）或 0/1/2
-        out_dtype  : 输出 dtype。None → fp32（推荐，保精度）；
-                     torch.bfloat16 → bf16 输出
-        force_splitk : 调试用，强制 split-K 值（1/2/4/8/16）
-
-        限制
-        ----
-        - K % 8 == 0
-        - 后端要求：FP8 需 SM89+；INT8 需 SM80+
-        """
+        """混合精度 GEMM：y = activation(x @ (w_high + w_low*scale)^T + bias)。"""
         if isinstance(activation, str):
             if activation not in _ACTIVATION_TO_ID:
                 raise ValueError(
@@ -187,38 +308,32 @@ class RecsysOps(CustomOps):
             out_dtype = torch.float32
         if out_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("out_dtype must be torch.float32 or torch.bfloat16")
-        return torch.ops.recsys_ops.mixed_gemm(
+        return self._group("mixed_gemm").mixed_gemm(
             x, w_high, w_low, w_scale, scale, bias,
             activation, out_dtype == torch.float32, force_splitk)
 
     def mixed_gemm_fp8_available(self) -> bool:
-        """
-        FP8 residual 后端在本机是否可用（编译期 CUDA >= 12.4 且 GPU 为 SM89+）。
+        """FP8 residual 后端可用性（懒加载 mixed_gemm 分组）。"""
+        return bool(self._group("mixed_gemm").mixed_gemm_fp8_available())
 
-        False 时 ``split_mixed_precision_weight(backend="auto")`` 会自动
-        降级到 INT8 动态量化后端（SM80+ 可用，精度略低于 FP8）。
+    def fuse_moe(
+        self,
+        x:              torch.Tensor,                      # (S, H) bf16/fp16
+        gate_up_weight: torch.Tensor,                      # (E, 2I, H) 同 dtype
+        down_weight:    torch.Tensor,                      # (E, H, I) 同 dtype
+        topk_ids:       torch.Tensor,                      # (S, K) int32
+        topk_scale:     torch.Tensor,                      # (S, K) fp32
+    ) -> torch.Tensor:
         """
-        return bool(torch.ops.recsys_ops.mixed_gemm_fp8_available())
+        MoE 前向融合算子（单 GPU，bf16/fp16 输入，fp32 累加）：
 
-    def register_fake_impls(self) -> None:
+            y[s] = Σ_j topk_scale[s,j] * (Down_ej @ silu(GateUp_ej @ x[s]))
+
+        限制：H % 64 == 0 且 I % 64 == 0；num_topk <= 128；num_expert <= 512；
+        SM80+（sm89 / sm120）。
         """
-        为所有算子注册 fake（meta）实现，供 torch.compile / AOTI 做 shape 推断。
-        load() 成功后由基类自动调用，无需手动触发。
-        """
-        # mha_fwd_with_mask: 输出 shape 与 q 相同 (B, H, Sq, d)
-        self.register_fake_for(
-            "mha_fwd_with_mask",
-            lambda q, k, v, mask: torch.empty_like(q),
-        )
-        # mixed_gemm: (..., K) -> (..., N)，dtype 由 fp32_output 决定
-        self.register_fake_for(
-            "mixed_gemm",
-            lambda x, w_high, w_low, w_scale, scale, bias, activation, \
-                   fp32_output, force_splitk: torch.empty(
-                x.shape[:-1] + (w_high.shape[0],),
-                dtype=torch.float32 if fp32_output else torch.bfloat16,
-                device=x.device),
-        )
+        return self._group("fuse_moe").fuse_moe(
+            x, gate_up_weight, down_weight, topk_ids, topk_scale)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,27 +353,6 @@ def split_mixed_precision_weight(
         w ≈ w_high + w_low * scale
         w_high = bf16(w)                          主项，bf16 tensor core
         w_low  = quant((w - w_high) / scale)      residual 项，低精度 tensor core
-
-    参数
-    ----
-    w       : (N, K) 权重，任意可转 float32 的 dtype，建议 fp32
-    scale   : residual 补偿 scale，调用 mixed_gemm 时须传同一值
-    backend : "fp8" | "int8" | "auto"
-        - "fp8"  ：w_low 产出 float8_e4m3fn（SM89+，需编译期 CUDA >= 12.4）
-        - "int8" ：w_low 产出 int8 + per-channel scale（SM80+，兼容性最好）
-        - "auto" ：当前机器可用 FP8 则选 FP8，否则降级 INT8
-
-    返回
-    ----
-    (w_high, w_low, w_scale)：
-        w_high : (N, K) bf16
-        w_low  : (N, K) float8_e4m3fn（FP8 后端）或 int8（INT8 后端）
-        w_scale: (N,) fp32，仅 INT8 后端非 None
-
-    示例
-    ----
-        w_high, w_low, w_scale = split_mixed_precision_weight(w_fp32)
-        y = ops.mixed_gemm(x, w_high, w_low, w_scale, bias=b, activation="silu")
     """
     if w.dim() != 2:
         raise ValueError(f"w must be 2D (N, K), got {tuple(w.shape)}")
@@ -284,7 +378,7 @@ def split_mixed_precision_weight(
     return w_high, w_low, w_scale.to(torch.float32)
 
 
-# FP8 可用性进程级缓存（探测需要 torch.ops，可能触发 JIT 编译，避免反复触发）
+# FP8 可用性进程级缓存（探测需要加载 mixed_gemm 分组，避免反复触发）
 _fp8_available_cache: bool | None = None
 
 
@@ -292,9 +386,10 @@ def _fp8_available_cached() -> bool:
     global _fp8_available_cache
     if _fp8_available_cache is None:
         try:
-            _fp8_available_cache = bool(
+            # 运行期导入包级单例（此时 custom_ops 已完成初始化，无循环导入）
+            from custom_ops import ops
+            _fp8_available_cache = ops.is_available("mixed_gemm") and bool(
                 torch.ops.recsys_ops.mixed_gemm_fp8_available())
         except Exception:
             _fp8_available_cache = False
     return _fp8_available_cache
-

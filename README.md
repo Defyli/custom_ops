@@ -2,7 +2,7 @@
 
 中文 | [English](README_EN.md)
 
-面向生成式推荐系统的高性能 CUDA 算子库，包含两个核心算子：
+面向生成式推荐系统的高性能 CUDA 算子库，包含三个核心算子：
 
 - **`mha_fwd_with_mask`**：支持**任意加法 mask**（0=可见 / -inf=屏蔽）的
   FlashAttention-2 前向，深度适配消费级 GPU（sm120 / sm89，bf16 / fp16）与 Volta
@@ -11,6 +11,9 @@
   tf32 性能不足**的问题——bf16 tensor core 算主项 + 低精度 tensor core 算
   residual 补偿项，以接近 bf16 的开销恢复接近 fp32 的精度，且在 epilogue
   融合执行 bias 相加与 silu/gelu 激活
+- **`fuse_moe`**：MoE FFN 前向融合（单 GPU），计数 / 路由重排 / gate_up
+  group GEMM / silu·mul / down group GEMM / topk 加权归约全部融合为 4 个
+  kernel，bf16/fp16 输入、fp32 累加
 
 **亮点**
 
@@ -53,6 +56,22 @@
 - **自适应 tile/split-K**：沿用原 TensorRT 插件的 wall-clock 启发式，
   小 M 自动 split-K，无需调参
 
+**MoE 前向融合 `fuse_moe`**
+
+- **大 shape 有效算力 171~190 TFLOPS**（mma.sync 峰值的 82~91%）：
+  4096×4096×1408 **188 TF**、16384×2048×1024 **188 TF**；vs PyTorch eager
+  **1.9~14.8x**，vs `torch.compile` **1.4~2.5x**，vs compile+CUDA graph
+  最高 **98x**（小 batch 大 E 场景）
+- **gemm1 gate/up 配对融合**：同一 CTA 同时计算 W1 的 gate 与 up 两个 N
+  面板（共享 X tile，装载量减半），epilogue 直接 `silu(gate)·up` 写
+  act_out——免 `gate_up_out (T, 2I)` 物化与独立激活 kernel
+- **跨 tile 连续流水**：slab 发射流全局计数，task（tile）边界不排空；
+  scatter 行索引驻留寄存器滚动预取；激活全程 expert 有序 compact 布局
+  （无 padded 空洞与预物化）
+- **架构自适应**：sm89 / sm120 统一 cp.async 引擎（sm120 可选 TMA +
+  mbarrier 引擎，`FUSE_MOE_TMA=1`）；kTileM 按 avg tokens/expert 选
+  32/64/128、kStage 按 smem 预算自适应；PDL 串联四个 kernel
+
 **通用能力**
 
 - **JIT 自动编译**：首次 import 自动构建，多进程安全，支持
@@ -61,7 +80,9 @@
 > FA 算子完整的移植与优化过程记录见
 > [docs/fa_sm120_porting_and_optimization.md](docs/fa_sm120_porting_and_optimization.md)
 > 与
-> [docs/fa_sm70_porting_and_optimization.md](docs/fa_sm70_porting_and_optimization.md)。
+> [docs/fa_sm70_porting_and_optimization.md](docs/fa_sm70_porting_and_optimization.md)；
+> fuse_moe 见
+> [docs/fuse_moe_porting_and_optimization.md](docs/fuse_moe_porting_and_optimization.md)。
 
 ## 性能
 
@@ -315,6 +336,44 @@ mixed **8.0e-3** vs bf16 1.2e-2；RMS 误差 **1.7e-3** vs 4.0e-3（低 2.3x）�
 > 对等）+ fp32 epilogue：速度快 1.3~1.7x（单次 GEMM vs 主项+补偿双 GEMM），但
 > 权重舍入误差完全未补偿。
 
+### fuse_moe（MoE FFN 前向融合，单 GPU）
+
+测试环境：RTX 5090D / PyTorch 2.6 / CUDA 12.8，bf16，均匀路由。sm120 上
+默认引擎为 cp.async 连续流水 kernel（各 shape 实测均优于 TMA 引擎
+3~15%）；`FUSE_MOE_TMA=1` 可选切换 TMA + mbarrier 引擎（16384 case
+2807µs vs 默认 2197µs）。sm89（RTX 4090D）走同一 cp.async 路径。
+
+大 shape 有效算力 **171~190 TFLOPS**（mma.sync 峰值的 82~91%）；
+vs eager **1.9~14.8x**，vs `torch.compile` **1.4~2.5x**，vs
+compile+reduce-overhead（CUDA graph）最高 **98x**：
+
+| Shape (S,H,I,E,K) | custom µs | TFLOPS | eager µs | vs eager | comp µs | comp+RO µs | FG+graph µs | vs FG |
+|---|---|---|---|---|---|---|---|---|
+| (128,2048,1024,8,2) | 83.6 | 38.5 | 1235 | **14.8x** | 1728 | 1636 | 8198 | **98.0x** |
+| (128,2048,1024,64,2) | 634.4 | 5.1 | 8030 | **12.7x** | 12819 | 12280 | 9565 | 15.1x |
+| (1024,2048,1024,8,2) | 175.3 | 147.0 | 1125 | 6.4x | 1800 | 1676 | — | — |
+| (1024,4096,1024,8,2) | 339.7 | 151.7 | 1183 | 3.5x | 1813 | 1695 | — | — |
+| (4096,2048,1024,8,2) | 577.0 | 178.7 | 1415 | 2.5x | 1866 | 1947 | — | — |
+| (4096,2048,1024,64,8) | 2413.7 | 170.8 | 9301 | **3.9x** | 14236 | 13726 | — | — |
+| (4096,4096,1408,8,2) | 1507.2 | 188.1 | 3191 | 2.1x | 3592 | 3300 | — | — |
+| (16384,2048,1024,8,2) | 2196.6 | 187.7 | 4180 | **1.9x** | 4471 | 4638 | — | — |
+
+设计要点（实现见 `csrc/fuse_moe/`，完整优化历程见
+[docs/fuse_moe_porting_and_optimization.md](docs/fuse_moe_porting_and_optimization.md)）：
+
+- **跨 tile 连续流水**：slab 发射流全局计数（`stage = cnt % kStage`），
+  task（tile）边界不排空；scatter 行索引驻留寄存器滚动预取；kStage 按
+  smem 预算自适应（96KB）
+- **gemm1 gate/up 配对融合**：同一 CTA 同时计算 W1 的 gate 与 up 两个
+  N 面板（共享 X tile，X 装载量减半），epilogue 直接 `silu(gate)·up`
+  直写 act_out——免 `gate_up_out (T, 2I)` 物化与独立激活 kernel
+- **compact 直读**：激活按 expert 有序紧凑布局流动，无 padded 空洞；
+  cp.async scatter 路径 gather-on-load 直读 token 序 x
+- **tile 自适应**：kTileM 按 avg tokens/expert 选 32/64/128（128 将 W
+  复用面翻倍，avg≥256 启用）；kTileK 按 k%128 选 64/128（smem 门控）
+- **PDL 串联**：count → gemm1 → gemm2 → reduce 四个 kernel 以
+  Programmatic Dependent Launch 串联（sm89 自动退化为 stream 顺序）
+
 ## 环境要求
 
 - NVIDIA GPU：sm120（RTX 5090D，FA TMA 主路径与 mixed_gemm sm120a TMA 路径
@@ -359,6 +418,16 @@ b = torch.randn(4096, device="cuda") * 0.1
 w_high, w_low, w_scale = split_mixed_precision_weight(w)  # 模型加载时一次性拆分
 y = ops.mixed_gemm(x, w_high, w_low, w_scale, bias=b,
                    activation="silu")                   # fp32 输出，精度 ≈ fp32
+
+# ── MoE FFN：y[s] = Σ_j scale[s,j]·(Down_ej @ silu(GateUp_ej @ x[s])) ─
+S, H, I, E, K = 4096, 2048, 1024, 8, 2
+x  = torch.randn(S, H, device="cuda", dtype=torch.bfloat16)
+w1 = torch.randn(E, 2 * I, H, device="cuda", dtype=torch.bfloat16) * 0.05
+w2 = torch.randn(E, H, I, device="cuda", dtype=torch.bfloat16) * 0.05
+topk_ids   = torch.randint(0, E, (S, K), device="cuda", dtype=torch.int32)
+topk_scale = torch.rand(S, K, device="cuda")            # fp32 加权
+
+y = ops.fuse_moe(x, w1, w2, topk_ids, topk_scale)       # (S, H) bf16
 ```
 
 > dtype 约定：fp16 全架构可用（sm70 / sm89 / sm120）；bf16 仅 SM80+（V100 无
@@ -415,6 +484,24 @@ FP8 后端可用性（编译期 CUDA >= 12.4 且 GPU 为 SM89+）。
 - `K % 8 == 0`
 - FP8 后端需 SM89+；INT8 后端需 SM80+
 
+### `ops.fuse_moe(x, gate_up_weight, down_weight, topk_ids, topk_scale) -> Tensor`
+
+MoE FFN 前向融合：
+`y[s] = Σ_j topk_scale[s,j] · (Down_{e_j} @ silu(GateUp_{e_j} @ x[s]))`。
+count / 路由重排 / 两个 group GEMM / 激活 / topk 加权归约全部融合为
+4 个 kernel，bf16/fp16 输入、fp32 累加。
+
+| 参数 | shape | 说明 |
+|---|---|---|
+| `x` | (S, H) | bf16 / fp16，token 序 |
+| `gate_up_weight` | (E, 2I, H) | 与 x 同 dtype（gate 在前 up 在后） |
+| `down_weight` | (E, H, I) | 与 x 同 dtype |
+| `topk_ids` | (S, K) | int32，取值 ∈ [0, E) |
+| `topk_scale` | (S, K) | fp32，topk 加权系数 |
+| 返回 | (S, H) | 与 x 同 dtype |
+
+限制：`H % 64 == 0`、`I % 64 == 0`、`K <= 128`、`E <= 512`、SM80+。
+
 ### `split_mixed_precision_weight(w, scale=1/256, backend="auto") -> (w_high, w_low, w_scale)`
 
 离线（模型加载时一次性）将 fp32 权重拆分为 mixed_gemm 所需的三元组：
@@ -429,6 +516,9 @@ FP8 后端可用性（编译期 CUDA >= 12.4 且 GPU 为 SM89+）。
 | `FA_SPLITKV=0` | 禁用 split KV |
 | `FA_PERSISTENT=1` | 启用 persistent kernel（d128 部分场景 +2~5%） |
 | `GEMM_MIXED_FORCE_SPLITK=n` | 强制 mixed_gemm 的 split-K 值（1/2/4/8/16，调试用） |
+| `FUSE_MOE_TMA=1` | sm120 上启用 TMA + mbarrier 引擎（默认 cp.async） |
+| `FUSE_MOE_TILE_M=32/64/128` | 强制 fuse_moe 的 kTileM（默认按 avg tokens 自适应） |
+| `FUSE_MOE_TIME=1` | 打印 fuse_moe 各 kernel 分段耗时 |
 
 ## Examples
 
@@ -437,6 +527,7 @@ python examples/basic_usage.py        # 最小示例：调用 + 与 SDPA 校验
 python examples/custom_mask_demo.py   # 4 种典型 mask：causal / 滑窗 / padding / 随机稀疏
 python examples/gqa_example.py        # GQA：无需扩展 K/V 头
 python examples/mixed_gemm_demo.py    # 混合精度 GEMM：权重拆分 + epilogue 融合 + 精度对比
+python tests/test_fuse_moe.py         # fuse_moe：21 用例正确性（含单专家/稀疏/重复路由）
 ```
 
 ## Benchmark
@@ -469,6 +560,9 @@ sm89 d=128 默认配置编译失败时自动降级（BLOCK_M=64）/输出 N/A。
 python benchmark/benchmark_mixed_gemm.py                       # 后端 auto（FP8 可用则 FP8）
 python benchmark/benchmark_mixed_gemm.py --backend int8        # 指定 residual 后端
 python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
+
+# fuse_moe：对比 PyTorch eager / torch.compile / compile+reduce-overhead（CUDA graph）
+python benchmark/benchmark_fuse_moe.py
 ```
 
 ## 仓库结构
@@ -476,11 +570,12 @@ python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
 ```
 custom_ops/
 ├── __init__.py            # CustomOps 通用 JIT 算子加载框架（基类）
-├── recsys.py              # RecsysOps：mha_fwd_with_mask / mixed_gemm 封装 + 权重拆分 helper
+├── recsys.py              # RecsysOps：分组懒加载门面（fa/mixed_gemm/fuse_moe）+ 权重拆分 helper
 ├── csrc/
-│   ├── recsys_bindings.cpp        # torch.ops 注册入口
+│   ├── custom_ops_macros.h       # 通用算子注册框架宏
 │   ├── arch_targets.h             # 架构条件编译标准入口：FA_TARGETS → FA_HAS_SM70/SM8X/SM120 + gpu_major()
-│   ├── fa/                        # FA2 + mask kernel（sm70 / sm89 / sm120 三路径，互不依赖）
+│   ├── fa/
+│   │   ├── fa_bindings.cpp       # FA 分组注册入口（独立 .so，懒加载）
 │   │   ├── fa_fwd_op.cu           # 算子入口：校验 / 自动 pad / 填 params（零架构感知）
 │   │   ├── fa_fwd_launch.h        # 架构分发入口：fa_launch_smXX 策略 + Split-KV cost model
 │   │   ├── sm70/fa_fwd_sm70.h     # sm70 WMMA m16n16k16 kernel（fp16，无 split-KV）
@@ -488,12 +583,20 @@ custom_ops/
 │   │   ├── sm120/fa_fwd_sm120.h   # sm120 TMA 流水线 kernel / splitkv / persistent / combine
 │   │   ├── cpu/                   # CPU 参考实现（未接入算子分发，仅供参考）
 │   │   └── common/                # 两路共用的参数包 / softmax / utils
-│   └── mixed_gemm/                # 混合精度 GEMM kernel（自 TRT 插件移植）
-│       ├── mixed_gemm_op.cu       # torch 算子入口：校验 / workspace / 分发
-│       ├── gemm_bf16xfp32_sm80.cu # kernel：tile/split-K 启发式 + bf16 主项 + fp8/int8 补偿双 GEMM
-│       ├── gemm_bf16xfp32_sm80.h  # kernel 入口声明 + FP8 编译期守卫
-│       ├── gemm_bf16xfp32_sm120.cu # sm120a TMA+mbarrier 专用 kernel（自动路由，与 sm80 路径解耦）
-│       └── gemm_bf16xfp32_sm120.h # sm120a 路径入口声明（supported/对齐检查）
+│   ├── mixed_gemm/                # 混合精度 GEMM kernel（自 TRT 插件移植，独立 .so 懒加载）
+│   │   ├── mixed_gemm_bindings.cpp # 分组注册入口（mixed_gemm + fp8 可用性查询）
+│   │   ├── mixed_gemm_op.cu       # torch 算子入口：校验 / workspace / 分发
+│   │   ├── gemm_bf16xfp32_sm80.cu # kernel：tile/split-K 启发式 + bf16 主项 + fp8/int8 补偿双 GEMM
+│   │   ├── gemm_bf16xfp32_sm80.h  # kernel 入口声明 + FP8 编译期守卫
+│   │   ├── gemm_bf16xfp32_sm120.cu # sm120a TMA+mbarrier 专用 kernel（自动路由，与 sm80 路径解耦）
+│   │   └── gemm_bf16xfp32_sm120.h # sm120a 路径入口声明（supported/对齐检查）
+│   └── fuse_moe/                  # MoE 前向融合 kernel（独立 .so 懒加载）
+│       ├── fuse_moe_bindings.cpp  # 分组注册入口
+│       ├── fuse_moe_op.cu/.h      # torch 算子入口：校验 / workspace / 架构分发
+│       ├── fuse_moe_launch.h      # 架构分发标准入口（gemm 引擎/tile/PDL 策略内封）
+│       ├── common/                # 跨架构共享：count/act/reduce kernels、GEMM traits、params
+│       ├── sm89/                  # cp.async 家族（sm80+ 通用，sm120 默认引擎亦复用）
+│       └── sm120/                 # TMA + mbarrier 家族（FUSE_MOE_TMA=1 可选引擎）
 ├── thirdparty/            # CUTLASS / CuTe（头文件依赖）
 ├── benchmark/             # 性能基准测试
 ├── examples/              # 使用示例
@@ -530,10 +633,13 @@ GCC 版本配置、优雅降级、`torch.compile`/AOTI fake 注册。
 ## 致谢与引用
 
 本项目的 kernel 实现基于 FlashAttention 官方源码修改而来（计算骨架沿用 FA2，
-数据通路参考 FA3/hopper 的 TMA 写法移植至 sm120），并依赖 NVIDIA CUTLASS/CuTe
+数据通路参考 FA3/hopper 的 TMA 写法移植至 sm120）；fuse_moe 移植自
+[hpc-ops](https://github.com/meituan-hpc/hpc-ops) 的 sm90 实现（group GEMM
+调度与 count/build_indices 流程）；并依赖 NVIDIA CUTLASS/CuTe
 （已作为头文件内置于 `thirdparty/`）。如果本项目对您有帮助，请同时引用原项目：
 
 - FlashAttention 官方仓库：https://github.com/Dao-AILab/flash-attention
+- hpc-ops：https://github.com/meituan-hpc/hpc-ops
 - CUTLASS：https://github.com/NVIDIA/cutlass
 
 ```bibtex

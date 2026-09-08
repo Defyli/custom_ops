@@ -351,25 +351,53 @@ class CustomOps:
         """内部：执行快速路径或编译路径加载。"""
         t0 = time.monotonic()
 
-        build_dir = get_build_dir(
+        base_dir = get_build_dir(
             so_name=self.so_name,
             fallback_dir=self.build_dir_fallback,
         )
+        # 每个扩展独占子目录 <base>/<so_name>/：多个扩展共享同一 base 时，
+        # build.ninja / .build_stamp / lock 互不干扰（分组懒加载编译的前提；
+        # 旧扁平布局的缓存会因找不到 .so 自动重建一次，无害）
+        build_dir = os.path.join(base_dir, self.so_name) if base_dir else ""
+        if build_dir:
+            os.makedirs(build_dir, exist_ok=True)
         so_path = os.path.join(build_dir, f"{self.so_name}.so") if build_dir else ""
 
-        # 构建签名（目标 arch 列表 + 全部源文件指纹）：编译时写入 .build_stamp，
-        # 快速加载前校验，防两类静默错误：
+        # 构建签名（目标 arch 列表 + 源文件及分组内头文件指纹）：编译时写入 .build_stamp，
+        # 快速加载前校验，防三类静默错误：
         #   ① 缓存目录被跨机器/跨 GPU 共享时 dlopen 错误架构的 .so
         #     （kernel 缺失 → 静默跑空 stub 或直接崩溃）
         #   ② 源码已修改但 .so 还是旧版本（快速路径绕过了 cpp_extension
-        #     的版本检查，必须自行承担源码指纹比对）
+        #     的版本检查，必须自行承担指纹比对）
+        #   ③ 仅改了头文件（traits/宏）但源文件未变——源文件指纹不够，
+        #     递归扫入每个源文件所在目录的头文件（分组目录互不重叠，改动
+        #     只触发所属分组重建）+ csrc 顶层共享头（macros/arch_targets）。
+        #     thirdparty（cutlass，27MB 且几乎不变）不扫。
         def _build_signature() -> str:
             try:
+                import glob as _glob
                 import hashlib
                 h = hashlib.sha1()
-                for src in sorted(self.get_sources()):
+                srcs = sorted(self.get_sources())
+                for src in srcs:
                     st = os.stat(src)
                     h.update(f"{src}|{st.st_size}|{st.st_mtime_ns}\n".encode())
+                heads = set()
+                for src in srcs:
+                    d = os.path.dirname(os.path.abspath(src))
+                    for pat in ("*.h", "*.hpp", "*.cuh"):
+                        heads.update(
+                            os.path.realpath(p)
+                            for p in _glob.glob(os.path.join(d, "**", pat),
+                                                recursive=True))
+                csrc_top = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
+                if os.path.isdir(csrc_top):
+                    heads.update(
+                        os.path.realpath(p)
+                        for p in _glob.glob(os.path.join(csrc_top, "*.h")))
+                for f in sorted(heads):
+                    st = os.stat(f)
+                    h.update(f"{f}|{st.st_size}|{st.st_mtime_ns}\n".encode())
                 arch = " ".join(f"{a // 10}.{a % 10}" for a in _detect_archs())
                 return f"{arch}|{h.hexdigest()[:12]}"
             except Exception:
@@ -603,22 +631,27 @@ class CustomOps:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RecsysOps — 推荐系统三大核心算子库（包级内置，可直接导入）
+# RecsysOps — 推荐系统核心算子库（分组懒加载门面）
+#
+# 按算子分组拆分为独立 .so（fa / mixed_gemm / fuse_moe），首次访问某算子
+# 时才 JIT 编译对应分组——只测/只用一个算子时不再全量编译。
 #
 # 用法：
-#   from custom_ops import ops            # 使用预加载单例（推荐）
-#   from custom_ops import RecsysOps, ops # 同时导入类与单例
-#   from custom_ops import RecsysOps      # 仅导入类，自行实例化
+#   from custom_ops import ops            # import 零编译
+#   out = ops.mha_fwd_with_mask(q,k,v,mask)  # 首次调用才编译 FA 分组
+#   y   = ops.fuse_moe(...)                  # 首次调用才编译 MoE 分组
+#   ops.ensure_loaded()                       # 显式全量加载（旧行为）
 # ─────────────────────────────────────────────────────────────────────────────
 
 from custom_ops.recsys import RecsysOps  # noqa: E402  (避免循环导入，置于类定义之后)
 from custom_ops.recsys import split_mixed_precision_weight  # noqa: E402
 
-#: 推荐系统算子库的包级全局单例，import 时自动完成编译加载及 fake 注册。
+#: 推荐系统算子库的包级全局单例（懒加载：首次访问某算子时才编译对应分组）。
 #:
 #: 用法::
 #:
 #:     from custom_ops import ops
 #:     out  = ops.mha_fwd_with_mask(q, k, v, mask)
 #:     y    = ops.mixed_gemm(x, w_high, w_low, w_scale, activation="silu")
-ops: RecsysOps = RecsysOps().load()
+#:     z    = ops.fuse_moe(x, w1, w2, topk_ids, topk_scale)
+ops: RecsysOps = RecsysOps()

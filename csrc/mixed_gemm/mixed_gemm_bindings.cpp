@@ -1,12 +1,8 @@
 /**
- * csrc/recsys_bindings.cpp — RecsysOps 算子注册入口
+ * mixed_gemm_bindings.cpp — mixed_gemm 分组算子注册入口
  *
- * 命名空间: recsys_ops → torch.ops.recsys_ops.<name>(...)
- *
- * 注册算子:
- *   1. mha_fwd_with_mask      — Flash Attention 2 前向，支持任意 bf16 加法 mask
- *   2. mixed_gemm             — 混合精度 GEMM：bf16 主项 + fp8/int8 residual 精度补偿，
- *                               epilogue 融合 bias + silu/gelu 激活
+ * 命名空间: recsys_ops → torch.ops.recsys_ops.{mixed_gemm, mixed_gemm_fp8_available}
+ * 本分组独立编译为 recsys_mixed_gemm_kernel.so（懒加载）。
  */
 
 // Step 1: 定义命名空间
@@ -16,7 +12,6 @@
 #include "custom_ops_macros.h"
 
 // Step 3: 包含算子声明头文件
-#include "fa/fa_fwd_op.h"
 #include "mixed_gemm/mixed_gemm_op.h"
 #include "mixed_gemm/gemm_bf16xfp32_sm80.h"
 
@@ -26,20 +21,6 @@
 // Step 4: 分发函数
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── mha_fwd_with_mask ────────────────────────────────────────────────────────
-CUSTOM_OP_DISPATCH_FN(
-    mha_fwd_with_mask,
-    (const torch::Tensor& q,
-     const torch::Tensor& k,
-     const torch::Tensor& v,
-     const torch::Tensor& mask),
-    (q, k, v, mask),
-    q
-)
-
-// ── mixed_gemm ──────────────────────────────────────────────────────────────
-// 注意：c10::optional<Tensor> 对应 schema 中的 "Tensor? ..."；
-// dispatch 宏按参数名原样转发。
 CUSTOM_OP_DISPATCH_FN(
     mixed_gemm,
     (const torch::Tensor& x,
@@ -54,7 +35,6 @@ CUSTOM_OP_DISPATCH_FN(
     (x, w_high, w_low, w_scale, scale, bias, activation, fp32_output, force_splitk),
     x
 )
-
 
 // ── mixed_gemm_fp8_available ─────────────────────────────────────────────────
 // 无 tensor 参数的纯查询函数：不适用 CUSTOM_OP_DISPATCH_FN（无设备分派语义），
@@ -77,15 +57,10 @@ static bool _dispatch_mixed_gemm_fp8_available() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 5: 注册 schema
+// Step 5/6: 注册 schema + 绑定实现
 // ─────────────────────────────────────────────────────────────────────────────
 
 CUSTOM_OPS_LIBRARY_BEGIN
-    CUSTOM_OP_SCHEMA(
-        mha_fwd_with_mask,
-        "Tensor q, Tensor k, Tensor v, Tensor mask",
-        "-> Tensor"
-    )
     CUSTOM_OP_SCHEMA(
         mixed_gemm,
         "Tensor x, Tensor w_high, Tensor w_low, "
@@ -101,20 +76,13 @@ CUSTOM_OPS_LIBRARY_BEGIN
     )
 CUSTOM_OPS_LIBRARY_END
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Step 6: 绑定实现
-// ─────────────────────────────────────────────────────────────────────────────
-
 CUSTOM_OPS_IMPL_BEGIN
-    CUSTOM_OP_BIND(mha_fwd_with_mask)
     CUSTOM_OP_BIND(mixed_gemm)
     CUSTOM_OP_BIND(mixed_gemm_fp8_available)
 CUSTOM_OPS_IMPL_END
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 7: pybind 入口
 // ─────────────────────────────────────────────────────────────────────────────
 
-CUSTOM_OPS_PYBIND_MODULE("RecsysOps — recsys_ops CUDA operator library")
+CUSTOM_OPS_PYBIND_MODULE("RecsysOps/mixed_gemm — bf16+fp8/int8 residual GEMM with fused epilogue")
