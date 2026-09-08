@@ -639,7 +639,7 @@ GCC 版本配置、优雅降级、`torch.compile`/AOTI fake 注册。
 （已作为头文件内置于 `thirdparty/`）。如果本项目对您有帮助，请同时引用原项目：
 
 - FlashAttention 官方仓库：https://github.com/Dao-AILab/flash-attention
-- hpc-ops：https://github.com/meituan-hpc/hpc-ops
+- hpc-ops：https://github.com/Tencent/hpc-ops
 - CUTLASS：https://github.com/NVIDIA/cutlass
 
 ```bibtex

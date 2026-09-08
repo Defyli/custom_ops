@@ -706,7 +706,7 @@ as headers under `thirdparty/`). If this project helps you, please also cite
 the original works:
 
 - FlashAttention official repo: https://github.com/Dao-AILab/flash-attention
-- hpc-ops: https://github.com/meituan-hpc/hpc-ops
+- hpc-ops: https://github.com/Tencent/hpc-ops
 - CUTLASS: https://github.com/NVIDIA/cutlass
 
 ```bibtex
