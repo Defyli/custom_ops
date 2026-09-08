@@ -1,9 +1,9 @@
 # FlashAttention-2 在 Volta (V100/sm70) 上的移植与优化全记录
 
-> **硬件**：Tesla V100-PCIE-32GB（sm_70，80 SMs，96KB smem/CTA（默认 48KB），fp16 Tensor Core 理论峰值 ~125 TFLOPS，cuBLAS 实测 **84.2 TFLOPS**）
+> **硬件**：Tesla V100-PCIE-32GB（sm_70，80 SMs，96KB smem/CTA（默认 48KB），fp16 Tensor Core 理论峰值 ≈125 TFLOPS，cuBLAS 实测 **84.2 TFLOPS**）
 > **软件**：CUDA 11.7/11.8 / PyTorch 2.0.1+cu117 / CUTLASS+CuTe（thirdparty）
 > **算子**：带任意加法 mask 的 FA2 Forward（fp16，d∈{64,128}，支持 GQA）
-> **最终结果**：标准场景 d=128 **16~24 TFLOPS**（cuBLAS 峰值的 19~29%，SDPA+mask 的 **1.05~1.42x**，无 mask 等价场景超开源 fa-v100 参考的 **1.23~1.31x**）；d=64 **10~18 TFLOPS**（SDPA+mask 的 1.4~1.8x，与 fa-v100 持平 0.95~1.07x）；从大序列 2.4 TF 的起点累计 **7~8x**
+> **最终结果**：标准场景 d=128 **16–24 TFLOPS**（cuBLAS 峰值的 19–29%，SDPA+mask 的 **1.05–1.42x**，无 mask 等价场景超开源 fa-v100 参考的 **1.23–1.31x**）；d=64 **10–18 TFLOPS**（SDPA+mask 的 1.4–1.8x，与 fa-v100 持平 0.95–1.07x）；从大序列 2.4 TF 的起点累计 **7–8x**
 
 ---
 
@@ -15,8 +15,8 @@
    - [Phase 1（v3）：Swizzle smem——搬运方向正确，行映射 softmax 全军覆没](#phase-1v3swizzle-smem搬运方向正确行映射-softmax-全军覆没)
    - [Phase 2（v4）：MMA 线程直接管理 softmax——fragment 映射实验先行](#phase-2v4mma-线程直接管理-softmaxfragment-映射实验先行)
    - [Phase 3（v5）：P/Mask smem 时间复用 + warp 数实验（否决 8-warp）](#phase-3v5pmask-smem-时间复用--warp-数实验否决-8-warp)
-   - [Phase 4（v6）：同步结构优化——大序列场景的 3.3~3.8x](#phase-4v6同步结构优化大序列场景的-338x)
-   - [Phase 5（v7）：Q-in-regs + K double buffer——1.4~1.6x](#phase-5v7q-in-regs--k-double-buffer146x)
+   - [Phase 4（v6）：同步结构优化——大序列场景的 3.3–3.8x](#phase-4v6同步结构优化大序列场景的-338x)
+   - [Phase 5（v7）：Q-in-regs + K double buffer——1.4–1.6x](#phase-5v7q-in-regs--k-double-buffer146x)
    - [Phase 6（v8/v8.1）：SASS 驱动的清理——死代码、spill、softmax 通信](#phase-6v8v81sass-驱动的清理死代码spillsoftmax-通信)
    - [Phase 7（v9）：WMMA m16n16k16——LDS 密度 3.4x 差距的终极解](#phase-7v9wmma-m16n16k16lds-密度-34x-差距的终极解d128-35)
    - [Phase 8（v9.1）：Q A-fragment 常驻寄存器——d=64 反超开源参考](#phase-8v91q-a-fragment-常驻寄存器d64-反超开源参考)
@@ -33,7 +33,7 @@ V100 上的现实格局：
 
 - **PyTorch SDPA 带 `attn_mask` 只能走 math 后端**（mem_efficient 后端不支持任意 additive mask），还要物化并读取整个 `[B,H,Sq,Sk]` mask 张量——大序列下非常昂贵
 - **开源 flash-attention-v100** 性能优秀但不支持任意 additive mask（仅 causal/window/alibi），也无 split-KV
-- 本仓库已有的 sm70 路径（cute `SM70_8x8x4` mma atom，64×64 tile）实测只有 **4~8 TFLOPS**——SDPA fp16 的 0.37~0.6x，硬件峰值的 ~7%
+- 本仓库已有的 sm70 路径（cute `SM70_8x8x4` mma atom，64×64 tile）实测只有 **4–8 TFLOPS**——SDPA fp16 的 0.37–0.6x，硬件峰值的 ≈7%
 
 **目标**：显著超过 SDPA+mask（同功能公平对照），追平乃至反超 fa-v100（无 mask 参照），并全程保持任意 mask / GQA / 非对齐 seqlen 的正确性。
 
@@ -48,12 +48,12 @@ V100 上的现实格局：
 | `ldmatrix` | ✅ | ❌（sm75+ 才有） | fragment 加载手工 `LDS.128` + swizzle |
 | `cp.async` | ✅ | ❌（sm80+ 才有） | gmem→smem 走 LDG→STS，靠多路并行发射（MLP）重叠 |
 | `wmma.m16n16k16` | ✅ | ✅ | v9 核心武器（PTX 内联，展开为 16×HMMA.884） |
-| `mma.m8n8k4` | ✅ | ✅ | v2~v8.1 使用（cute `SM70_8x8x4_F32F16F16F32_TN` atom） |
+| `mma.m8n8k4` | ✅ | ✅ | v2–v8.1 使用（cute `SM70_8x8x4_F32F16F16F32_TN` atom） |
 | bf16 | ✅ | ❌ | fp16 only |
 | smem/CTA | 164KB | 96KB（默认 48KB，超限需 opt-in） | d=128 必须 opt-in 96KB |
-| fp16 峰值 | 312 TF | ~125 TF 理论 / **84.2 TF cuBLAS 实测** | 参照系 |
+| fp16 峰值 | 312 TF | ≈125 TF 理论 / **84.2 TF cuBLAS 实测** | 参照系 |
 
-> **核心结论（后被反复验证）**：sm70 没有 Ampere 及以后的一切数据搬运加速器（ldmatrix / cp.async / TMA），**数据通路必须全手工搭**（swizzle + 向量化 LDS + gmem 多路发射）；但 **WMMA m16n16k16 从第一代 Tensor Core 就存在**，计算通路可以直接用最宽的 MMA 指令。"手工通路 + 宽指令"这个组合贯穿了整个优化史——前半程（v3~v8.1）我们在手工通路上精进，后半程（v9）才动计算指令。
+> **核心结论（后被反复验证）**：sm70 没有 Ampere 及以后的一切数据搬运加速器（ldmatrix / cp.async / TMA），**数据通路必须全手工搭**（swizzle + 向量化 LDS + gmem 多路发射）；但 **WMMA m16n16k16 从第一代 Tensor Core 就存在**，计算通路可以直接用最宽的 MMA 指令。"手工通路 + 宽指令"这个组合贯穿了整个优化史——前半程（v3–v8.1）我们在手工通路上精进，后半程（v9）才动计算指令。
 
 ### 2.2 性能参照系（全部在本机实测，shape 4,16,16,2048,2048,128）
 
@@ -79,15 +79,15 @@ V100 上的现实格局：
 
 | 版本 | 核心变化 | d=64 耗时/TF | d=128 耗时/TF | vs 上一版 |
 |---|---|---|---|---|
-| v2 初始 | m8n8k4 + plain smem + 8~9 sync/iter + 跨 8 warp atomic 归约 | （小 shape 4~8 TF） | （小 shape 4~8 TF） | — |
+| v2 初始 | m8n8k4 + plain smem + 8–9 sync/iter + 跨 8 warp atomic 归约 | （小 shape 4–8 TF） | （小 shape 4–8 TF） | — |
 | v3 | Swizzle<3,3,3> + 行映射 softmax | 行映射方案错误，正确性未过 | | |
 | v4 | MMA 线程直接管理 softmax（acc fragment 上做归约） | 正确性全过，性能未单独记录 | | |
 | v5 | + P/Mask smem 时间复用 | 28723µs / 2.4 | 47446µs / 2.9 | 基线* |
-| v6 | sync 6→4 + V load 重叠 + Q-in-regs | 8634µs / 8.0 | 12622µs / 10.9 | **3.3~3.8x** |
-| v7 | + K double buffer + Q 常驻寄存器 | 5512µs / 12.5 | 8679µs / 15.8 | **1.4~1.6x** |
-| v8.1 | 死代码删除 + spill 消除 + partial-l 寄存器化 + V load 提前 | 5131µs / 13.9 | 7725µs / 17.9 | 1.07~1.18x |
-| v9 | WMMA m16n16k16 + v9 swizzle + 4×4 warp grid | 4029µs / 17.1 | 5695µs / 24.1 | **1.27~1.36x** |
-| v9.1 | + Q A-fragment 常驻寄存器（仅 d=64） | 3974µs / 17.3（峰值 18.0） | 5686µs / 24.2 | d=64 +1~6% |
+| v6 | sync 6→4 + V load 重叠 + Q-in-regs | 8634µs / 8.0 | 12622µs / 10.9 | **3.3–3.8x** |
+| v7 | + K double buffer + Q 常驻寄存器 | 5512µs / 12.5 | 8679µs / 15.8 | **1.4–1.6x** |
+| v8.1 | 死代码删除 + spill 消除 + partial-l 寄存器化 + V load 提前 | 5131µs / 13.9 | 7725µs / 17.9 | 1.07–1.18x |
+| v9 | WMMA m16n16k16 + v9 swizzle + 4×4 warp grid | 4029µs / 17.1 | 5695µs / 24.1 | **1.27–1.36x** |
+| v9.1 | + Q A-fragment 常驻寄存器（仅 d=64） | 3974µs / 17.3（峰值 18.0） | 5686µs / 24.2 | d=64 +1–6% |
 
 \* v5 是首次完整 V100 benchmark。各版本数字混合了两种口径：benchmark_sm70.py（带 10% 随机 -inf mask）与开发期临时对拍脚本（zero additive mask ≡ 无 mask，用于与 fa-v100 对比）——两种口径实测差异 <1%，三方对比详见表 4.3。
 
@@ -97,7 +97,7 @@ V100 上的现实格局：
 
 **实验**（host 端 cute layout 分析）：引入 `Swizzle<3,3,3>`（XOR-8，(8,64) atom）后 A/B 降到 4-way、C 降到 16-way，且 16B 向量化保持（swizzle 以 16B 为粒度，LDS.128/STS.128 可用）。选 `Swizzle<3,3,3>` 与 sm80 成熟模式一致，cute 的向量化分析对它最友好。
 
-**失败**：同期的"行映射 softmax"（`tidx/8` 分行 + warp 内 `__shfl_xor(1|2|4)` 归约、零 atomic）**完全错误**——MMA 线程持有的 S 行由 atom 的 CLayout 决定，与 `tidx/8` 的行划分毫无关系。全部测试误差 0.3~2.3。
+**失败**：同期的"行映射 softmax"（`tidx/8` 分行 + warp 内 `__shfl_xor(1|2|4)` 归约、零 atomic）**完全错误**——MMA 线程持有的 S 行由 atom 的 CLayout 决定，与 `tidx/8` 的行划分毫无关系。全部测试误差 0.3–2.3。
 
 > 教训：**线程-数据映射不能靠直觉，必须先用实验 dump 出来**。cute atom 的 CLayout 是嵌套 layout，手推极易出错。这次失败直接催生了下一阶段的 fragment 映射实验方法论。
 
@@ -122,11 +122,11 @@ V100 首跑：18 项正确性测试全过（zero/neg mask、causal、随机 mask
 - **P/Mask 时间复用**：mask 在 QK^T+mask 加法后就死了，sP 覆写同一区域——省 8KB smem，d=64 从 40.5→32.5KB（默认 48KB 限额内可 2 CTA/SM）
 - **warp 数实验**：`AtomLayout<4,8,1>`（256 线程，8 warps）变体被实测否决——d=128 的 occupancy 瓶颈是 smem 而非线程数，减 warp 不改善占用，反而每 warp 承担双倍归约工作、跨 warp atomic 竞争加剧。保持 512 线程（16 warps）
 
-**首次完整 V100 benchmark 暴露关键问题**：小序列（512²）尚可（5.8~8.5 TF），**大序列（2048²）灾难性退化到 2.4~2.9 TF**（SDPA+mask 的 0.14~0.23x），GB/s 只有 1~5——不是带宽问题，是每 n_block 迭代的固定开销在长序列上线性放大。
+**首次完整 V100 benchmark 暴露关键问题**：小序列（512²）尚可（5.8–8.5 TF），**大序列（2048²）灾难性退化到 2.4–2.9 TF**（SDPA+mask 的 0.14–0.23x），GB/s 只有 1–5——不是带宽问题，是每 n_block 迭代的固定开销在长序列上线性放大。
 
 **诊断**：每 iter 6 次 `__syncthreads`（含 softmax 内部的 init/atomic 归约同步）+ 每轮 2 组跨 warp smem atomic + V load 串行在 softmax 之后。
 
-### Phase 4（v6）：同步结构优化——大序列场景的 3.3~3.8x
+### Phase 4（v6）：同步结构优化——大序列场景的 3.3–3.8x
 
 三板斧（全部围绕"削减每 iter 固定开销"）：
 
@@ -140,7 +140,7 @@ V100 首跑：18 项正确性测试全过（zero/neg mask、causal、随机 mask
 
 > 教训：**老硬件上同步成本是第一杀手**。512 线程 CTA 的一次全同步开销不低，长序列（n_block 数百次迭代）把它线性放大成主导项。sync 计数应该和 smem/寄存器一样被当作一等资源记账。
 
-### Phase 5（v7）：Q-in-regs + K double buffer——1.4~1.6x
+### Phase 5（v7）：Q-in-regs + K double buffer——1.4–1.6x
 
 **诊断**（读 `gemm()` 结构）：主循环没有 pipeline——每 iter 的 smem→register fragment copy 完成后才开始 mma，两者串行；K smem 单 buffer，当前轮计算无法与下一轮 K load 重叠。
 
@@ -149,7 +149,7 @@ V100 首跑：18 项正确性测试全过（zero/neg mask、causal、随机 mask
 - **Q 常驻寄存器**：prologue 把 Q 先落到 sK1（借用 K 的第二 buffer 空间），sync 后拷入寄存器 fragment，主循环零 Q LDS（同时腾出 sQ 空间）
 - **K smem double buffer**：sK0/sK1 轮换，当前轮 QK^T 计算与下一轮 K 的 gmem→smem 重叠
 
-**结果**：d=64 12.5 TF / d=128 15.8 TF（1.4~1.6x）。**d=64 首次超过 SDPA+mask（1.25x）**，d=128 达到 SDPA+mask 的 0.85x。
+**结果**：d=64 12.5 TF / d=128 15.8 TF（1.4–1.6x）。**d=64 首次超过 SDPA+mask（1.25x）**，d=128 达到 SDPA+mask 的 0.85x。
 
 ### Phase 6（v8/v8.1）：SASS 驱动的清理——死代码、spill、softmax 通信
 
@@ -174,7 +174,7 @@ SASS 指令画像（d=64，归一化到相同 MMA 工作量）：
 
 **v8.1**：**partial-l 寄存器化**——关键数学：`l_global = Σ_thr partial_l`，而 rescale factor 对整行一致，因此各线程的 partial-l 可以**独立累积**、无需每轮跨线程求和，epilogue 一次 atomicAdd 归约即可。删掉每轮的 shuffle 归约 + atomicAdd + init 写；V load 再提前到 A 段（mask copy / K-prefetch / V-load **三路 gmem 并行发射**，与 QK^T 计算重叠）。
 
-**结果**：d=128 17.9 TF（+11~18%），d=64 13.9 TF（+7~10%）；与 fa-v100 差距缩小到 0.76~0.96x；每轮 sync 4 次、主循环零 atomicAdd。
+**结果**：d=128 17.9 TF（+11–18%），d=64 13.9 TF（+7–10%）；与 fa-v100 差距缩小到 0.76–0.96x；每轮 sync 4 次、主循环零 atomicAdd。
 
 ### Phase 7（v9）：WMMA m16n16k16——LDS 密度 3.4x 差距的终极解（d=128 +35%）
 
@@ -231,7 +231,7 @@ v9 首次正确性测试全 FAIL，一度以为 kernel 写错——实际是 `cu
 | 32,16,16,1024,1024,128 | 18.5 TF | **24.1 TF** | **1.31x** |
 | 4,16,16,2048,2048,64 | 17.5 TF | 17.1 TF | 0.98x |
 
-- d=128 相对 v8.1 **+35%**（17.9→24.2 TF），全面反超开源参考 24~31%
+- d=128 相对 v8.1 **+35%**（17.9→24.2 TF），全面反超开源参考 24–31%
 - LDS 静态数：259 → 86（d=128）/ 51（d=64）；**零 spill**
 - d=64 持平但未反超——差距不在指令密度（已拉平），在 fa-v100 的 BLOCK_N=128 tile 结构（超长序列仍 0.95x，属已知结构性 gap）
 
@@ -265,7 +265,7 @@ QK^T 的 A-fragment（Q）是**环路不变量**：d=64 时 4 个 fragment × 8 
 | sync/iter | 4 | 4（sync1/syncM/sync5/sync6） |
 | 主循环 atomicAdd | 0 | 0（atomicMax 2/lane + epilogue 一次 atomicAdd 归约 l） |
 
-（v9 用 +8~16KB smem 换 LDS 密度 -67~83%——这笔账只有对着逐版本资源账本才看得清。）
+（v9 用 +8–16KB smem 换 LDS 密度 -67–83%——这笔账只有对着逐版本资源账本才看得清。）
 
 ### 4.2 标准场景（带 10% 随机 -inf mask，vs SDPA+mask 同功能公平对照）
 
@@ -281,7 +281,7 @@ QK^T 的 A-fragment（Q）是**环路不变量**：d=64 时 4 个 fragment × 8 
 | 4,16,4,2048,2048,128 (GQA) | 5712.9µs | 24.1 | 7721.1µs | **1.35x** |
 | 1,8,8,2048,2048,128 | 878.1µs | 19.6 | 925.8µs | **1.05x** |
 
-全部大 grid shape 1.05~1.77x；d=128 峰值 24.2 TF = cuBLAS 峰值的 29%。
+全部大 grid shape 1.05–1.77x；d=128 峰值 24.2 TF = cuBLAS 峰值的 29%。
 
 ### 4.3 三方对比（无 mask 等价：zero additive mask ≡ 无 mask）
 
@@ -295,7 +295,7 @@ QK^T 的 A-fragment（Q）是**环路不变量**：d=64 时 4 个 fragment × 8 
 | 1,8,8,8192,8192,128 | 18.8 TF | **24.1 TF** | **1.28x** | 35.4 TF |
 | 32,16,16,1024,1024,128 | 18.5 TF | **24.1 TF** | **1.31x** | — |
 
-**d=128 全 shape 反超开源参考 23~31%**（且我们带任意 mask 能力）；d=64 持平（1024² grid 反超，8192² 超长序列 0.95x——fa-v100 的 BLOCK_N=128 结构优势，属已知 gap）。与 SDPA mem_efficient（无 mask、不支持任意 mask）相比 0.72x，但该后端无法承接业务需求。
+**d=128 全 shape 反超开源参考 23–31%**（且我们带任意 mask 能力）；d=64 持平（1024² grid 反超，8192² 超长序列 0.95x——fa-v100 的 BLOCK_N=128 结构优势，属已知 gap）。与 SDPA mem_efficient（无 mask、不支持任意 mask）相比 0.72x，但该后端无法承接业务需求。
 
 ### 4.4 小 grid / decode 场景（已知短板）
 
@@ -322,7 +322,7 @@ QK^T 的 A-fragment（Q）是**环路不变量**：d=64 时 4 个 fragment × 8 
 4. **结构性假设要受控实验验证**："S 行属于一个 warp"的错误假设造成 4x bug；K=V=identity 受控输入 + "输出恰为 4 倍、每 tile 行和=1"一步定位。**数据归属（谁算哪些行列）是 kernel 正确性的第一公理，必须画图验证。**
 5. **数学等价变换消除通信**：partial-l 寄存器化的依据是"rescale factor 行全局一致 → partial 可独立累积"——比"减少 atomic 次数"更彻底的优化是**证明这步通信在数学上不必要**。
 6. **寄存器预算按 head dim 分别决策**：同一个 Q-寄存器化优化，d=64（+32 regs）有益、d=128（+64 regs）必然 spill——`if constexpr` 分配置，不做一刀切。
-7. **版本演进要记资源账本**：每版记 smem / sync / REG+spill / LDS 四件套。v9 用 +8~16KB smem 换 LDS -67~83%、v9.1 用 +23 regs 换 -8 条 LDS.128，这些 tradeoff 只有对着账本才能持续做对。
+7. **版本演进要记资源账本**：每版记 smem / sync / REG+spill / LDS 四件套。v9 用 +8–16KB smem 换 LDS -67–83%、v9.1 用 +23 regs 换 -8 条 LDS.128，这些 tradeoff 只有对着账本才能持续做对。
 8. **回归环境要防"假阴性"**：JIT fast-load 不校验源码 hash（新旧 .so 混淆）、half 测试数据的舍入假象、`-inf` mask 对 scale 语义 bug 的完全隐形（0/-inf mask 下不可见，需有限值随机 mask 才能抓到）——三条都在本项目真实踩过。
 9. **手工逆向的 fragment 映射是架构绑定的**：v9 手工 WMMA PTX 依赖的 lane 映射系 sm70 实测逆向，而 WMMA 内部布局**无跨架构契约**——实测 sm89 的 A-fragment 映射与 sm70 不同（lane 持交错行列块而非整行）。因此 `FA_FORCE_SM70` 旁路在 v8.1 前（m8n8k4，布局跨架构一致）可做交叉验证，对 v9+ 在非 V100 架构上会**静默产出错误结果**。手工布局 kernel 的正确性验证必须在与目标架构一致的真机上做。
 

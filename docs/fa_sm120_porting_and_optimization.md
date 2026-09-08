@@ -1,9 +1,9 @@
 # FlashAttention-2 在 Blackwell (sm120) 上的移植与优化全记录
 
-> **硬件**：RTX 5090D（GB202，sm_120，170 SMs，~100KB smem/CTA，cuBLAS bf16 实测峰值 **235 TFLOPS**）
+> **硬件**：RTX 5090D（GB202，sm_120，170 SMs，≈100KB smem/CTA，cuBLAS bf16 实测峰值 **235 TFLOPS**）
 > **软件**：CUDA 12.9 / PyTorch / CUTLASS+CuTe（thirdparty）
 > **算子**：带任意加法 mask 的 FA2 Forward（bf16，d∈{64,128}，支持 GQA）
-> **最终结果**：标准场景 **160~197 TFLOPS**（cuBLAS 峰值的 70~85%，SDPA 的 **2~2.7x**）；小 grid 长序列场景相对无 split 基线 **8.3~37.5x**，相对 SDPA **17~63x**
+> **最终结果**：标准场景 **160–197 TFLOPS**（cuBLAS 峰值的 70–85%，SDPA 的 **2–2.7x**）；小 grid 长序列场景相对无 split 基线 **8.3–37.5x**，相对 SDPA **17–63x**
 
 ---
 
@@ -13,12 +13,12 @@
 2. [第一步：摸清 sm90 与 sm120 的硬件差异](#2-第一步摸清-sm90-与-sm120-的硬件差异)
 3. [优化历程时间线](#3-优化历程时间线)
    - [Phase 1：TMA + mbarrier 多级流水线移植](#phase-1tma--mbarrier-多级流水线移植)
-   - [Phase 2：流水线深化——双 barrier 拆分（d64 +56~61%）](#phase-2流水线深化双-barrier-拆分d64-5661)
+   - [Phase 2：流水线深化——双 barrier 拆分（d64 +56–61%）](#phase-2流水线深化双-barrier-拆分d64-5661)
    - [Phase 3：QInRegs——寄存器换流水深度（d128 补齐差距）](#phase-3qinregs寄存器换流水深度d128-补齐差距)
    - [Phase 4：Warp Specialization 实验（负收益，果断回退）](#phase-4warp-specialization-实验负收益果断回退)
    - [Phase 5：NCU 驱动的精细化调优](#phase-5ncu-驱动的精细化调优)
    - [Phase 6：Persistent Kernel（有场景价值的过渡技术）](#phase-6persistent-kernel有场景价值的过渡技术)
-   - [Phase 7：Split KV——小 grid 场景的 10~37 倍杀器](#phase-7split-kv小-grid-场景的-1037-倍杀器)
+   - [Phase 7：Split KV——小 grid 场景的 10–37 倍杀器](#phase-7split-kv小-grid-场景的-1037-倍杀器)
      - [7.9 Split KV kernel 随 Sk 的耗时分解](#79-split-kv-kernel-随-sk-的耗时分解)
      - [7.10 Roofline 分析](#710-roofline-分析)
      - [7.11 NCU 详细指标总结](#711-ncu-详细指标总结)
@@ -32,7 +32,7 @@
 
 业务需要一个支持**任意加法 mask**（item 级屏蔽，0=可见 / -inf=屏蔽）的 Attention Forward 算子，目标硬件是消费级 Blackwell（RTX 5090D, sm120）。
 
-一个关键前提：**PyTorch SDPA 在带任意 `attn_mask` 时只能走 MemEfficient 后端**（FlashAttention 后端不支持任意 mask），实测标准场景只有 55~99 TFLOPS；而 FA2/FA3 的官方实现分别以 sm80（cp.async）和 sm90（wgmma+TMA）为目标，均无法直接在 sm120 上发挥新特性。
+一个关键前提：**PyTorch SDPA 在带任意 `attn_mask` 时只能走 MemEfficient 后端**（FlashAttention 后端不支持任意 mask），实测标准场景只有 55–99 TFLOPS；而 FA2/FA3 的官方实现分别以 sm80（cp.async）和 sm90（wgmma+TMA）为目标，均无法直接在 sm120 上发挥新特性。
 
 **目标**：参考 FA3 (hopper) 的写法，把 FA2 移植到 sm120，用足 TMA 等新特性，显著超越 SDPA。
 
@@ -50,8 +50,8 @@
 | **mbarrier** | ✅ | ✅ | ✅ 照搬，手搓轻量流水线 |
 | **Cluster / TMA multicast** | ✅ | ❌（CUTLASS 断言禁用） | 不用 |
 | **stmatrix (STSM)** | ✅ | ✅ | ✅ epilogue 采用 |
-| **smem/CTA** | 227KB | **~100KB** | 流水深度受限，需精打细算 |
-| **MMA 峰值 (bf16)** | 989 TF | ~235 TF（实测 cuBLAS） | 参照系 |
+| **smem/CTA** | 227KB | **≈100KB** | 流水深度受限，需精打细算 |
+| **MMA 峰值 (bf16)** | 989 TF | ≈235 TF（实测 cuBLAS） | 参照系 |
 
 > **核心结论（后被反复验证）**：sm120 移植 Hopper kernel 时，**TMA + mbarrier 流水线值得照搬；wgmma 体系和 warp specialization 不应照搬**——前者硬件支持，后者在硬件上根本不存在。
 
@@ -64,13 +64,13 @@
 **方案**：以 FA2 的 `mma.sync` 计算骨架为基础，数据通路全面替换为 Hopper 风格：
 
 - Q/K/V/Mask 的 gmem→smem 搬运全部由 **TMA**（单线程发射、`__grid_constant__` 传 descriptor）替代 cp.async 多线程协作拷贝
-- K/V/Mask 三级（kStages=2~3）smem 流水，`ClusterTransactionBarrier` 做 arrive-and-expect-tx 事务屏障
+- K/V/Mask 三级（kStages=2–3）smem 流水，`ClusterTransactionBarrier` 做 arrive-and-expect-tx 事务屏障
 - Epilogue：acc → STSM 写 swizzled smem → TMA store（自动处理边界裁剪，消灭 `Is_even_MN/Is_even_K` 分支）
 - L2 cache hint：K/V/Mask `EVICT_LAST`（跨 CTA 复用），Q `EVICT_FIRST`（一次性）
 
 **结果**：首个可用版本与原 cp.async baseline **性能持平**（d64 ≈112 TF / d128 ≈187 TF @ B4H16 2048²）——证明"搬运路径不是瓶颈时，TMA 本身不产生收益"，收益要靠后续的流水线结构挖掘。
 
-### Phase 2：流水线深化——双 barrier 拆分（d64 +56~61%）
+### Phase 2：流水线深化——双 barrier 拆分（d64 +56–61%）
 
 **关键洞察**：单 barrier 等待 K+V+Mask 全部就绪才能启动 QK^T，把 V/Mask 的传输延迟串进了关键路径。
 
@@ -83,7 +83,7 @@ B4 H16 2048² d64:   114 TF ──────────► 180 TF   (+58%)
 B16 H16 1024² d64:  117 TF ──────────► 189 TF   (+61%)   ← 达 cuBLAS 峰值 80%
 ```
 
-d128 此时仍落后 baseline 5~8%（smem 不足，只能 2 级流水），引出下一步。
+d128 此时仍落后 baseline 5–8%（smem 不足，只能 2 级流水），引出下一步。
 
 ### Phase 3：QInRegs——寄存器换流水深度（d128 补齐差距）
 
@@ -104,7 +104,7 @@ d128 此时仍落后 baseline 5~8%（smem 不足，只能 2 级流水），引�
 
 ### Phase 4：Warp Specialization 实验（负收益，果断回退）
 
-FA3 的核心优化之一是 producer/consumer warp specialization。我们完整实现了第 9 个专职 producer warp（独立跑 empty-wait + TMA 发射）+ 8 consumer warps 的版本，一次编译通过、正确性全过，但实测**全面落后 2~4%**：
+FA3 的核心优化之一是 producer/consumer warp specialization。我们完整实现了第 9 个专职 producer warp（独立跑 empty-wait + TMA 发射）+ 8 consumer warps 的版本，一次编译通过、正确性全过，但实测**全面落后 2–4%**：
 
 | shape | cooperative（保留） | warp-specialized | Δ |
 |---|---|---|---|
@@ -122,29 +122,29 @@ FA3 的核心优化之一是 producer/consumer warp specialization。我们完�
 
 用 NCU 对两个 kernel 做了 stall 级分析，并建立参照系：
 
-- **cuBLAS bf16 实测峰值 235.2 TFLOPS**，我们 d64/d128 均已达其 **~80%**
+- **cuBLAS bf16 实测峰值 235.2 TFLOPS**，我们 d64/d128 均已达其 **≈80%**
 - d64：stall 干净（long_scoreboard 0.8%，0 bank conflict）→ 接近极致
 - d128：long_scoreboard 6.8%（gmem 直读 mask/Q 的延迟）→ 加 mask 双缓冲软件流水（提前一轮发射 ldg）。另有 2 万次 smem bank conflict（load 侧），但相对 6713 万次 smem load wavefronts 冲突率仅 **0.03%**（≈0.01% 运行时影响），确认无需处理
 
-同期验证并否决的方向：CUDA 12.9 升级 + LOAD256/STORE256 向量化 epilogue（epilogue 仅占 ~5% 耗时，收益 <1%）、`ld.global.b256` PTX 语法修正（改用 cute `.v8.f32`）。
+同期验证并否决的方向：CUDA 12.9 升级 + LOAD256/STORE256 向量化 epilogue（epilogue 仅占 ≈5% 耗时，收益 <1%）、`ld.global.b256` PTX 语法修正（改用 cute `.v8.f32`）。
 
-**至此，大 grid 标准场景（CTA 数 ≥ SM 数）基本收敛**：160~197 TF，SDPA 的 **1.94~2.69x（平均 2.2x）**。
+**至此，大 grid 标准场景（CTA 数 ≥ SM 数）基本收敛**：160–197 TF，SDPA 的 **1.94–2.69x（平均 2.2x）**。
 
 ### Phase 6：Persistent Kernel（有场景价值的过渡技术）
 
 参照 FA3 的 `StaticPersistentTileScheduler`，实现了 1D grid（2×SM 数）+ 步长式取任务的 persistent kernel，消除大 grid 的 tail 效应：
 
-- **d128：+2~5%**（170 SMs 满载、尾效应消除）→ 保留为 `FA_PERSISTENT=1` 可选路径
-- **d64：-3~5%**（tile 小，循环开销摊不薄）→ 不启用
+- **d128：+2–5%**（170 SMs 满载、尾效应消除）→ 保留为 `FA_PERSISTENT=1` 可选路径
+- **d64：-3–5%**（tile 小，循环开销摊不薄）→ 不启用
 - **极扁 grid（如 1 个 tile）：严重劣化**（340 CTA 中 339 个空转自旋）→ 这类场景的真正解药是下面的 Split KV
 
-### Phase 7：Split KV——小 grid 场景的 10~37 倍杀器
+### Phase 7：Split KV——小 grid 场景的 10–37 倍杀器
 
 这是全项目收益最大的一轮，过程也最具戏剧性，完整记录如下。
 
 #### 7.1 问题定义
 
-真实业务中大量出现 **B×H×num_m_blocks ≪ 170 SMs** 的 shape（如 B=1 H=1 Sq=128 Sk=8192：grid 只有 **1 个 CTA**，1/170 的 SM 在干活）。实测这类场景单 CTA 每 n_block 有 ~3µs 的流水线延迟下限，**真基线 kernel 耗时 391.7µs**，与计算量完全不成比例。
+真实业务中大量出现 **B×H×num_m_blocks ≪ 170 SMs** 的 shape（如 B=1 H=1 Sq=128 Sk=8192：grid 只有 **1 个 CTA**，1/170 的 SM 在干活）。实测这类场景单 CTA 每 n_block 有 ≈3µs 的流水线延迟下限，**真基线 kernel 耗时 391.7µs**，与计算量完全不成比例。
 
 #### 7.2 初版实现（参考 `gemmbf16fp32.cu` 的 split-K 设计 + FA2/FA3 约定）
 
@@ -154,7 +154,7 @@ FA3 的核心优化之一是 producer/consumer warp specialization。我们完�
 
 #### 7.3 戏剧性转折：测量假象与真凶定位
 
-初版 benchmark 显示"只有 5~13% 提升"，差点误判方向价值。用 nsys 做 kernel 级分解后发现**两个真相**：
+初版 benchmark 显示"只有 5–13% 提升"，差点误判方向价值。用 nsys 做 kernel 级分解后发现**两个真相**：
 
 ```
 ① "baseline" 是假象：初测时 splitkv 已默认开启，对比对象其实是 splitkv 自己！
@@ -179,7 +179,7 @@ combine kernel:  49.9µs ──────────► 4.8µs   (10.4x)
 
 #### 7.5 kMaxSplits 16→64 + cost-model 启发式
 
-单 CTA 每 n_block 有 ~3µs 延迟下限 → **更多 split 是唯一出路**。放宽上限后，用 sweep 数据拟合出 cost model 替代 FA 的 waves-efficiency 启发式：
+单 CTA 每 n_block 有 ≈3µs 延迟下限 → **更多 split 是唯一出路**。放宽上限后，用 sweep 数据拟合出 cost model 替代 FA 的 waves-efficiency 启发式：
 
 ```
 T(s) ≈ F + (nb/s)·t_nb + c·s·total
@@ -193,13 +193,13 @@ auto 模式在所有测试 shape 上**距人工调出的最优点 ≤9%**，且�
 
 #### 7.6 d128 splitkv 专用配置：Q-TMA + 2-stage
 
-splitkv 每 CTA 只跑 2~4 个 n_block，深流水线无意义；把 d128 的 QInRegs 直载（32KB 标量 ldg）换成 **TMA 批量加载 + ldmatrix**，省下的 smem 正好配平 2 级流水：`25.2µs → 22.9µs`（s=64）。
+splitkv 每 CTA 只跑 2–4 个 n_block，深流水线无意义；把 d128 的 QInRegs 直载（32KB 标量 ldg）换成 **TMA 批量加载 + ldmatrix**，省下的 smem 正好配平 2 级流水：`25.2µs → 22.9µs`（s=64）。
 
 #### 7.7 O_partial fp32→bf16 + TMA store
 
 分析发现高 split 时 **partial 写+读流量（8.4MB）已超过 mainloop 的 K/V/mask 读取（6MB）**：
 
-- `O_partial` 改 bf16（流量减半；~0.4% 相对误差 < bf16 输出本身的量化误差，实测 rel_err ≤1.5%）
+- `O_partial` 改 bf16（流量减半；≈0.4% 相对误差 < bf16 输出本身的量化误差，实测 rel_err ≤1.5%）
 - 写路径复用基线 epilogue（STSM→swizzled smem→TMA store 批量异步写），替代散乱的 8B 寄存器直写
 
 #### 7.8 附带捕获：persistent kernel 的预存 bug
@@ -242,7 +242,7 @@ splitkv 每 CTA 只跑 2~4 个 n_block，深流水线无意义；把 d128 的 QI
 | Kernel | Arithmetic Intensity (FLOP/B) | Achieved TF | Achieved BW (GB/s) | 瓶颈判定 |
 |---|---:|---:|---:|---|
 | splitkv 主 kernel | **84.5** | 40.1 (35.8) | 475 (424) | ridge 左侧（AI<198）→ **带宽受限**，达 ridge 上限的 40% (36%) |
-| combine kernel | **0.96** (1.14) | ~0 | 66 (86) | 纯带宽 kernel → **并行度受限**（SM active 8.6%→30.4%，long_scoreboard 58.9%→29.1%） |
+| combine kernel | **0.96** (1.14) | ≈0 | 66 (86) | 纯带宽 kernel → **并行度受限**（SM active 8.6%→30.4%，long_scoreboard 58.9%→29.1%） |
 | （对照）SDPA MemEff 同 shape | 84.5* | 14.9 | — | 同 AI，但 achieved TF 仅 14.9 → 带宽利用率 1/2.7 |
 
 \* 同计算量、同访存量级，AI 与 splitkv 主 kernel 相同；SDPA 慢 2.7× 等价于带宽利用率仅 1/2.7。
@@ -253,7 +253,7 @@ splitkv 每 CTA 只跑 2~4 个 n_block，深流水线无意义；把 d128 的 QI
 
 **结论**：
 1. 两个 kernel 都在 ridge 左侧（**带宽受限**）——SM 不是瓶颈，DRAM/并行度才是。
-2. splitkv 主 kernel 达 ridge 上限的 40%（Split-M 后 SM active 22.4%→29.9%，wall-clock 12.4→9.8µs），仍有 ~2.5× 的带宽挖掘空间（475 GB/s vs 峰值 1181 GB/s）。瓶颈是单 CTA 的 TMA 发射节奏 + L2 局部性，不是 SM 算力。
+2. splitkv 主 kernel 达 ridge 上限的 40%（Split-M 后 SM active 22.4%→29.9%，wall-clock 12.4→9.8µs），仍有 ≈2.5× 的带宽挖掘空间（475 GB/s vs 峰值 1181 GB/s）。瓶颈是单 CTA 的 TMA 发射节奏 + L2 局部性，不是 SM 算力。
 3. combine kernel 并行度大幅改善（grid 16→64 CTA，SM active ×3.5），但绝对带宽利用率仍低——Sq=128 时 combine 的并行度天花板就在这里。
 
 #### 7.11 NCU 详细指标总结
@@ -306,7 +306,7 @@ splitkv 每 CTA 只跑 2~4 个 n_block，深流水线无意义；把 d128 的 QI
 
 ### Phase 8：Combine v2 + PDL + Split-M——小 grid 再进一轮
 
-基于 §7.9~7.11 的 profile 结论（主 kernel 带宽/并行度双受限、combine 并行度受限、双 kernel 间有 3.4µs launch 空隙），本轮打了三个靶向优化，叠加 cost model 的一次重要修正。
+基于 §7.9–7.11 的 profile 结论（主 kernel 带宽/并行度双受限、combine 并行度受限、双 kernel 间有 3.4µs launch 空隙），本轮打了三个靶向优化，叠加 cost model 的一次重要修正。
 
 #### 8.1 Combine kernel v2：自适应 tile + PDL + 活跃位掩码
 
@@ -332,7 +332,7 @@ K（分配置拟合）: d128 M128=2  d128 M64=8  d64 M128=1  d64 M64=18
 
 #### 8.4 附带捕获的两个坑
 
-1. **`__reduce_or_sync` 只有 32-bit 重载**：归约 64-bit 活跃位掩码时被隐式截断，**splits 32~63 的活跃位丢失**导致结果错误。修复：高低 32-bit 分别 reduce 再拼。该 bug 只在 num_splits>32 且高号 split 整段被 mask 时触发，常规回归难以覆盖。
+1. **`__reduce_or_sync` 只有 32-bit 重载**：归约 64-bit 活跃位掩码时被隐式截断，**splits 32–63 的活跃位丢失**导致结果错误。修复：高低 32-bit 分别 reduce 再拼。该 bug 只在 num_splits>32 且高号 split 整段被 mask 时触发，常规回归难以覆盖。
 2. **扩展加载的 fast-path 陷阱**：`custom_ops` 框架的 `.so 已存在 → 直接 dlopen` 快速路径**不做源码时间戳/哈希检查**。本轮一度出现 .o 已重编译但 .so 未重链接、源码修改完全没进二进制的情况， benchmark "怎么改都没变化"——删 .so 强制重编译后才恢复。**改 C++ 源码后必须确认重编译真实发生**（ nsys 看 grid 维度是最直接的验证手段）。
 3. **mask scale 语义 bug（本轮最重要捕获）**：引入不规则形状 + **有限值随机 mask**（非 0/-inf）的全面测试后，19/100 用例全灭。定位为 kernel 把 mask 加到**未缩放**的 QK^T 上、随后 softmax 统一乘 scale——即实际计算的是 `softmax((S+mask)·scale)` 而非 SDPA 语义的 `softmax(S·scale+mask)`，有限值 mask 被错误地乘了 1/√d。**该 bug 对 0/-inf mask 完全隐形**（-inf×正数仍为 -inf），此前所有回归（zero mask、-inf 随机、整段屏蔽）一个都抓不到它。修复：7 处 mask 应用点（sm120 三个 kernel 的 smem/gmem 两路 + sm89 base kernel）统一乘 `1/scale_softmax` 预还原。修复后 100/100 全过。**教训：边界语义的测试矩阵必须包含有限值随机 mask——只测 0/-inf 等于没测 mask 的数值路径。**
 
@@ -349,7 +349,7 @@ K（分配置拟合）: d128 M128=2  d128 M64=8  d64 M128=1  d64 M64=18
 | d64 Sq=1024 Sk=8192 | 24.2µs | **20.5µs** | -15% |
 | d64 GQA H2/Hk1 Sq512 Sk16K | 36.3µs | **32.5µs** | -11% |
 
-标准场景 8 个 shape 中 7 个在 ±1% 以内（路径完全不变）；B32 H16 1024² d128 表观 +4.4%，经新旧二进制同环境对测（1544 vs 1567µs）确认为**测量时代漂移 ~2.4% + 同源码不同构建的布局噪声 ~2%**，主 kernel 源码本轮零改动，非真实回退。
+标准场景 8 个 shape 中 7 个在 ±1% 以内（路径完全不变）；B32 H16 1024² d128 表观 +4.4%，经新旧二进制同环境对测（1544 vs 1567µs）确认为**测量时代漂移 ≈2.4% + 同源码不同构建的布局噪声 ≈2%**，主 kernel 源码本轮零改动，非真实回退。
 
 ---
 
@@ -417,9 +417,9 @@ K（分配置拟合）: d128 M128=2  d128 M64=8  d64 M128=1  d64 M64=18
 ## 5. 经验总结：可复用的方法论
 
 1. **先摸清硬件再动手**：sm120 无 wgmma/tcgen05/multicast 的前期调研，直接决定了"借 TMA 流水线、弃 wgmma 体系"的正确路线，避免了整个方向的返工。
-2. **优化不是照搬论文**：Warp specialization 在 Hopper 成立的前提（wgmma 异步）在 sm120 不存在，实测 -2~4% 后果断回退。机制必须匹配硬件。
-3. **用 profile 打破测量假象**：Split KV 初版"只有 5~13%"的误判，源于对比对象已是优化后版本；nsys kernel 级分解才暴露真基线（389µs）与真瓶颈（combine 50µs）。**每一轮优化都应先建立 kernel 级耗时分解，再决定攻击点。**
-4. **每类瓶颈有唯一正解**：大 grid 已收敛（~80% cuBLAS 峰值）后，小 grid 的"单 CTA 每 n_block 3µs 延迟下限"只能靠 split KV 增加并行度；combine 的带宽瓶颈只能靠 3D grid 并行化；partial 流量超过 mainloop 后只能靠 bf16 降流量。**瓶颈迁移到哪里，优化就跟进到哪里。**
+2. **优化不是照搬论文**：Warp specialization 在 Hopper 成立的前提（wgmma 异步）在 sm120 不存在，实测 -2–4% 后果断回退。机制必须匹配硬件。
+3. **用 profile 打破测量假象**：Split KV 初版"只有 5–13%"的误判，源于对比对象已是优化后版本；nsys kernel 级分解才暴露真基线（389µs）与真瓶颈（combine 50µs）。**每一轮优化都应先建立 kernel 级耗时分解，再决定攻击点。**
+4. **每类瓶颈有唯一正解**：大 grid 已收敛（≈80% cuBLAS 峰值）后，小 grid 的"单 CTA 每 n_block 3µs 延迟下限"只能靠 split KV 增加并行度；combine 的带宽瓶颈只能靠 3D grid 并行化；partial 流量超过 mainloop 后只能靠 bf16 降流量。**瓶颈迁移到哪里，优化就跟进到哪里。**
 5. **启发式用 cost model 而非经验公式**：`s* = √(nb·t_nb/(c·total))` 由实测数据拟合、有解析最优解，auto 模式全程距人工最优点 ≤9%，且大 grid 自动无开销退化——**一个入口，全场景自适应**。
 6. **边角 bug 会潜伏在"恰好无影响"的路径里**：`#pragma unroll for` 吞掉 mask 加法的 bug 在 zero mask 下完全隐形。回归集必须覆盖 -inf mask、非对齐 seqlen、整段屏蔽等边界语义。
 
@@ -430,4 +430,4 @@ K（分配置拟合）: d128 M128=2  d128 M64=8  d64 M128=1  d64 M64=18
 | `FA_NUM_SPLITS=n` | 强制 split 数（0=auto cost model） |
 | `FA_SPLITKV=0` | 禁用 split KV |
 | `FA_SPLITM=0` | 禁用 splitkv 的 kBlockM=64（Split-M）变体 |
-| `FA_PERSISTENT=1` | 启用 persistent kernel（d128 部分场景 +2~5%） |
+| `FA_PERSISTENT=1` | 启用 persistent kernel（d128 部分场景 +2–5%） |

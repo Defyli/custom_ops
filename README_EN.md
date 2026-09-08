@@ -239,7 +239,7 @@ rounded down to the multiple of 8, quantifying the auto-pad overhead;
 > a fixed Sk, pre-align to a multiple of 8 (zero-copy main path).
 >
 > FlexAtt note: FlexAttention's default config (BLOCK_M=128) **fails to compile**
-> on sm89 at d=128 (smem requirement ~112KB exceeds the ~99KB Ada hardware
+> on sm89 at d=128 (smem requirement ≈112KB exceeds the ≈99KB Ada hardware
 > limit; Inductor reports "No valid triton configs"). The tables above use its
 > downgraded `BLOCK_M=64` — the only official config that runs on this
 > architecture. sm120 (Blackwell, 228KB smem) has no such issue and uses the
@@ -376,7 +376,7 @@ Backend selection notes:
 - The two residual backends are accuracy-identical: the weight-rounding bias is
   eliminated either way, and the dominant remaining error is the unbiased bf16
   rounding noise of the activations (both quantization grids are fine enough)
-- Building with CUDA 11.8 makes the same INT8 kernel ~17% slower on large shapes
+- Building with CUDA 11.8 makes the same INT8 kernel ≈17% slower on large shapes
   (nvcc codegen differences; 4096³ measures 1658µs) — small shapes are
   unaffected; prefer a recent CUDA toolkit
 

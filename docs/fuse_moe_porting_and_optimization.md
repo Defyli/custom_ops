@@ -3,7 +3,7 @@
 > **硬件**：RTX 5090D（GB202，sm_120a，170 SMs，L2 96MB，mma.sync bf16 峰值 **209.5 TFLOPS**，cuBLAS bf16 峰值 235 TFLOPS）；对照机 RTX 4090D（sm_89，128 SMs）
 > **软件**：CUDA 12.8 / PyTorch / CUTLASS+CuTe（thirdparty）
 > **算子**：MoE FFN 前向融合——`y[s] = Σ_j topk_scale[s,j] · (Down_ej @ silu(GateUp_ej @ x[s]))`，bf16/fp16 输入、fp32 累加，单 GPU，无 fp8 量化
-> **最终结果**：大 shape 有效算力 **170~190 TFLOPS**（mma.sync 峰值的 81~91%）；vs PyTorch eager **1.9~22.9x**，vs `torch.compile` **1.6~2.4x**，vs compile+CUDA graph **最高 159.6x**（小 batch 大 E 场景）；流水线 kernel 数 6 → 4，workspace 537 → 268 MB
+> **最终结果**：大 shape 有效算力 **170–190 TFLOPS**（mma.sync 峰值的 81–91%）；vs PyTorch eager **1.9–22.9x**，vs `torch.compile` **1.6–2.4x**，vs compile+CUDA graph **最高 159.6x**（小 batch 大 E 场景）；流水线 kernel 数 6 → 4，workspace 537 → 268 MB
 
 ---
 
@@ -108,17 +108,17 @@ host 探针逐 case 验证坐标后落地：gemm2 的 A=act_out（流水线自�
 - scatter 行索引驻留寄存器（cur/next 两组滚动预取），消灭 smem 往返；
 - sC 独立 smem 区 + 16B 向量化 epilogue。
 
-结果 **cp.async 全面反超 TMA 引擎 3~15%**（92 vs 108µs @S=128 … 2557 vs 2645µs @S=16384），sm120 默认引擎随之切换（TMA 保留为 `FUSE_MOE_TMA=1` 可选路径）。教训：**比较两种引擎前，先确认两者的流水线连续性等价**——TMA 早期领先的一部分其实是「cp.async 的 task 边界没做好」贡献的。
+结果 **cp.async 全面反超 TMA 引擎 3–15%**（92 vs 108µs @S=128 … 2557 vs 2645µs @S=16384），sm120 默认引擎随之切换（TMA 保留为 `FUSE_MOE_TMA=1` 可选路径）。教训：**比较两种引擎前，先确认两者的流水线连续性等价**——TMA 早期领先的一部分其实是「cp.async 的 task 边界没做好」贡献的。
 
 ### Phase 5：gemm1 融合——gate/up 配对 N-tile
 
-GEMM 本体到 ~180 TFLOPS（mma.sync 峰值的 86%）后，转向结构性省流量：gate 与 up 是同一输出行的两个 N 半区（W1 行 `[0, I)` 与 `[I, 2I)`），**配对计算**让同一 CTA 共享同一 X tile（X 装载量减半、task 数减半），双累加器在 epilogue 直接 `silu(tYr_g(i)) · tYr_u(i)`——fragment 索引 i 在同一 tiled_mma + 同一 B 分区的两次 gemm 中恒映射相同 (m_row, n_col)。
+GEMM 本体到 ≈180 TFLOPS（mma.sync 峰值的 86%）后，转向结构性省流量：gate 与 up 是同一输出行的两个 N 半区（W1 行 `[0, I)` 与 `[I, 2I)`），**配对计算**让同一 CTA 共享同一 X tile（X 装载量减半、task 数减半），双累加器在 epilogue 直接 `silu(tYr_g(i)) · tYr_u(i)`——fragment 索引 i 在同一 tiled_mma + 同一 B 分区的两次 gemm 中恒映射相同 (m_row, n_col)。
 
 `gate_up_out (T, 2I)` 缓冲与独立 act_mul kernel 整体消灭（省 2×T×I×2B DRAM 往返），16384 case 端到端 **2585 → 2351µs**，峰值 **176.2 TFLOPS**。
 
 ### Phase 6：kTileM=128——W 面板流量减半
 
-当年 TMA 版的 kTileM=128 存在「输出 ~6 个元素恒 0」的悬案（S=128 复现、S=129 反常通过）。将其加到连续流水 cp.async 结构上后发现**不复现**——且大 shape 的 6 个 ~0.15 误差元素经 M64 对照判定为合法 bf16 量化尾部（M64 强制运行给出逐位相同输出）。
+当年 TMA 版的 kTileM=128 存在「输出 ≈6 个元素恒 0」的悬案（S=128 复现、S=129 反常通过）。将其加到连续流水 cp.async 结构上后发现**不复现**——且大 shape 的 6 个 ≈0.15 误差元素经 M64 对照判定为合法 bf16 量化尾部（M64 强制运行给出逐位相同输出）。
 
 kTileM=128 将每 M-tile 装载的 W 复用面扩大一倍（W 流量随 task 数减半），avg≥256 启用后：
 
@@ -150,7 +150,7 @@ RTX 5090D（sm_120a，bf16，PyTorch 2.6 / CUDA 12.8；`vs FG` 为 `torch.compil
 
 ![引擎与 tile 选择](assets/fuse_moe_engines.png)
 
-各环节效率水位（16384 case）：gemm1_fused ~208 TFLOPS（mma.sync 峰值 209.5 的 ~99%）、gemm2 ~185（88%）、reduce 1.54TB/s（DRAM 峰值的 86%）——三者均接近各自瓶颈，剩余可优化空间主要在 reduce 与 gemm2 epilogue 的融合（需接受 bf16 累加精度权衡，未启用）。
+各环节效率水位（16384 case）：gemm1_fused ≈208 TFLOPS（mma.sync 峰值 209.5 的 ≈99%）、gemm2 ≈185（88%）、reduce 1.54TB/s（DRAM 峰值的 86%）——三者均接近各自瓶颈，剩余可优化空间主要在 reduce 与 gemm2 epilogue 的融合（需接受 bf16 累加精度权衡，未启用）。
 
 ---
 
@@ -182,14 +182,14 @@ gate/up 配对融合后 operands 变为 X + 2×W 面板，M64/K128 需 104KB > s
 
 ### 5.7 精度尾部 vs bug 的判定方法
 
-kTileM=128 验收时出现 6 个 ~0.15 误差元素（输出值高达 26~37）。判定方法：**强制 M64 重跑同 shape——逐位相同输出 → 合法 bf16 量化尾部**（大值三重舍入的期望量级），不同 → tile 尺寸相关 bug。误差阈值也应随输出量级缩放（相对而非绝对）。
+kTileM=128 验收时出现 6 个 ≈0.15 误差元素（输出值高达 26–37）。判定方法：**强制 M64 重跑同 shape——逐位相同输出 → 合法 bf16 量化尾部**（大值三重舍入的期望量级），不同 → tile 尺寸相关 bug。误差阈值也应随输出量级缩放（相对而非绝对）。
 
 ---
 
 ## 6. 经验总结
 
 1. **host 探针先行**：CuTe 的 layout 代数（`make_tma_copy`/`partition`/`local_tile`）大多是 constexpr，可以在 CPU 上直接编译打印。每个「模式顺序/坐标语义/分区偏移」的疑问都值得一个 30 行的探针——本项目至少裁决了 4 次争议，远快于 GPU 盲调。
-2. **引擎对比要控制变量**：TMA vs cp.async 的比较在「cp.async 的 task 边界流水排空」修复后完全逆转（TMA 领先 → 落后 3~15%）。先修平结构性差距，再下引擎结论。
+2. **引擎对比要控制变量**：TMA vs cp.async 的比较在「cp.async 的 task 边界流水排空」修复后完全逆转（TMA 领先 → 落后 3–15%）。先修平结构性差距，再下引擎结论。
 3. **中间量布局是免费的结构杠杆**：compact 直读（消 padded 物化）、gate/up 配对（消 gate_up_out 物化 + X 装载减半）都是纯结构性改动，合计贡献了仅次于引擎重写的收益，且零数值风险。
 4. **越界行为的分层兜底**：组尾跨界读（in-bounds 垃圾行）由行谓词丢弃、末组越界由 TMA OOB 补零、cp.async 由 src-size 零填充——每层各管一段，语义清晰且无需额外指令。
 5. **确定性 bug 优先做「路径隔离 + 边界扫描」**：固定输入下可复现的 bug，先确认它与配置开关（PDL/引擎/tile）的相关性，再对最可疑的维度做细粒度扫描（本项目的 S 扫描直接把调度器 bug 定位到多 block count 路径）。

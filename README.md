@@ -21,18 +21,18 @@
 
 - **任意 mask 直达 softmax**：因果、滑动窗口、padding、随机稀疏（item 级屏蔽）
   等任意形态，无需改 kernel
-- **sm120（RTX 5090D）**：标准场景 **160~180 TFLOPS**（cuBLAS bf16 实测峰值的
-  68~76%），SDPA+mask 的 **1.62~2.48x**、官方 FlexAttention 同场景的 **1.5~3.5x**；
+- **sm120（RTX 5090D）**：标准场景 **160–180 TFLOPS**（cuBLAS bf16 实测峰值的
+  68–76%），SDPA+mask 的 **1.62–2.48x**、官方 FlexAttention 同场景的 **1.5–3.5x**；
   小 grid 长序列场景最高 **60x**（vs FlexAttention 最高 **104x**）；ragged
-  （Sk%8≠0 自动 pad / 任意 Sq）场景 SDPA+mask 的 **1.65~7.8x**
-- **sm89（RTX 4090D）**：开箱即用，标准场景 SDPA+mask 的 **1.15~1.86x**、
-  FlexAttention 的 **1.3~4.5x**；小 grid 长序列场景最高 **31x**（vs FlexAttention
+  （Sk%8≠0 自动 pad / 任意 Sq）场景 SDPA+mask 的 **1.65–7.8x**
+- **sm89（RTX 4090D）**：开箱即用，标准场景 SDPA+mask 的 **1.15–1.86x**、
+  FlexAttention 的 **1.3–4.5x**；小 grid 长序列场景最高 **31x**（vs FlexAttention
   最高 **51x**）；ragged 场景多数 shape 保持加速
 - **sm70（Tesla V100）**：fp16 专用路径（V100 无 bf16 tensor core），数据
   通路全手工——WMMA m16n16k16 + 冲突消除 swizzle（sm70 无 ldmatrix /
-  cp.async / TMA）；标准场景 d=128 **16~24 TFLOPS**、d=64 **11~17 TFLOPS**
-  （cuBLAS fp16 实测峰值的 13~29%），SDPA+mask 的 **1.07~1.82x**；无 mask
-  等价场景 d=128 超开源 flash-attention-v100 参考的 **1.23~1.31x**；
+  cp.async / TMA）；标准场景 d=128 **16–24 TFLOPS**、d=64 **11–17 TFLOPS**
+  （cuBLAS fp16 实测峰值的 13–29%），SDPA+mask 的 **1.07–1.82x**；无 mask
+  等价场景 d=128 超开源 flash-attention-v100 参考的 **1.23–1.31x**；
   暂无 Split-KV（小 grid 长序列为已知短板）
 - **原生 GQA**：K/V 头数整除 Q 头数即可，无需手动扩展
 - **自适应 Split-KV**（sm89/sm120）：cost model 自动选择 split 数，大 grid
@@ -42,8 +42,8 @@
 
 - **精度 ≈ fp32，速度 > tf32**：权重离线拆分为 bf16 主项 + fp8/int8
   residual 补偿项，消除权重的系统性舍入偏差（RMS 误差比纯 bf16 低 **2.3 倍**，
-  最大误差低 **3.9 倍**），RTX 5090D 上为 fp32 matmul 的 **1.7~2.6x**（sm120a
-  TMA 专用路径，较通用路径再快 **1.6~3.0x**），RTX 4090D 上为 **1.3~2.5x**，
+  最大误差低 **3.9 倍**），RTX 5090D 上为 fp32 matmul 的 **1.7–2.6x**（sm120a
+  TMA 专用路径，较通用路径再快 **1.6–3.0x**），RTX 4090D 上为 **1.3–2.5x**，
   大 shape 有效算力最高 **118 TFLOPS**
 - **sm120a TMA 专用路径**：RTX 5090 系自动启用——4 路 operand 全 TMA 搬运
   （OOB 自动补零，无谓词开销）+ mbarrier 双屏障流水线 + bulk TMA store
@@ -58,9 +58,9 @@
 
 **MoE 前向融合 `fuse_moe`**
 
-- **大 shape 有效算力 171~190 TFLOPS**（mma.sync 峰值的 82~91%）：
+- **大 shape 有效算力 171–190 TFLOPS**（mma.sync 峰值的 82–91%）：
   4096×4096×1408 **188 TF**、16384×2048×1024 **188 TF**；vs PyTorch eager
-  **1.9~14.8x**，vs `torch.compile` **1.4~2.5x**，vs compile+CUDA graph
+  **1.9–14.8x**，vs `torch.compile` **1.4–2.5x**，vs compile+CUDA graph
   最高 **98x**（小 batch 大 E 场景）
 - **gemm1 gate/up 配对融合**：同一 CTA 同时计算 W1 的 gate 与 up 两个 N
   面板（共享 X tile，装载量减半），epilogue 直接 `silu(gate)·up` 写
@@ -91,8 +91,8 @@
 测试环境：RTX 5090D / PyTorch 2.11 / CUDA 12.8，benchmark 默认参数
 （见 [Benchmark](#benchmark) 小节），带 10% 随机 -inf mask。
 
-标准场景：**160~180 TFLOPS**（cuBLAS bf16 实测峰值的 68~76%），SDPA+mask 的
-**1.62~2.48x**、官方 FlexAttention（同 mask 场景）的 **1.5~3.5x**：
+标准场景：**160–180 TFLOPS**（cuBLAS bf16 实测峰值的 68–76%），SDPA+mask 的
+**1.62–2.48x**、官方 FlexAttention（同 mask 场景）的 **1.5–3.5x**：
 
 | Shape | custom | SDPA+mask | 加速比 | FlexAtt | vs Flex |
 |---|---|---|---|---|---|
@@ -103,8 +103,8 @@
 | d128 B=4 H=16 Hk=4 S=2048 (GQA) | 775.9µs (177.1 TF) | 1925.9µs | **2.48x** | 1711.1µs | **2.21x** |
 | d128 B=32 H=16 S=1024 | 1527.1µs (180.0 TF) | 3572.7µs | **2.34x** | 3101.1µs | **2.03x** |
 
-小 grid + 长序列场景（Split-KV 自动生效）：SDPA+mask 的 **13~60x**、
-FlexAttention 的 **22~104x**：
+小 grid + 长序列场景（Split-KV 自动生效）：SDPA+mask 的 **13–60x**、
+FlexAttention 的 **22–104x**：
 
 | Shape | custom | SDPA+mask | 加速比 | FlexAtt | vs Flex |
 |---|---|---|---|---|---|
@@ -114,7 +114,7 @@ FlexAttention 的 **22~104x**：
 | d64 Sq=128 Sk=8192 | 16.4µs | 436.3µs | **26.6x** | 1053.7µs | **64.3x** |
 
 ragged 场景（`--suite ragged`，Sk%8!=0 自动 pad / 任意 Sq，「对齐等价」列度量
-自动 pad 开销；vs FlexAttention **1.17~19.7x**）：
+自动 pad 开销；vs FlexAttention **1.17–19.7x**）：
 
 | Shape (B,H,Hk,Sq,Sk,d) | custom | 对齐等价（pad 开销） | SDPA+mask | 加速比 | vs Flex |
 |---|---|---|---|---|---|
@@ -129,7 +129,7 @@ ragged 场景（`--suite ragged`，Sk%8!=0 自动 pad / 任意 Sq，「对齐等
 | d128 B=4 Hk=4 Sq=2048 Sk=2053（GQA） | 896.7µs (153.6 TF) | 775.9µs（+16%） | 2094.1µs | 2.34x | 1.49x |
 
 > 注：Sk ragged 的 pad 拷贝开销绝对量与 sm89 同量级，但 sm120 kernel 本身更快，
-> 相对占比更高（+35~72%）；GQA 因 K/V 更小而降至 +16%。性能敏感且 Sk 固定的
+> 相对占比更高（+35–72%）；GQA 因 K/V 更小而降至 +16%。性能敏感且 Sk 固定的
 > 场景建议数据侧预对齐到 8 倍数（零拷贝主路径）。
 
 > 注：SDPA 带任意 `attn_mask` 时只能走 MemEfficient 后端（FlashAttention 后端不支持
@@ -139,7 +139,7 @@ ragged 场景（`--suite ragged`，Sk%8!=0 自动 pad / 任意 Sq，「对齐等
 > torch≥2.5）：`create_block_mask` 预构建 + `torch.compile`，block_mask 构建与
 > Triton 编译开销均不计入计时，与本算子「mask 预构建后直进 kernel」对齐；
 > 10% 随机 -inf mask 下几乎全部 block 为 partial，FlexAttention 无法利用块稀疏
-> 跳过。FlexAttention 无 Split-KV，小 grid 长序列 shape 差距最大（22~104x）。
+> 跳过。FlexAttention 无 Split-KV，小 grid 长序列 shape 差距最大（22–104x）。
 
 ### RTX 4090D (sm89, bf16)
 
@@ -149,8 +149,8 @@ sm89 路径为 cp.async 实现，同样具备自适应 Split-KV（自 sm120 移�
 测试环境：RTX 4090D / PyTorch 2.11 / CUDA 12.8，benchmark 默认参数
 （见 [Benchmark](#benchmark) 小节）。
 
-标准场景（大 grid）：SDPA+mask 的 **1.15~1.86x**、FlexAttention 的
-**1.30~4.50x**：
+标准场景（大 grid）：SDPA+mask 的 **1.15–1.86x**、FlexAttention 的
+**1.30–4.50x**：
 
 | Shape | custom | SDPA+mask | 加速比 | FlexAtt | vs Flex |
 |---|---|---|---|---|---|
@@ -164,8 +164,8 @@ sm89 路径为 cp.async 实现，同样具备自适应 Split-KV（自 sm120 移�
 | d128 B=4 H=16 Hk=4 S=2048 (GQA) | 1069.2µs (128.5 TF) | 1983.4µs | **1.86x** | 2446.3µs | **2.29x** |
 | d128 B=32 H=16 S=1024 | 2215.9µs (124.0 TF) | 3768.3µs | **1.70x** | 5006.7µs | **2.26x** |
 
-小 grid + 长序列场景（Split-KV 自动生效）：SDPA+mask 的 **7.1~31.3x**、
-FlexAttention 的 **9.6~50.8x**：
+小 grid + 长序列场景（Split-KV 自动生效）：SDPA+mask 的 **7.1–31.3x**、
+FlexAttention 的 **9.6–50.8x**：
 
 | Shape | custom | SDPA+mask | 加速比 | SDPA flash* | FlexAtt | vs Flex |
 |---|---|---|---|---|---|---|
@@ -183,11 +183,11 @@ FlexAttention 的 **9.6~50.8x**：
 > 该参照（如 d128 H=2 Hk=1 Sq=512 Sk=16384: 94.2µs vs 123.9µs）。
 
 作为参照：未启用 Split-KV 时，小 grid 长序列 shape 只能由单个 CTA 串行处理全部
-KV 块，耗时 234~935µs；Split-KV 自动生效后降至 19~53µs（**10~18x**）。
+KV 块，耗时 234–935µs；Split-KV 自动生效后降至 19–53µs（**10–18x**）。
 
 ragged 场景（`Sk % 8 != 0` 自动 pad / 任意 `Sq`，`--suite ragged`）。「对齐等价」
 列为 Sk 向上取整到 8 倍数前同 shape 的 custom 耗时，用于度量自动 pad 的开销；
-vs FlexAttention **1.30~12.8x**：
+vs FlexAttention **1.30–12.8x**：
 
 | Shape (B,H,Hk,Sq,Sk,d) | custom | 对齐等价（pad 开销） | SDPA+mask | 加速比 | vs Flex |
 |---|---|---|---|---|---|
@@ -209,7 +209,7 @@ vs FlexAttention **1.30~12.8x**：
 > 主路径）；极端小 shape（如首行 0.99x 一例）建议直接比对后选用。
 >
 > FlexAtt 对照说明：FlexAttention 默认配置（BLOCK_M=128）在 sm89 d=128 上
-> **无法编译**（smem 需求 ~112KB 超出 Ada 架构 ~99KB 上限，Inductor 报
+> **无法编译**（smem 需求约 112KB 超出 Ada 架构约 99KB 上限，Inductor 报
 > 「No valid triton configs」），上表为其降级 `BLOCK_M=64` 后的结果——
 > 这是该架构下能跑起来的唯一官方配置。sm120（Blackwell，228KB smem）
 > 无此问题，均用默认配置。
@@ -223,7 +223,7 @@ swizzle（sm70 无 ldmatrix / cp.async / TMA），d=128 需 opt-in 96KB smem。
 
 测试环境：V100-PCIE-32GB / PyTorch 2.0.1 / CUDA 11.7，带 10% 随机 -inf mask。
 
-标准场景（大 grid）：SDPA+mask 的 **1.07~1.82x**，d=128 峰值 **24.2 TFLOPS**
+标准场景（大 grid）：SDPA+mask 的 **1.07–1.82x**，d=128 峰值 **24.2 TFLOPS**
 （本机 cuBLAS fp16 实测峰值 84.2 TF 的 29%）：
 
 | Shape | custom | SDPA+mask | 加速比 |
@@ -239,9 +239,9 @@ swizzle（sm70 无 ldmatrix / cp.async / TMA），d=128 需 opt-in 96KB smem。
 
 > 注：V100 + torch 2.0.1 上 SDPA 带 `attn_mask` 只能走 math 后端。FlexAttention
 > 需要 torch≥2.5，该环境不可用（N/A）。无 mask 等价场景（zero additive mask）
-> 下本算子 d=128 全面超过开源 flash-attention-v100 参考实现 **1.23~1.31x**
-> （19.1~24.2 TF vs 15.5~19.5 TF，且对方不支持任意 mask）；d=64 持平
-> （0.95~1.07x）。
+> 下本算子 d=128 全面超过开源 flash-attention-v100 参考实现 **1.23–1.31x**
+> （19.1–24.2 TF vs 15.5–19.5 TF，且对方不支持任意 mask）；d=64 持平
+> （0.95–1.07x）。
 
 ragged 场景（`--suite ragged`，Sk%8!=0 自动 pad / 任意 Sq）：
 
@@ -253,7 +253,7 @@ ragged 场景（`--suite ragged`，Sk%8!=0 自动 pad / 任意 Sq）：
 | d64 Sq=1000 Sk=1024（任意 Sq） | 312.6µs (13.4 TF) | ≈零开销 | 422.5µs | 1.35x |
 | d128 B=2 Hk=4 Sq=500 Sk=2053（GQA 双 ragged） | 1026.5µs (16.4 TF) | — | 1747.6µs | 1.70x |
 
-> 注：V100 上自动 pad 开销 +20~25%（kernel 本身较慢，相对占比低于 sm89/sm120）。
+> 注：V100 上自动 pad 开销 +20–25%（kernel 本身较慢，相对占比低于 sm89/sm120）。
 > 极小 Sq 的 shape（如 Sq=127 d128，仅 16 CTA）无 Split-KV 时不如 SDPA math
 > 后端，为已知短板（见上）。
 
@@ -267,7 +267,7 @@ ragged 场景（`--suite ragged`，Sk%8!=0 自动 pad / 任意 Sq）：
 启用 TMA + mbarrier 专用数据通路（数值语义与通用路径完全一致）；`sm80 路径`
 列为同机强制回退的 A/B 对照（`GEMM_MIXED_FORCE_SM80=1`）。
 
-sm120a 专用路径较通用路径提升 **1.6~3.0x**，为 fp32 matmul 的 **1.7~2.6x**；
+sm120a 专用路径较通用路径提升 **1.6–3.0x**，为 fp32 matmul 的 **1.7–2.6x**；
 4096³ 大 shape 有效算力 **118 TFLOPS**（同 shape bf16 matmul 的 72%）。
 
 | Shape (M,N,K) | mixed (sm120a) | sm80 路径 | 提升 | fp32 | vs fp32 | tf32 | bf16* |
@@ -304,7 +304,7 @@ sm120a 专用路径的设计要点（实现见
 PyTorch 2.11 / CUDA 12.8（FP8 与 INT8 后端同机对照）；编译期 CUDA < 12.4 时
 FP8 自动降级 INT8（精度相同）。
 
-通用路径最优后端为 fp32 matmul 的 **1.3~2.5x**、tf32 的 **1.2~1.6x**，
+通用路径最优后端为 fp32 matmul 的 **1.3–2.5x**、tf32 的 **1.2–1.6x**，
 大 shape 有效算力 **100 TFLOPS**；精度接近 fp32（权重舍入误差被完全消除，
 误差仅剩激活的无偏舍入噪声）。
 
@@ -323,28 +323,28 @@ mixed **8.0e-3** vs bf16 1.2e-2；RMS 误差 **1.7e-3** vs 4.0e-3（低 2.3x）�
 
 后端选择说明：
 
-- **小 M（≤64）FP8 略快**（7~10%，量化 kernel 更简单）；**大 M INT8 更快**
+- **小 M（≤64）FP8 略快**（7–10%，量化 kernel 更简单）；**大 M INT8 更快**
   （最高 21%）；`vs fp32†` 取每行更优后端的倍率。`backend="auto"` 在 FP8
   可用时默认选 FP8（精度相同、免 per-channel scale 存储），大 M 追求极致
   性能可显式 `backend="int8"`
 - 两种 residual 后端精度一致：权重舍入偏差均被消除，剩余误差主导项是激活的
   bf16 舍入噪声（两种量化精度都已足够细）
-- CUDA 11.8 编译时同一 INT8 kernel 大 shape 慢 ~17%（nvcc 代码生成差异，
+- CUDA 11.8 编译时同一 INT8 kernel 大 shape 慢约 17%（nvcc 代码生成差异，
   4096³ 实测 1658µs），小 shape 不受影响；建议用较新 CUDA 编译
 
 > \* bf16 列为 `bf16(x) @ bf16(W)^T`（权重离线预转，与 mixed_gemm 的离线权重拆分
-> 对等）+ fp32 epilogue：速度快 1.3~1.7x（单次 GEMM vs 主项+补偿双 GEMM），但
+> 对等）+ fp32 epilogue：速度快 1.3–1.7x（单次 GEMM vs 主项+补偿双 GEMM），但
 > 权重舍入误差完全未补偿。
 
 ### fuse_moe（MoE FFN 前向融合，单 GPU）
 
 测试环境：RTX 5090D / PyTorch 2.6 / CUDA 12.8，bf16，均匀路由。sm120 上
 默认引擎为 cp.async 连续流水 kernel（各 shape 实测均优于 TMA 引擎
-3~15%）；`FUSE_MOE_TMA=1` 可选切换 TMA + mbarrier 引擎（16384 case
+3–15%）；`FUSE_MOE_TMA=1` 可选切换 TMA + mbarrier 引擎（16384 case
 2807µs vs 默认 2197µs）。sm89（RTX 4090D）走同一 cp.async 路径。
 
-大 shape 有效算力 **171~190 TFLOPS**（mma.sync 峰值的 82~91%）；
-vs eager **1.9~14.8x**，vs `torch.compile` **1.4~2.5x**，vs
+大 shape 有效算力 **171–190 TFLOPS**（mma.sync 峰值的 82–91%）；
+vs eager **1.9–14.8x**，vs `torch.compile` **1.4–2.5x**，vs
 compile+reduce-overhead（CUDA graph）最高 **98x**：
 
 | Shape (S,H,I,E,K) | custom µs | TFLOPS | eager µs | vs eager | comp µs | comp+RO µs | FG+graph µs | vs FG |
@@ -514,7 +514,7 @@ count / 路由重排 / 两个 group GEMM / 激活 / topk 加权归约全部融�
 |---|---|
 | `FA_NUM_SPLITS=n` | 强制 split KV 的 split 数（0=auto cost model） |
 | `FA_SPLITKV=0` | 禁用 split KV |
-| `FA_PERSISTENT=1` | 启用 persistent kernel（d128 部分场景 +2~5%） |
+| `FA_PERSISTENT=1` | 启用 persistent kernel（d128 部分场景 +2–5%） |
 | `GEMM_MIXED_FORCE_SPLITK=n` | 强制 mixed_gemm 的 split-K 值（1/2/4/8/16，调试用） |
 | `FUSE_MOE_TMA=1` | sm120 上启用 TMA + mbarrier 引擎（默认 cp.async） |
 | `FUSE_MOE_TILE_M=32/64/128` | 强制 fuse_moe 的 kTileM（默认按 avg tokens 自适应） |
