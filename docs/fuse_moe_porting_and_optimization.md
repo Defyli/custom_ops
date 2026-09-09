@@ -19,8 +19,9 @@
    - [Phase 5：gemm1 融合——gate/up 配对 N-tile](#phase-5gemm1-融合gateup-配对-n-tile)
    - [Phase 6：kTileM=128——W 面板流量减半](#phase-6ktilem128w-面板流量减半)
 4. [最终性能全景](#4-最终性能全景)
-5. [踩坑实录（可复用的教训）](#5-踩坑实录可复用的教训)
-6. [经验总结](#6-经验总结)
+5. [与 sglang Triton MoE 的对比](#5-与-sglang-triton-moe-的对比)
+6. [踩坑实录（可复用的教训）](#6-踩坑实录可复用的教训)
+7. [经验总结](#7-经验总结)
 
 ---
 
@@ -154,39 +155,111 @@ RTX 5090D（sm_120a，bf16，PyTorch 2.6 / CUDA 12.8；`vs FG` 为 `torch.compil
 
 ---
 
-## 5. 踩坑实录（可复用的教训）
+## 5. 与 sglang Triton MoE 的对比
 
-### 5.1 TMA OOB 补零救不了 per-group 的尾部
+sglang 的生产 MoE 是 Triton kernel（`kernels/ops/moe/fused_moe_triton_kernels.py`，
+源自 vLLM）+ 查表 tuning（`configs/triton_*/E=*,N=*,device_name=*.json`，
+运行时按 M 最近邻取）。对比基准为 `benchmark/sglang_triton_moe/`——
+**自包含移植，不依赖 sglang/sgl-kernel 安装，也不依赖 3rd/sglang checkout**：
+
+- `kernels.py`：`fused_moe_kernel` / `moe_sum_reduce_triton` 从 sglang 源码
+  逐字提取（保留的代码路径与上游一致，Apache-2.0 出处见文件头；裁剪的
+  fp8/int8/int4 量化、TMA、GDC/PDL、LoRA 分支不在 bf16 基准路径上）；
+  `silu_and_mul` 为等价 Triton 实现（生产版为 JIT CUDA kernel）；
+- `runner.py`：五段式编排（align → gemm1 → silu·mul → gemm2 → sum），
+  `moe_align` 为语义对齐的 torch 参考实现（生产 AOT 为单 kernel，
+  ~10µs 量级）；新增 `up_config`/`down_config` 显式注入参数，取代
+  sglang 的 override_config 上下文（tuning 扫参无需 monkey-patch）；
+- `config.py`：查表 + default 启发式 + down-BLOCK_M 对齐约束（上游同款逻辑），
+  configs 目录指向包内；
+- `configs/triton_3_6_0/`：5090D / 4090D 两机的 tuned JSON（tune 脚本生成，
+  文件名按设备区分，运行时自动命中本机）。
+
+配套脚本：`benchmark/tune_sglang_moe.py`（官方 tuning 方案的轻量驱动——
+1170 候选网格（官方 compute-bound 网格裁剪 + 补齐 default 启发式会用到的
+K=32/N=32/GROUP=8，smem 预剪枝），粗筛+精筛两轮，逐 M 子进程隔离
+sticky 错误）；`benchmark/benchmark_fuse_moe_vs_sglang.py`（三方对比：
+ours / sglang default 启发式 / sglang 本机 tuned）。
+
+RTX 5090D（sm120；E=8, H=2048, I=1024, K=2, bf16，tuned 为本机 7 个 M 网点实测最优）：
+
+| S | ours µs | ours TF | sglang-def µs | sglang-tuned µs | vs def | vs tuned |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 102.1 | 126.2 | 505.9 | 498.7 | 4.95x | 4.88x |
+| 1024 | 175.3 | 147.0 | 518.3 | 529.5 | 2.96x | 3.02x |
+| 4096 | 574.3 | 179.5 | 949.9 | 956.4 | 1.65x | 1.67x |
+| 8192 | 1100.9 | 187.3 | 1514.9 | 1510.6 | 1.38x | 1.37x |
+| 16384 | 2175.4 | 189.5 | 2785.3 | 2759.4 | 1.28x | 1.27x |
+
+RTX 4090D（sm89，同一移植包与 tuning 流程；大 S 处 ours 跨 run 有 ±5%
+时钟波动，下表为三次完整测量的一致值）：
+
+| S | ours µs | ours TF | sglang-def µs | sglang-tuned µs | vs def | vs tuned |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 178.8 | 72.1 | 709.2 | 701.6 | 3.97x | 3.92x |
+| 1024 | 306.8 | 84.0 | 695.5 | 698.2 | 2.27x | 2.28x |
+| 4096 | 956.3 | 107.8 | 1293.4 | 1310.5 | 1.35x | 1.37x |
+| 8192 | 1714.4 | 120.2 | 2125.9 | 2122.8 | 1.24x | 1.24x |
+| 16384 | 3381.5 | 121.9 | 3838.9 | 3818.6 | 1.14x | 1.13x |
+
+结论：**两代架构全场景领先**——小 batch 时 2.3–4.9x（launch/调度开销
+主导，sglang 需 align + 2×GEMM + activation + sum 五段式多 kernel），
+大 batch 时 5090D 1.3–1.7x / 4090D 1.1–1.4x（进入 GEMM 主导区，我们的
+gate/up 融合与连续流水仍保持优势；sm89 上差距更小，因 sglang 的 default
+启发式在大 M 时选 K=32 tile，恰好落在该卡的最优区）。tuning 对 sglang
+提升有限（≤2%，本形状族 default 启发式已接近最优），不改变量级差距。
+
+tuning 方法论两则（踩坑）：
+
+- **网格必须覆盖 default 启发式的取值**：初版网格 K 从 64 起，4090D
+  大 M 处任何 K≥64 候选都比 default 的 K=32 差 45%——"tuned" 反而
+  劣于 default。补齐 K=32/N=32/GROUP=8 后（246→1170 候选）两机最优
+  均不再低于 default。
+- **持续满载会污染扫参的绝对时间**：1170 候选 × 7 网点连扫使大 M
+  worker 连续满载 60s+，热节流令后期测得的绝对时间膨胀 1.4–2.2x
+  （5090D M=16384 扫参显示 6469µs，短突发实测同配置 2759µs）；个别
+  网点的选择也被小幅带偏（5090D M=1024 tuned 比 default 慢 2%）。可靠
+  做法是短突发 benchmark 复核扫参结果，或扫参间隔加冷却。
+
+公平性说明：移植版编排层比 sglang 生产 `fused_experts_impl` 精简（无
+hooks/symmetric-memory/dtype-str 等分支），sglang 侧 Python 开销更低，
+实测比带完整编排的早期测量快 5–10%——即本表对 sglang 略偏保守；
+`moe_align` 为 torch 参考实现（生产 AOT 单 kernel，约 10µs），对大 batch
+占比 <2%，小 batch 时会低估 sglang（估数十 µs 量级），均不改变结论方向。
+
+## 6. 踩坑实录（可复用的教训）
+
+### 6.1 TMA OOB 补零救不了 per-group 的尾部
 
 OOB 相对的是 descriptor 编码的整张张量 shape；expert 行数是运行期数据，单一静态 descriptor 无法表达「越过 m_g 补零」。hpc sm90 用 per-expert descriptor + device 侧 tensormap 修改解决——sm120a 不支持该指令（语法通过、硬件 illegal instruction）。两条出路：padded 布局（Phase 1，后被 Phase 3 的任意行坐标取代）或坐标基平移。
 
-### 5.2 local_tile 的「中间模式后置」行为
+### 6.2 local_tile 的「中间模式后置」行为
 
 对 3D 张量 `(n, k, E)` 做 `local_tile(_, (N,K), (_, _))` 时，未参与 tile 的中间模式 E 被排到**自由 tile 模式之后**：`gB = (N, K, nn, nk, E)` → `tBg = (TMA, nn, nk, E)`，而非直觉的 `(TMA, E, nn, nk)`。索引错位后测试可能「侥幸」通过小 shape（S=7 的 RNG 恰好没触发），大 shape 全崩——用 host 探针打印真实 layout 才裁决。此行为已写入 `sm120/group_gemm_sm120.cuh` 注释。
 
-### 5.3 调度器耗尽后的 -1 越界扫描
+### 6.3 调度器耗尽后的 -1 越界扫描
 
 `get_next_tile_horizon` 耗尽时置 `igroup = -1`。旧 while-break 结构耗尽即退出；改成「预取下一 task（Tn）」后，`pull_task` 在耗尽后仍会被调用，从 `i = -1` 开始扫描：`tiles_ptr[-1]` 越界读 + 前缀和污染累积，**当污染和超过 itile_m_total 时会合成一个假任务**（垃圾坐标 → 散射错误写）。该 bug 依赖分配器垃圾值，连续躲过多轮回归，最终靠「S 扫描定位边界（256/384/512 失败、160 通过）+ 失败签名（确定性、路径无关）」锁定。修复：`pull_task` 显式耗尽守卫。
 
-### 5.4 r2s 分区越界：C tile 形状与 kTileM 无关
+### 6.4 r2s 分区越界：C tile 形状与 kTileM 无关
 
 `make_tiled_copy_C` 的分区覆盖面由 TiledMMA 决定（`Tile<32,64,16>` × thr (2,4,1) → 恒为 64×64），与 kTileM 无关。kTileM=32 时分区写到 sC 逻辑边界外 104 elems——sC 别名在 operand 大区时被 prologue 覆写而侥幸无害，sC 独立成区后即刻越界崩溃。修复：sC 预留按 `(N, max(M, 64))` 分配（`shm_c_alloc`）。host 探针可直接打印分区最大偏移验证。
 
-### 5.5 cp.async 的 issue/fence 顺序是正确性约束
+### 6.5 cp.async 的 issue/fence 顺序是正确性约束
 
 `issue → fence → wait` 的顺序下，slab r 的 commit 到其 wait 之间恰有 kStage-1 个 fence，`wait<kStage-1>` 保证落地。把 issue 挪到 fence 之后，commit 落后一个迭代、计数变 kStage-2，wait 不再保证数据到达——20/21 FAIL。这不是性能问题而是正确性契约，已写入 kernel 注释。
 
-### 5.6 双面板 smem 预算与静默 launch 失败
+### 6.6 双面板 smem 预算与静默 launch 失败
 
 gate/up 配对融合后 operands 变为 X + 2×W 面板，M64/K128 需 104KB > sm120 每块动态 smem 硬限 101376B——**`cudaLaunchKernel` 静默失败，输出 NaN**。修复：K=128 门控（`k128_fits` 按完整预算计算，超限降级 K64）+ `assert(shm_size <= 101376)` 防回归。教训：smem 预算公式要跟着 operand 数量走，且超限时 CUDA 不一定报错。
 
-### 5.7 精度尾部 vs bug 的判定方法
+### 6.7 精度尾部 vs bug 的判定方法
 
 kTileM=128 验收时出现 6 个 ≈0.15 误差元素（输出值高达 26–37）。判定方法：**强制 M64 重跑同 shape——逐位相同输出 → 合法 bf16 量化尾部**（大值三重舍入的期望量级），不同 → tile 尺寸相关 bug。误差阈值也应随输出量级缩放（相对而非绝对）。
 
 ---
 
-## 6. 经验总结
+## 7. 经验总结
 
 1. **host 探针先行**：CuTe 的 layout 代数（`make_tma_copy`/`partition`/`local_tile`）大多是 constexpr，可以在 CPU 上直接编译打印。每个「模式顺序/坐标语义/分区偏移」的疑问都值得一个 30 行的探针——本项目至少裁决了 4 次争议，远快于 GPU 盲调。
 2. **引擎对比要控制变量**：TMA vs cp.async 的比较在「cp.async 的 task 边界流水排空」修复后完全逆转（TMA 领先 → 落后 3–15%）。先修平结构性差距，再下引擎结论。
@@ -196,4 +269,4 @@ kTileM=128 验收时出现 6 个 ≈0.15 误差元素（输出值高达 26–37�
 
 ---
 
-*相关实现：`csrc/fuse_moe/`（架构分层见 `fuse_moe_launch.h` 头注释）；测试 `tests/test_fuse_moe.py`（21 用例：双 dtype × 形状 × 分布含 single_expert/sparse/duplicate）；基准 `benchmark/benchmark_fuse_moe.py`。*
+*相关实现：`csrc/fuse_moe/`（架构分层见 `fuse_moe_launch.h` 头注释）；测试 `tests/test_fuse_moe.py`（21 用例：双 dtype × 形状 × 分布含 single_expert/sparse/duplicate）；基准 `benchmark/benchmark_fuse_moe.py`；sglang 对比 `benchmark/benchmark_fuse_moe_vs_sglang.py` + `benchmark/sglang_triton_moe/`（自包含移植，无需安装 sglang/sgl-kernel）。*

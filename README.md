@@ -345,7 +345,29 @@ mixed **8.0e-3** vs bf16 1.2e-2；RMS 误差 **1.7e-3** vs 4.0e-3（低 2.3x）�
 
 大 shape 有效算力 **171–190 TFLOPS**（mma.sync 峰值的 82–91%）；
 vs eager **1.9–14.8x**，vs `torch.compile` **1.4–2.5x**，vs
-compile+reduce-overhead（CUDA graph）最高 **98x**：
+compile+reduce-overhead（CUDA graph）最高 **98x**；vs sglang 生产
+Triton MoE（本机 tuned，`benchmark/benchmark_fuse_moe_vs_sglang.py` +
+自包含移植包 `benchmark/sglang_triton_moe/`，无需安装 sglang）
+**5090D 1.3–4.9x / 4090D 1.1–3.9x**（小 batch 2.3–4.9x，大 batch
+1.1–1.7x，详见 docs 第 5 节）。
+
+5090D（sm120）：
+
+| Shape (S,H,I,E,K) | custom µs | sglang-def µs | sglang-tuned µs | vs tuned |
+|---|---|---|---|---|
+| (512,2048,1024,8,2) | 102.1 | 505.9 | 498.7 | **4.9x** |
+| (1024,2048,1024,8,2) | 175.3 | 518.3 | 529.5 | 3.0x |
+| (4096,2048,1024,8,2) | 574.3 | 949.9 | 956.4 | 1.7x |
+| (16384,2048,1024,8,2) | 2175.4 | 2785.3 | 2759.4 | 1.3x |
+
+4090D（sm89，同一移植包与 tuning 流程，121.9 TF vs sglang 107.4 TF）：
+
+| Shape (S,H,I,E,K) | custom µs | sglang-def µs | sglang-tuned µs | vs tuned |
+|---|---|---|---|---|
+| (512,2048,1024,8,2) | 178.8 | 709.2 | 701.6 | **3.9x** |
+| (1024,2048,1024,8,2) | 306.8 | 695.5 | 698.2 | 2.3x |
+| (4096,2048,1024,8,2) | 956.3 | 1293.4 | 1310.5 | 1.4x |
+| (16384,2048,1024,8,2) | 3381.5 | 3838.9 | 3818.6 | 1.1x |
 
 | Shape (S,H,I,E,K) | custom µs | TFLOPS | eager µs | vs eager | comp µs | comp+RO µs | FG+graph µs | vs FG |
 |---|---|---|---|---|---|---|---|---|

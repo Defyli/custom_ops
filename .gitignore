@@ -20,3 +20,6 @@ torch_extensions/
 
 # benchmark 输出
 result.csv
+
+# 临时文件
+remote.txt
