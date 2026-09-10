@@ -554,6 +554,7 @@ python examples/basic_usage.py        # 最小示例：调用 + 与 SDPA 校验
 python examples/custom_mask_demo.py   # 4 种典型 mask：causal / 滑窗 / padding / 随机稀疏
 python examples/gqa_example.py        # GQA：无需扩展 K/V 头
 python examples/mixed_gemm_demo.py    # 混合精度 GEMM：权重拆分 + epilogue 融合 + 精度对比
+python examples/fuse_moe_demo.py      # 融合 MoE：Mixtral 风格前向 + 数值校验 + vs eager 性能对比
 python tests/test_fuse_moe.py         # fuse_moe：21 用例正确性（含单专家/稀疏/重复路由）
 ```
 
