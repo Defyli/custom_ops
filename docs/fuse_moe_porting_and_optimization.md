@@ -145,6 +145,123 @@ sm89 移植完成后的后续优化（4090D，ncu 2025.1，sudo 计数器权限�
 
 5090D 同路径受益：16384 case 2187→2133µs（193.3 TF），峰值 190.1→**194.3 TF**。一个测量教训：首轮 full benchmark 中 (4096,4096,1408) 显示 N-pair 慢 3.5%，三轮背靠背复测实为**稳定快 2.0%**（旧基线 run 恰逢高 boost 时段，时钟漂移 6%）——单次跨 run 对比在 ±5% 量级时必须复测。
 
+### Phase 8：ncu 源级归因——LDL 寄存器溢出与 r2s bank 冲突双修
+
+4090D 上的后续优化（ncu 2025.1，S=16384 稳态，detailed set + `--page source`
+逐指令 stall 采样 + host 探针）。
+
+**归因**（gemm1/gemm2 均 M128/K64/S2、occupancy 16.7%、HMMA pipe 实际占用
+~85%（fp32-acc 口径；ncu 的 42% 系按 fp16-acc 双倍率峰值归一）——不是带宽
+问题（long_scoreboard 0.5、DRAM 9-16%），剩余 ~15% pipe-idle 的构成：
+1. **barrier stall 3.55/issue（gemm1）**：71.5k 采样集中在 K 循环回边分支
+   （sync#2 后）与 slab 首个 LDSM（sync#1 后）——sync 到达偏斜；
+2. **SASS 循环头出现 LDL.64/STL**——`rows_cur/rows_next` 数组经 `const int*`
+   指针形参（调用侧还有 `cond ? rows_next : rows_cur` 三元选择）与 TaskCtx
+   引用穿透 lambda 边界，ptxas 据此取址降级 local memory，K 循环头每迭代
+   重载，其 L1/L2 可变延迟正是 sync 偏斜的主要来源；
+3. **r2s 的 8 路 bank 冲突**：host 探针（g++ 编译 CLayout 代数）证实 warp 内
+   32 线程访问模式为 (n, m) = (tid/4, 2·(tid%4)+v0)、地址 n + 64m——sC 的
+   M-stride 64×2B = 128B ≡ bank 周期，m 维各行全落同一 bank 组（ncu 计
+   6.37M 过量 wavefront；但 kernel 非吞吐受限，实测贡献小）。探针同时证伪
+   了「fragment 内 (2i,2i+1) 为 n 相邻对」的假设（实为 m 相邻对，同 n 相邻
+   行）——寄存器直写 gmem 的 4B 打包 epilogue 因此不可行。
+
+**修复**（零配置漂移：所有 kStage/k128 门控结果改前改后完全一致）：
+- `SmemLayoutC` M-stride 64→**72**（144B 行距，保持 16B 对齐；bank =
+  (n/2 + 36m) & 31 随 m 展开互异，相邻 n 对共字由硬件写合并）；
+- **寄存器驻留**：`scatter_load_x_tile` 数组形参改 `const int (&)[N]`、
+  `load_slab` 的 TaskCtx 改按值传递、`issue_step` 改 if/else 双路直传（消灭
+  指针退化与引用三元选择）、`pull_task` 改返回值语义。ncu 复查：local_op_ld
+  = 0，gemm1 寄存器 171→198（rows 数组入驻）、gemm2 168→154，
+  long_scoreboard 0.5→0.10。
+
+**实测**（4090D，FUSE_MOE_TIME 分段计时稳态中位，µs）：
+
+| shape | gemm1 旧→新 | e2e 旧→新 | gemm1 Δ |
+|---|---|---|---|
+| 512 | 112→105 | 185→179 | **-6.3%** |
+| 1024 | 193→184 | 308→299 | **-4.7%** |
+| 4096 | 622→600 | 968→943 | **-3.5%** |
+| 16384 | 2275→2205 | 3638→3559 | **-3.1%** |
+| 4096×4096×1408 | 1703→1652 | 2639→2589 | **-3.0%** |
+| 4096,E64,K8 | 2520→2438 | 3978→3890 | **-3.3%** |
+
+全 shape e2e **-1.9~-3.2%**，gemm1（scatter 路径，溢出最重）收益最大、小
+batch 最显著——与归因方向一致；gemm2（无 rows 数组）仅 TaskCtx 受益。
+sglang 对比基准无回归：16384 e2e 3225µs = **127.8 TF**（cuBLAS 同 session
+峰值 144.4 的 88.5%），vs sglang-tuned 1.19–4.22x。方法论：**逐指令 stall
+采样比聚合比率多挖出一层**——聚合视角只见 barrier 高，源级才看到循环头
+LDL；host 探针继续裁决 layout 争议（本次同时证实一个假设、证伪一个假设）。
+
+### Phase 9：单 sync 协议实验——正确但 -4%，否决
+
+Phase 8 后 barrier stall 仍 3.4-3.6/issue（双 __syncthreads/迭代的到达偏斜）。
+实验假设：把发射从迭代顶（fence 前）挪到 sync 之后，让唯一 sync 同时承担
+「slab 可见」与「上一迭代读完成」——sync 减半且协议论证完备（wait<kStage-2>
+的「除最近 N 组外全部完成」语义；发射目标 stage 的读取程序序先于 sync）。
+
+**结果**：21/21 正确性通过，但全 shape 一致退化 3.9-4.5%（gemm1 +4.3%、
+gemm2 +3.8%），规律性极强——协议级效应，立即回滚（md5 复核恢复 Phase 8 
+状态，回归 21/21、性能复原）。
+
+**机制归因**（失败原因比成功更值得记录）：双 sync 里的 sync#2 不是纯开销——
+它定义了发射窗口的边界。旧协议 issue 在迭代最顶部，拷贝窗口 = 完整迭代
+（wait+sync+compute ≈ 4376 cyc）；单 sync 的 issue 在 sync 后，窗口只剩
+compute 相位（≈3700 cyc）。省 1 个 sync（~100-300 cyc）换来窗口缩短
+~600 cyc——L2 延迟波动（97% 命中但 ~700-900 cyc）下 wait<kStage-2> 对
+最旧组零在途余量，空等直接暴露。**issue 置顶（迭代最顶、fence 前）是
+拷贝窗口最大化的结构最优位置**；消 sync 必须与加深 kStage 联动才可能
+保窗口，而 M128/K64 的 smem 预算装不下 kStage=3（需 116KB）——该路径
+在 sm89 上被架构封死。
+
+由此确认 Phase 8 后的 sync 结构已在最优点附近：剩余 ~15% pipe-idle 由
+HMMA 饱和度 85% × LDSM/HMMA 依赖链的物理延迟构成，M128/S2 的结构性
+天花板。后续空间仅剩 reduce×gemm2 融合（bf16 累加精度取舍，未启用）。
+
+### Phase 10：reduce 结构性融合实验——atomic epilogue 双机净负，否决但保留
+
+Phase 9 确认 gemm 的 sync 结构已到最优点后，转向尾段。ncu 实测独立 reduce kernel
+（S=16384 / E64K8）DRAM 利用率 **94.8% / 93.5%**、L2 命中 33.6% / 11.2%——
+standalone 无优化空间，唯一剩余路径是结构性消灭流量：gemm2 epilogue 直接
+`atomicAdd(scale × y)` 加权累加到 out，彻底消灭 down_out 的写+读往返
+（T×H×2B ×2）与独立 reduce kernel。
+
+**实现**（完整可用，双机 21/21 通过含 duplicate/sparse 边界）：
+- prep 折叠进 gemm1 kernel 开头：grid-stride 清零 out + 由 topk_pos 反散射
+  构建 row_scale[t] = {token, scale} 反向映射（零额外 kernel/launch；顺序由
+  kernel 边界栅栏保证）；
+- gemm2 双变体（wide-N 双面板 / 非 wide 回退）各加融合 epilogue 分支：
+  row_scale 反查 → fp32 缩放（bf16×bf16 乘积在 fp32 精确、单次 RN 舍入，与
+  独立 reduce 数值路径等价；K=2 舍入次数同为 2 次）→ 2 元素打包原子累加；
+- 实验结论：双机净负，代码已移除（见下）。
+
+**实测（两台机器均净负，否决默认启用）：**
+
+| 机器 | 机制 | 结果 |
+|---|---|---|
+| 4090D (sm89) | `atomicAdd(__nv_bfloat162)` 为 **sm90+ 特性**，nvcc 对 sm_89
+  生成 CAS 重试循环模拟（正确但每次原子 = LDG+FADD+ATOM.CAS 循环） | gemm2
+  1147→1794µs（**+57%**），e2e +13.7%，灾难性 |
+| 5090D (sm120) | 原生 bf16x2 red，但 16384 shape 需 33.5M 次原子（≈42G
+  ops/s）**贴 L2 RMW 吞吐墙** | gemm2 672→808µs（+20%），吃掉 100%+ 的
+  reduce 节省（133µs）；全 shape e2e 净负 0.4~5.6% |
+
+5090D 背靠背 A/B（同 session 稳态中位，µs）：
+
+| shape | 基线 e2e | 融合 e2e |
+|---|---:|---:|
+| 4096 | 592 | 625 |
+| 16384 | 2126 | 2142 |
+| 4096×4096×1408 | 1465 | 1497 |
+| 4096,E64,K8 | 2248 | 2258 |
+
+**机制结论**：独立 reduce 的 94% DRAM 即物理墙；原子融合本质是「DRAM 流量
+换 L2 RMW 流量」，当前两代消费级硬件上 RMW 代价 ≥ DRAM。另一条死路也已
+排查：reduce 的行访问按 token→compact 散射（topk_pos 随机），无法通过块
+调度序提升 L2 局部性。方向封死。实验代码已从主干移除（实现与双机实测数据均存于
+本日志与 git 历史；若未来硬件提供更高吞吐的 L2 原子/专用累加单元，
+按本节机制描述重新实现即可）。
+
 ![优化演进](assets/fuse_moe_evolution.png)
 
 ---

@@ -124,10 +124,13 @@ __device__ __forceinline__ void get_next_tile_vert(const int *cu_tiles_ptr, int 
 // partition_D（swizzle 感知），每个 (row_iter, thread) 恰好对应一个 16B chunk。
 // 行索引来源：调用方预取的本线程行数组 my_rows[row_iter]（每个 row_iter 恰
 // 一行——行号 = row_iter*kRowsPerIter + threadIdx.x/kThreadsPerRow）。
-template <typename Config, bool kFullTile, typename TsXCopy>
+// my_rows 以数组引用传递：指针形参（含调用侧三元选择退化）会触发 ptxas 将
+// rows_cur/rows_next 降级 local memory，K 循环头每迭代 LDL 重载（ncu SASS 实测），
+// 其可变延迟是 sync#1 到达偏斜的主要来源。
+template <typename Config, bool kFullTile, typename TsXCopy, int kNumRows>
 __device__ __forceinline__ void scatter_load_x_tile(
     TsXCopy &tsX_copy, const typename Config::Tin *__restrict__ x_pool,
-    const int *__restrict__ my_rows, int num_valid, int k_col_base, int k_row_stride,
+    const int (&my_rows)[kNumRows], int num_valid, int k_col_base, int k_row_stride,
     int ismem) {
   using Tin = typename Config::Tin;
   constexpr int kTileM = Config::kTileM;
@@ -293,7 +296,8 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
   // 续扫位置，任务映射错乱。
   int sched_igroup = 0;
   int sched_sum_tile_m = 0;
-  auto pull_task = [&](TaskCtx &t) {
+  auto pull_task = [&]() -> TaskCtx {
+    TaskCtx t{};
     if (use_vert) {
       // vert：N-major 无状态映射，耗尽 = itile_n 越过 N tile 数
       //（flat_divider 除数即 num_tile_n）。
@@ -306,7 +310,7 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
         t.start_token = cu_seqlens_ptr[sched_igroup];
         t.m = seqlens_ptr[sched_igroup];
       }
-      return;
+      return t;
     }
     // 已耗尽：直接返回，不得再扫——耗尽后 sched_igroup=-1，后续调用会
     // 从 i=-1 扫描（tiles_ptr[-1] 越界读 + sum_tile_m 污染累积），当污染
@@ -315,7 +319,7 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
     // 耗尽即退出；Tn 预取路径必须显式守卫。
     if (sched_igroup < 0) {
       t.valid = false;
-      return;
+      return t;
     }
     get_next_tile_horizon(shm_tiles, iblock, num_group, sched_igroup, t.itile_m, t.itile_n,
                           sched_sum_tile_m, flat_divider);
@@ -326,6 +330,7 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
       t.start_token = cu_seqlens_ptr[sched_igroup];
       t.m = seqlens_ptr[sched_igroup];
     }
+    return t;
   };
 
   // scatter 行索引（寄存器，每线程 kNumRowIters 个；issue 侧最多领先
@@ -348,8 +353,8 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
 
   // K-slab 装载（按发射时刻的 task 上下文；gmem 分区/谓词随 task 变化，
   // 在此重算——layout 代数，代价可忽略）
-  auto load_slab = [&](const TaskCtx &t, int itile_k, int istage,
-                       [[maybe_unused]] const int *rows) {
+  auto load_slab = [&](TaskCtx t, int itile_k, int istage,
+                       [[maybe_unused]] const int (&rows)[kNumRowIters]) {
     Tensor W = make_tensor(
         make_gmem_ptr((Tin const *)Wptr + uint64_t(t.igroup) * n * k),
         make_shape(n, k), make_stride(k, Int<1>{}));
@@ -392,8 +397,8 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
   int issued = 0;            // 全局已发射 slab 数（stage = issued % kStage）
   int slab_read = 0;         // 全局已消费 slab 数（stage = slab_read % kStage）
 
-  pull_task(Tc);
-  pull_task(Tn);
+  Tc = pull_task();
+  Tn = pull_task();
   if constexpr (kScatterA) {
     load_my_rows(Tc, rows_cur);
     if (Tn.valid) load_my_rows(Tn, rows_next);
@@ -407,9 +412,15 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
       iss_is_next = true;
       iss_kk = 0;
     }
-    const TaskCtx &t = iss_is_next ? Tn : Tc;
+    const TaskCtx t = iss_is_next ? Tn : Tc;
     if (!t.valid || iss_kk >= ntile) return;
-    load_slab(t, iss_kk, issued % kStage, iss_is_next ? rows_next : rows_cur);
+    // 数组以引用直传：三元选择会退化为指针，ptxas 据此将 rows 降级
+    // local memory（K 循环头每迭代 LDL 重载，可变延迟放大 sync 偏斜）
+    if (iss_is_next) {
+      load_slab(Tn, iss_kk, issued % kStage, rows_next);
+    } else {
+      load_slab(Tc, iss_kk, issued % kStage, rows_cur);
+    }
     ++iss_kk;
     ++issued;
   };
@@ -483,7 +494,7 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
     // iss_kk 保留（发射流在新 Tc（原 Tn）内的位置）；iss_is_next 复位后
     // 发射继续填补新 Tc 的剩余 slab，耗尽再切新 Tn。
     Tc = Tn;
-    pull_task(Tn);
+    Tn = pull_task();
     iss_is_next = false;
     if constexpr (kScatterA) {
 #pragma unroll
@@ -615,7 +626,8 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
   };
   int sched_igroup = 0;
   int sched_sum_tile_m = 0;
-  auto pull_task = [&](TaskCtx &t) {
+  auto pull_task = [&]() -> TaskCtx {
+    TaskCtx t{};
     if (use_vert) {
       // vert：N-major 无状态映射，耗尽 = itile_n 越过配对 tile 数
       //（flat_divider 除数即 (n/2)/64）。
@@ -628,7 +640,7 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
         t.start_token = cu_seqlens_ptr[sched_igroup];
         t.m = seqlens_ptr[sched_igroup];
       }
-      return;
+      return t;
     }
     // 任务流已耗尽时直接返回：get_next_tile_horizon 耗尽时把 igroup 置 -1，
     // 后续调用会从 i=-1 扫描（tiles_ptr[-1] 越界读 + sum_tile_m 污染累积），
@@ -636,7 +648,7 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
     // Tn 预取路径在 compute task 结束后仍会调用本函数，必须显式守卫。
     if (sched_igroup < 0) {
       t.valid = false;
-      return;
+      return t;
     }
     get_next_tile_horizon(shm_tiles, iblock, num_group, sched_igroup, t.itile_m, t.itile_n,
                           sched_sum_tile_m, flat_divider);
@@ -647,6 +659,7 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
       t.start_token = cu_seqlens_ptr[sched_igroup];
       t.m = seqlens_ptr[sched_igroup];
     }
+    return t;
   };
 
   constexpr int kNumRowIters =
@@ -665,7 +678,8 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
     }
   };
 
-  auto load_slab = [&](const TaskCtx &t, int itile_k, int istage, const int *rows) {
+  auto load_slab = [&](TaskCtx t, int itile_k, int istage,
+                       const int (&rows)[kNumRowIters]) {
     Tensor W = make_tensor(
         make_gmem_ptr((Tin const *)Wptr + uint64_t(t.igroup) * n * k),
         make_shape(n, k), make_stride(k, Int<1>{}));
@@ -715,8 +729,8 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
   int issued = 0;
   int slab_read = 0;
 
-  pull_task(Tc);
-  pull_task(Tn);
+  Tc = pull_task();
+  Tn = pull_task();
   if constexpr (kScatterA) {
     load_my_rows(Tc, rows_cur);
     if (Tn.valid) load_my_rows(Tn, rows_next);
@@ -727,9 +741,15 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
       iss_is_next = true;
       iss_kk = 0;
     }
-    const TaskCtx &t = iss_is_next ? Tn : Tc;
+    const TaskCtx t = iss_is_next ? Tn : Tc;
     if (!t.valid || iss_kk >= ntile) return;
-    load_slab(t, iss_kk, issued % kStage, iss_is_next ? rows_next : rows_cur);
+    // 数组以引用直传：三元选择会退化为指针，ptxas 据此将 rows 降级
+    // local memory（K 循环头每迭代 LDL 重载，可变延迟放大 sync 偏斜）
+    if (iss_is_next) {
+      load_slab(Tn, iss_kk, issued % kStage, rows_next);
+    } else {
+      load_slab(Tc, iss_kk, issued % kStage, rows_cur);
+    }
     ++iss_kk;
     ++issued;
   };
@@ -828,7 +848,7 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
     }
 
     Tc = Tn;
-    pull_task(Tn);
+    Tn = pull_task();
     iss_is_next = false;
     if constexpr (kScatterA) {
 #pragma unroll
@@ -876,7 +896,7 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
     // M128/K128 需 112KB 超限 → dispatch_k 的 k128_fits 门控降级 K64。
     constexpr int kStage = [] {
       constexpr int bps = (kTileM + 64) * kTileK * 2;             // 每 stage X+W
-      constexpr int sc = (kTileM < 64 ? 64 : kTileM) * 64 * 2;   // sC 预留区
+      constexpr int sc = ((kTileM < 64 ? 64 : kTileM) - 1) * 72 * 2 + 64 * 2;  // sC 预留区（M-stride 72 填充）
       constexpr int s = (96 * 1024 - sc) / bps;
       return (s > 6) ? 6 : ((s < 2) ? 2 : s);
     }();
@@ -912,7 +932,7 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
       constexpr int kTileM_v = decltype(m_tag)::value;
       constexpr bool k128_fits =
           ((kTileM_v + 64) * 128 * 2 * 2 +
-           (kTileM_v < 64 ? 64 : kTileM_v) * 64 * 2) <= (96 * 1024);
+           ((kTileM_v < 64 ? 64 : kTileM_v) - 1) * 72 * 2 + 64 * 2) <= (96 * 1024);
       if (k % 128 == 0 && k128_fits) {
         launch(t_tag, m_tag, Int<128>{});
       } else {
@@ -963,7 +983,7 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
     // M64/K64→3（82KB）、M32/K64→4（80KB）；K=128 仅 M32（90KB）。
     constexpr int kStage = [] {
       constexpr int bps = (kTileM + 2 * 64) * kTileK * 2;         // X + 双 W 面板
-      constexpr int sc = (kTileM < 64 ? 64 : kTileM) * 64 * 2;   // sC 预留区
+      constexpr int sc = ((kTileM < 64 ? 64 : kTileM) - 1) * 72 * 2 + 64 * 2;  // sC 预留区（M-stride 72 填充）
       constexpr int s = (96 * 1024 - sc) / bps;
       return (s > 6) ? 6 : ((s < 2) ? 2 : s);
     }();
@@ -1005,7 +1025,7 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
       constexpr int kTileM_v = decltype(m_tag)::value;
       constexpr bool k128_fits =
           ((kTileM_v + 2 * 64) * 128 * 2 * 2 +
-           (kTileM_v < 64 ? 64 : kTileM_v) * 64 * 2) <= (96 * 1024);
+           ((kTileM_v < 64 ? 64 : kTileM_v) - 1) * 72 * 2 + 64 * 2) <= (96 * 1024);
       if (k % 128 == 0 && k128_fits) {
         launch(t_tag, m_tag, Int<128>{});
       } else {
@@ -1054,7 +1074,7 @@ void group_gemm_wide_n_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
     constexpr int kTileK = decltype(k_tag)::value;
     constexpr int kStage = [] {
       constexpr int bps = (kTileM + 2 * 64) * kTileK * 2;         // X + 双 W 面板
-      constexpr int sc = (kTileM < 64 ? 64 : kTileM) * 64 * 2;   // sC 预留区
+      constexpr int sc = ((kTileM < 64 ? 64 : kTileM) - 1) * 72 * 2 + 64 * 2;  // sC 预留区（M-stride 72 填充）
       constexpr int s = (96 * 1024 - sc) / bps;
       return (s > 6) ? 6 : ((s < 2) ? 2 : s);
     }();
@@ -1095,7 +1115,7 @@ void group_gemm_wide_n_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
       constexpr int kTileM_v = decltype(m_tag)::value;
       constexpr bool k128_fits =
           ((kTileM_v + 2 * 64) * 128 * 2 * 2 +
-           (kTileM_v < 64 ? 64 : kTileM_v) * 64 * 2) <= (96 * 1024);
+           ((kTileM_v < 64 ? 64 : kTileM_v) - 1) * 72 * 2 + 64 * 2) <= (96 * 1024);
       if (k % 128 == 0 && k128_fits) {
         launch(t_tag, m_tag, Int<128>{});
       } else {

@@ -71,10 +71,15 @@ struct MoEGemmConfig {
       SmemLayoutAtom{}, make_shape(Int<kTileM_>{}, Int<kTileK_>{}, Int<kStage_>{})));
   using SmemLayoutW = decltype(tile_to_shape(
       SmemLayoutAtom{}, make_shape(Int<kTileN_>{}, Int<kTileK_>{}, Int<kStage_>{})));
-  // C：(kTileN, kTileM)，mode0 连续、无 swizzle（mixed_gemm sm120 sY 同款；
-  // r2s 写仅每 tile 一次，bank sharing 可接受）
+  // C：(kTileN, kTileM)，mode0 连续、无 swizzle；M-stride = kTileN+8（=72）
+  // 填充消 bank 冲突：r2s 的 warp 内访问模式为 (n, m) = (tid/4,
+  // 2*(tid%4)+v0)，地址 n + stride*m。stride=64 时 64*2B=128B ≡ bank 周期，
+  // m 维各行全落同一 bank 组 → 8 路冲突（ncu 4090D S=16384 实测
+  // 6.37M 过量 wavefront，est. speedup 8%）。stride=72 → 144B 行距（保持
+  // 16B 对齐，s2g 的 uint4 读不受影响），bank = (n/2 + 36m) & 31
+  // 随 m 展开互异（相邻 n 对共字由硬件写合并）。
   using SmemLayoutC = decltype(make_layout(
-      make_shape(Int<kTileN_>{}, Int<kTileM_>{}), make_stride(Int<1>{}, Int<kTileN_>{})));
+      make_shape(Int<kTileN_>{}, Int<kTileM_>{}), make_stride(Int<1>{}, Int<kTileN_ + 8>{})));
 
   // g2s cp.async：16B = 8 个 16-bit 元素/线程
   static constexpr int kElemsPerAtom = 16 / int(sizeof(T));           // 8
@@ -94,13 +99,15 @@ struct MoEGemmConfig {
   // sC 预留区按 (kTileN, max(kTileM, 64)) 分配：TiledMMA 的 C tile 形状
   // 由 Tile<32,64,16> 与 thr (2,4,1) 组合决定（恒为 N=64 × M=64 的覆盖面，
   // 与 kTileM 无关，frag 总量 16×256=4096 elems），kTileM<64 时 r2s 分区
-  //（make_tiled_copy_C）会写到 sC 逻辑边界之外（最高 sC+2152 @M32）。
+  //（make_tiled_copy_C）会写到 sC 逻辑边界之外（按同 stride 布局计址，最高触及 72*63+64 元素 @M32）。
   // s2g 只读 [0, cosize(SmemLayoutC))，越界写部分属被行谓词丢弃的 M 尾部
   // 垃圾行，语义无关。
+  static constexpr int shm_c_pad_elems =
+      (kTileN_ + 8) * ((kTileM_ < 64 ? 64 : kTileM_) - 1) + kTileN_;
   static constexpr int shm_c_alloc =
-      (shm_c > static_cast<int>(sizeof(T) * kTileN_ * 64))
+      (shm_c > static_cast<int>(sizeof(T) * shm_c_pad_elems))
           ? shm_c
-          : static_cast<int>(sizeof(T) * kTileN_ * 64);
+          : static_cast<int>(sizeof(T) * shm_c_pad_elems);
   // sm89 家族：sC 为独立 smem 区（跨 tile 连续流水需要，见
   // sm89/group_gemm_sm89.cuh）；sm120 家族：别名 operand 基地址。
   // 两家族均满足 shm_c ≤ shm_xw（sm89 预算公式以此为前提）。
