@@ -115,6 +115,7 @@ torch::Tensor fuse_moe_cuda(
     torch::Tensor seqlens = torch::zeros({num_expert}, options_i32);
     torch::Tensor cu_seqlens = torch::empty({num_expert + 1}, options_i32);
     torch::Tensor tiles = torch::empty({num_expert}, options_i32);
+    torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options_i32);
     torch::Tensor gate_up_out;  // 仅 FUSE_MOE_TMA=1（TMA 引擎）
     if (std::getenv("FUSE_MOE_TMA") != nullptr) {
         gate_up_out =
@@ -134,6 +135,7 @@ torch::Tensor fuse_moe_cuda(
     params.seqlens_ptr = seqlens.data_ptr<int>();
     params.cu_seqlens_ptr = cu_seqlens.data_ptr<int>();
     params.tiles_ptr = tiles.data_ptr<int>();
+    params.cu_tiles_ptr = cu_tiles.data_ptr<int>();
     params.gate_up_out_ptr = gate_up_out.defined() ? gate_up_out.data_ptr() : nullptr;
     params.act_out_ptr = act_out.data_ptr();
     params.down_out_ptr = down_out.data_ptr();

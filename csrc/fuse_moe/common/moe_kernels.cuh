@@ -67,10 +67,11 @@ __global__ void count_seq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int
 }
 
 // 单 block 计算 cu_seqlens / tiles 前缀（cub BlockScan），同时把 seqlens
-// 清零供后续 build_indices 作为全局预留计数器复用。
+// 清零供后续 build_indices 作为全局预留计数器复用；顺带写出 cu_tiles
+//（tiles 的 exclusive 前缀，[num_group] = 总 tile 数 total_m，vert 调度用）。
 template <int kThreadPerBlock, int kGroupPerThread, int kTileM>
 __global__ void count_cuseq_kernel(int *seqlens_ptr, int *cu_seqlens_ptr, int *tiles_ptr,
-                                   int num_expert) {
+                                   int *cu_tiles_ptr, int num_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   int thread_seqs[kGroupPerThread];
@@ -110,10 +111,12 @@ __global__ void count_cuseq_kernel(int *seqlens_ptr, int *cu_seqlens_ptr, int *t
     int igroup = idx * kGroupPerThread + i;
     if (igroup < num_expert) {
       cu_seqlens_ptr[igroup] = thread_seqs[i];
+      cu_tiles_ptr[igroup] = thread_tiles[i];
     }
   }
   if (idx == 0) {
     cu_seqlens_ptr[num_expert] = seqs_aggregate;
+    cu_tiles_ptr[num_expert] = tiles_aggregate;
   }
 
   pdl_release();
@@ -174,7 +177,7 @@ __global__ void build_indices_kernel(const int *topk_ids_ptr, int *row_indices_p
 template <int kThreadPerBlock, int kGroupPerThread, int kTileM>
 __global__ void count_and_build_kernel(const int *topk_ids_ptr, int *row_indices_ptr,
                                        int *topk_pos_ptr, int *seqlens_ptr, int *cu_seqlens_ptr,
-                                       int *tiles_ptr, int num_seq, int num_topk,
+                                       int *tiles_ptr, int *cu_tiles_ptr, int num_seq, int num_topk,
                                        int total_num_topk, int num_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -226,10 +229,12 @@ __global__ void count_and_build_kernel(const int *topk_ids_ptr, int *row_indices
     int igroup = idx * kGroupPerThread + i;
     if (igroup < num_expert) {
       cu_seqlens_ptr[igroup] = thread_seqs[i];
+      cu_tiles_ptr[igroup] = thread_tiles[i];
     }
   }
   if (idx == 0) {
     cu_seqlens_ptr[num_expert] = seqs_aggregate;
+    cu_tiles_ptr[num_expert] = tiles_aggregate;
   }
 
   // Phase 3: 重置 smem 计数器并分配槽位
@@ -386,7 +391,8 @@ __global__ void gather_sorted_kernel(T *dst_ptr, const T *x_ptr, const int *row_
 // GEMM 按其迭代 itile_m）。输出 cu_seqlens（compact 前缀和）与 tiles。
 inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indices_ptr,
                                           int *topk_pos_ptr, int *seqlens_ptr,
-                                          int *cu_seqlens_ptr, int *tiles_ptr, int num_seq,
+                                          int *cu_seqlens_ptr, int *tiles_ptr,
+                                          int *cu_tiles_ptr, int num_seq,
                                           int num_topk, int num_expert, int tile_m, bool use_pdl,
                                           cudaStream_t stream) {
   constexpr int kThreadPerBlock = 256;
@@ -402,17 +408,17 @@ inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indi
       auto kernel = kernels::count_and_build_kernel<kThreadPerBlock, kGroupPerThread, 32>;
       launch_kernel_pdl(kernel, grid, block, smem, stream, use_pdl, topk_ids_ptr,
                         row_indices_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                        num_seq, num_topk, total_num_topk, num_expert);
+                        cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert);
     } else if (tile_m >= 128) {
       auto kernel = kernels::count_and_build_kernel<kThreadPerBlock, kGroupPerThread, 128>;
       launch_kernel_pdl(kernel, grid, block, smem, stream, use_pdl, topk_ids_ptr,
                         row_indices_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                        num_seq, num_topk, total_num_topk, num_expert);
+                        cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert);
     } else {
       auto kernel = kernels::count_and_build_kernel<kThreadPerBlock, kGroupPerThread, 64>;
       launch_kernel_pdl(kernel, grid, block, smem, stream, use_pdl, topk_ids_ptr,
                         row_indices_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                        num_seq, num_topk, total_num_topk, num_expert);
+                        cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert);
     }
     return;
   }
@@ -433,15 +439,15 @@ inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indi
     if (tile_m <= 32) {
       auto kernel = kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, 32>;
       launch_kernel_pdl(kernel, grid, block, 0, stream, use_pdl, seqlens_ptr, cu_seqlens_ptr,
-                        tiles_ptr, num_expert);
+                        tiles_ptr, cu_tiles_ptr, num_expert);
     } else if (tile_m >= 128) {
       auto kernel = kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, 128>;
       launch_kernel_pdl(kernel, grid, block, 0, stream, use_pdl, seqlens_ptr, cu_seqlens_ptr,
-                        tiles_ptr, num_expert);
+                        tiles_ptr, cu_tiles_ptr, num_expert);
     } else {
       auto kernel = kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, 64>;
       launch_kernel_pdl(kernel, grid, block, 0, stream, use_pdl, seqlens_ptr, cu_seqlens_ptr,
-                        tiles_ptr, num_expert);
+                        tiles_ptr, cu_tiles_ptr, num_expert);
     }
   }
 

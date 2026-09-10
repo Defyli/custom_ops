@@ -14,7 +14,9 @@
 //   2. fp8 权重/激活 + per-tensor scale → bf16/fp16 直入直出（无量化），
 //      MMA 累加器 fp32。
 //   3. 裁剪 EP 多卡与 TMA descriptor，调度用 kernel 内 horizon 扫描
-//      （移植自 hpc common.cuh get_next_tile_horizon）。
+//      （移植自 hpc common.cuh get_next_tile_horizon）；另含 vert 调度
+//      （移植自 hpc kernels.cuh get_next_tile_vert，N-major 遍历，W 面板跨
+//      M-band 复用；FUSE_MOE_SCHED=vert 启用，默认 horizon，见 launch 层）。
 //
 // 两个变体（同一 kernel 模板，kScatterA 区分）：
 //   - scatter（gate_up GEMM）：激活行按 row_indices 从原始 x (S, k) 中
@@ -88,6 +90,34 @@ __device__ __forceinline__ void get_next_tile_horizon(const int *tiles_ptr, int 
   igroup = -1;
 }
 
+// vert 调度（移植自 hpc kernels.cuh get_next_tile_vert）：N-major 遍历——
+// itile_m_total = iblock % total_m、itile_n = iblock / total_m，同 expert 的
+// 连续 M-band 落在相邻 CTA（共享同一 W 面板，L2 复用）；horizon 则是 M-major
+//（相邻 CTA 共享同一 X tile）。cu_tiles 为 tiles 的 exclusive 前缀，[num_group]
+// = total_m；二分定位 itile_m_total 所在 group（无状态，O(log E)）。适用于
+// W_per_expert = n·k 超出 L2 的场景（horizon 下 W 面板跨 band 重读距离 =
+// n·k，超 L2 即退化为每 band 一次 DRAM 重读）。
+__device__ __forceinline__ void get_next_tile_vert(const int *cu_tiles_ptr, int iblock,
+                                                   int num_group, int &igroup, int &itile_m,
+                                                   int &itile_n, int total_m) {
+  int itile_m_total = iblock % total_m;
+  itile_n = iblock / total_m;
+
+  int left = 0;
+  int right = num_group;
+  while (left <= right) {
+    int mid = left + (right - left) / 2;
+    if (cu_tiles_ptr[mid] > itile_m_total) {
+      right = mid - 1;
+    } else {
+      left = mid + 1;
+    }
+  }
+
+  itile_m = itile_m_total - cu_tiles_ptr[right];
+  igroup = right;
+}
+
 // scatter 激活装载（移植自 hpc scatter_load_A_tile，16-bit 适配）：按
 // 每线程寄存器行索引 gather 激活行，逐线程手写 16B cp.async.cg（src-size 语义：
 // 越界行拷 0 字节 = 零填充，语义同 ZFILL）。smem 目的地址取自 G2SCopy 的
@@ -151,7 +181,8 @@ __global__ void __launch_bounds__(Config::kNThreads, 1)
 group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
                   const int *row_indices_ptr,  // kScatterA 时非空
                   const int *seqlens_ptr, const int *cu_seqlens_ptr, const int *tiles_ptr,
-                  int n, int k, int num_group, cutlass::FastDivmod flat_divider) {
+                  const int *cu_tiles_ptr, int use_vert, int n, int k, int num_group,
+                  cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
   using Tin = typename Config::Tin;
   using Tout = typename Config::Tout;
@@ -182,8 +213,17 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
   // PDL acquire：等上游 kernel（count/act）写完 row_indices/tiles/cu_seqlens/x
   pdl_acquire();
 
-  for (int i = idx; i < num_group; i += kNThreads) {
-    shm_tiles[i] = tiles_ptr[i];
+  // 调度表驻 smem：horizon 用 tiles[E]（每 expert tile 数，线性扫描续位）；
+  // vert 用 cu_tiles[E+1]（exclusive 前缀，[E] = total_m，二分定位）。同一区域
+  // 复用，host 侧按 E+1 分配。
+  if (use_vert) {
+    for (int i = idx; i <= num_group; i += kNThreads) {
+      shm_tiles[i] = cu_tiles_ptr[i];
+    }
+  } else {
+    for (int i = idx; i < num_group; i += kNThreads) {
+      shm_tiles[i] = tiles_ptr[i];
+    }
   }
   __syncthreads();
 
@@ -254,6 +294,20 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
   int sched_igroup = 0;
   int sched_sum_tile_m = 0;
   auto pull_task = [&](TaskCtx &t) {
+    if (use_vert) {
+      // vert：N-major 无状态映射，耗尽 = itile_n 越过 N tile 数
+      //（flat_divider 除数即 num_tile_n）。
+      get_next_tile_vert(shm_tiles, iblock, num_group, sched_igroup, t.itile_m, t.itile_n,
+                         shm_tiles[num_group]);
+      iblock += gridDim.x;
+      t.valid = (t.itile_n < flat_divider.divisor);
+      if (t.valid) {
+        t.igroup = sched_igroup;
+        t.start_token = cu_seqlens_ptr[sched_igroup];
+        t.m = seqlens_ptr[sched_igroup];
+      }
+      return;
+    }
     // 已耗尽：直接返回，不得再扫——耗尽后 sched_igroup=-1，后续调用会
     // 从 i=-1 扫描（tiles_ptr[-1] 越界读 + sum_tile_m 污染累积），当污染
     // 和超过 itile_m_total 时会合成假任务（垃圾坐标 → 散射错误写，实测
@@ -455,11 +509,12 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
 //     的 DRAM 写+读）与独立 act_mul kernel。
 // smem：[sX (M,K,S)][sWg (64,K,S)][sWu (64,K,S)][sC 预留][shm_tiles]。
 // flat_divider = (n/2)/64（配对 tile 数，n = 2I）。
-template <typename Config>
+template <typename Config, bool kPairGateUp = true, bool kScatterA = kPairGateUp>
 __global__ void __launch_bounds__(Config::kNThreads, 1)
 group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
                          const int *row_indices_ptr, const int *seqlens_ptr,
-                         const int *cu_seqlens_ptr, const int *tiles_ptr, int n, int k,
+                         const int *cu_seqlens_ptr, const int *tiles_ptr,
+                         const int *cu_tiles_ptr, int use_vert, int n, int k,
                          int num_group, cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
   using Tin = typename Config::Tin;
@@ -472,8 +527,12 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
   constexpr int kStage = Config::kStage;
   constexpr int kNThreads = Config::kNThreads;
   constexpr int kNumSubK = kTileK / 16;
-  const int act_cols = n / 2;              // I（act_out 行宽）
-  const int up_tile_base = act_cols / 64;  // up 面板 tile 索引基（I/64）
+  const int act_cols = n / 2;                    // 仅 kPairGateUp：I（act_out 行宽）
+  const int up_tile_base = act_cols / 64;        // 仅 kPairGateUp：up 面板基（I/64）
+  const int out_stride = kPairGateUp ? act_cols : n;  // 输出行宽（act / 原始 n）
+  // 双面板 tile 索引：gate/up 配对（itile_n 与 I/64 基偏移）或相邻 N-pair
+  //（2i 与 2i+1，每 task 覆盖 2×kTileN 列）。flat_divider 除数同为 pair 数
+  //（(n/2)/64 == n/128）。
 
   extern __shared__ uint8_t shm_data[] alignas(128);
   Tin *xshm = reinterpret_cast<Tin *>(shm_data);
@@ -488,8 +547,17 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
 
   pdl_acquire();
 
-  for (int i = idx; i < num_group; i += kNThreads) {
-    shm_tiles[i] = tiles_ptr[i];
+  // 调度表驻 smem：horizon 用 tiles[E]（每 expert tile 数，线性扫描续位）；
+  // vert 用 cu_tiles[E+1]（exclusive 前缀，[E] = total_m，二分定位）。同一区域
+  // 复用，host 侧按 E+1 分配。
+  if (use_vert) {
+    for (int i = idx; i <= num_group; i += kNThreads) {
+      shm_tiles[i] = cu_tiles_ptr[i];
+    }
+  } else {
+    for (int i = idx; i < num_group; i += kNThreads) {
+      shm_tiles[i] = tiles_ptr[i];
+    }
   }
   __syncthreads();
 
@@ -548,6 +616,20 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
   int sched_igroup = 0;
   int sched_sum_tile_m = 0;
   auto pull_task = [&](TaskCtx &t) {
+    if (use_vert) {
+      // vert：N-major 无状态映射，耗尽 = itile_n 越过配对 tile 数
+      //（flat_divider 除数即 (n/2)/64）。
+      get_next_tile_vert(shm_tiles, iblock, num_group, sched_igroup, t.itile_m, t.itile_n,
+                         shm_tiles[num_group]);
+      iblock += gridDim.x;
+      t.valid = (t.itile_n < flat_divider.divisor);
+      if (t.valid) {
+        t.igroup = sched_igroup;
+        t.start_token = cu_seqlens_ptr[sched_igroup];
+        t.m = seqlens_ptr[sched_igroup];
+      }
+      return;
+    }
     // 任务流已耗尽时直接返回：get_next_tile_horizon 耗尽时把 igroup 置 -1，
     // 后续调用会从 i=-1 扫描（tiles_ptr[-1] 越界读 + sum_tile_m 污染累积），
     // 当污染和超过 itile_m_total 时会合成假任务（垃圾坐标 → 散射错误写）。
@@ -569,8 +651,8 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
 
   constexpr int kNumRowIters =
       (kTileM + Config::kRowsPerIter - 1) / Config::kRowsPerIter;
-  int rows_cur[kNumRowIters];
-  int rows_next[kNumRowIters];
+  [[maybe_unused]] int rows_cur[kNumRowIters];
+  [[maybe_unused]] int rows_next[kNumRowIters];
   auto load_my_rows = [&](const TaskCtx &t, int (&rows)[kNumRowIters]) {
     const int row_in_group = idx / Config::kThreadsPerRow;
     const int nvalid_raw = t.m - t.itile_m * kTileM;
@@ -587,20 +669,41 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
     Tensor W = make_tensor(
         make_gmem_ptr((Tin const *)Wptr + uint64_t(t.igroup) * n * k),
         make_shape(n, k), make_stride(k, Int<1>{}));
+    const int nt0 = kPairGateUp ? t.itile_n : 2 * t.itile_n;
+    const int nt1 = kPairGateUp ? (up_tile_base + t.itile_n) : (2 * t.itile_n + 1);
     Tensor gWg = local_tile(W, make_tile(Int<kTileN>{}, Int<kTileK>{}),
-                            make_coord(t.itile_n, _));
+                            make_coord(nt0, _));
     Tensor gWu = local_tile(W, make_tile(Int<kTileN>{}, Int<kTileK>{}),
-                            make_coord(up_tile_base + t.itile_n, _));
+                            make_coord(nt1, _));
     auto tgWg_copy = g2s_thr_copy.partition_S(gWg);
     auto tgWu_copy = g2s_thr_copy.partition_S(gWu);
-    const int num_valid_raw = t.m - t.itile_m * kTileM;
-    const int num_valid = num_valid_raw < kTileM ? num_valid_raw : kTileM;
-    if (num_valid == kTileM) {
-      scatter_load_x_tile<Config, /*kFullTile=*/true>(
-          tsX_copy, (Tin const *)Xptr, rows, num_valid, itile_k * kTileK, k, istage);
+    if constexpr (kScatterA) {
+      const int num_valid_raw = t.m - t.itile_m * kTileM;
+      const int num_valid = num_valid_raw < kTileM ? num_valid_raw : kTileM;
+      if (num_valid == kTileM) {
+        scatter_load_x_tile<Config, /*kFullTile=*/true>(
+            tsX_copy, (Tin const *)Xptr, rows, num_valid, itile_k * kTileK, k, istage);
+      } else {
+        scatter_load_x_tile<Config, /*kFullTile=*/false>(
+            tsX_copy, (Tin const *)Xptr, rows, num_valid, itile_k * kTileK, k, istage);
+      }
     } else {
-      scatter_load_x_tile<Config, /*kFullTile=*/false>(
-          tsX_copy, (Tin const *)Xptr, rows, num_valid, itile_k * kTileK, k, istage);
+      // 连续 A（gemm2：compact act_out），M 尾部谓词 + ZFILL——同
+      // group_gemm_kernel 的非 scatter 分支（K/N 维整除无谓词）
+      Tensor A = make_tensor(
+          make_gmem_ptr((Tin const *)Xptr + uint64_t(t.start_token) * k),
+          make_shape(t.m, k), make_stride(k, Int<1>{}));
+      Tensor gA = local_tile(A, make_tile(Int<kTileM>{}, Int<kTileK>{}),
+                             make_coord(t.itile_m, _));
+      auto tgA_copy = g2s_thr_copy.partition_S(gA);
+      auto tIA = g2s_thr_copy.partition_S(
+          make_identity_tensor(make_shape(Int<kTileM>{}, Int<kTileK>{})));
+      auto pred_x = make_tensor<bool>(shape(tIA));
+#pragma unroll
+      for (int i = 0; i < size(tIA); ++i) {
+        pred_x(i) = t.itile_m * kTileM + get<0>(tIA(i)) < t.m;
+      }
+      cute::copy_if(g2s_copy, pred_x, tgA_copy(_, _, _, itile_k), tsX_copy(_, _, _, istage));
     }
     cute::copy(g2s_copy, tgWg_copy(_, _, _, itile_k), tsWg_copy(_, _, _, istage));
     cute::copy(g2s_copy, tgWu_copy(_, _, _, itile_k), tsWu_copy(_, _, _, istage));
@@ -614,8 +717,10 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
 
   pull_task(Tc);
   pull_task(Tn);
-  load_my_rows(Tc, rows_cur);
-  if (Tn.valid) load_my_rows(Tn, rows_next);
+  if constexpr (kScatterA) {
+    load_my_rows(Tc, rows_cur);
+    if (Tn.valid) load_my_rows(Tn, rows_next);
+  }
 
   auto issue_step = [&]() {
     if (iss_kk >= ntile && !iss_is_next) {
@@ -661,42 +766,75 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
       __syncthreads();  // sync#2：读取完成，下一迭代的发射才可覆写该 stage
     }
 
-    // 融合 epilogue：silu(gate)·up（fp32）→ Tout → sC → 行谓词 16B
-    // 向量化写 act_out (T, I)。⚠️ fragment 配对正确性依赖：tYr_g/tYr_u
-    // 来自同一 tiled_mma + 同一 B 分区的两次 gemm ⇒ 索引 i 映射到相同
-    // (m_row, n_col)，仅 W 数据源（gate/up 面板）不同。
-    auto tActc = make_tensor<Tout>(shape(tYr_g));
-#pragma unroll
-    for (int i = 0; i < size(tYr_g); ++i) {
-      tActc(i) = static_cast<Tout>(silu(tYr_g(i)) * tYr_u(i));
-    }
-    cute::copy(tiled_copy_c, thr_copy_c.retile_S(tActc), tCs4g);
-    __syncthreads();
-
-    {
+    // 融合 epilogue。⚠️ fragment 配对正确性依赖：tYr_g/tYr_u 来自同一
+    // tiled_mma + 同一 B 分区的两次 gemm ⇒ 索引 i 映射到相同 (m_row,
+    // n_col)，仅 W 数据源（两面板）不同。
+    //  - kPairGateUp：silu(gate)·up（fp32）→ 单块写 act_out (T, I)
+    //  - 相邻 N-pair：两块独立直写 (T, n)，列基 itile_n×(2×kTileN) 与 +64
+    //    （gemm2 的宽 N 变体：每 task 覆盖 128 列，per-slab MMA 密度 ×2，
+    //    低 occupancy 下加深延迟掩盖——与 gate/up 配对同杠杆）
+    auto write_c_block = [&](const Tout *y_base, int col_base, int row_base, int m) {
       constexpr int kVecElems = 16 / int(sizeof(Tout));  // 8
       const int nvec = kTileN / kVecElems;
-      Tout *y_base = reinterpret_cast<Tout *>(ActPtr) + uint64_t(Tc.start_token) * act_cols;
-      const int col_base = Tc.itile_n * kTileN;
-      const int row_base = Tc.itile_m * kTileM;
 #pragma unroll 1
       for (int i = idx; i < kTileM * nvec; i += kNThreads) {
         const int r = i / nvec;
         const int c8 = (i % nvec) * kVecElems;
-        if (row_base + r < Tc.m) {
-          *reinterpret_cast<uint4 *>(y_base + uint64_t(row_base + r) * act_cols + col_base + c8) =
+        if (row_base + r < m) {
+          *reinterpret_cast<uint4 *>(
+              const_cast<Tout *>(y_base) + uint64_t(row_base + r) * out_stride + col_base + c8) =
               *reinterpret_cast<const uint4 *>(&sC(c8, r));
         }
       }
+    };
+
+    if constexpr (kPairGateUp) {
+      auto tActc = make_tensor<Tout>(shape(tYr_g));
+#pragma unroll
+      for (int i = 0; i < size(tYr_g); ++i) {
+        tActc(i) = static_cast<Tout>(silu(tYr_g(i)) * tYr_u(i));
+      }
+      cute::copy(tiled_copy_c, thr_copy_c.retile_S(tActc), tCs4g);
+      __syncthreads();
+
+      Tout *y_base = reinterpret_cast<Tout *>(ActPtr) + uint64_t(Tc.start_token) * out_stride;
+      write_c_block(y_base, Tc.itile_n * kTileN, Tc.itile_m * kTileM, Tc.m);
+      __syncthreads();  // sC 读取完成（下一 task 的 r2s 覆写前分隔）
+    } else {
+      // panel 0
+      auto tYc0 = make_tensor<Tout>(shape(tYr_g));
+#pragma unroll
+      for (int i = 0; i < size(tYr_g); ++i) {
+        tYc0(i) = static_cast<Tout>(tYr_g(i));
+      }
+      cute::copy(tiled_copy_c, thr_copy_c.retile_S(tYc0), tCs4g);
+      __syncthreads();
+
+      Tout *y_base = reinterpret_cast<Tout *>(ActPtr) + uint64_t(Tc.start_token) * out_stride;
+      write_c_block(y_base, Tc.itile_n * (2 * kTileN), Tc.itile_m * kTileM, Tc.m);
+      __syncthreads();  // sC 读取完成，panel 1 的 r2s 才可覆写
+
+      // panel 1
+      auto tYc1 = make_tensor<Tout>(shape(tYr_u));
+#pragma unroll
+      for (int i = 0; i < size(tYr_u); ++i) {
+        tYc1(i) = static_cast<Tout>(tYr_u(i));
+      }
+      cute::copy(tiled_copy_c, thr_copy_c.retile_S(tYc1), tCs4g);
+      __syncthreads();
+
+      write_c_block(y_base, Tc.itile_n * (2 * kTileN) + kTileN, Tc.itile_m * kTileM, Tc.m);
+      __syncthreads();
     }
-    __syncthreads();  // sC 读取完成（下一 task 的 r2s 覆写前分隔）
 
     Tc = Tn;
     pull_task(Tn);
     iss_is_next = false;
+    if constexpr (kScatterA) {
 #pragma unroll
-    for (int i = 0; i < kNumRowIters; ++i) rows_cur[i] = rows_next[i];
-    if (Tn.valid) load_my_rows(Tn, rows_next);
+      for (int i = 0; i < kNumRowIters; ++i) rows_cur[i] = rows_next[i];
+      if (Tn.valid) load_my_rows(Tn, rows_next);
+    }
   }
 
   pdl_release();
@@ -712,7 +850,8 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
 void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                       const void *row_indices_ptr,  // nullptr → 非 scatter（down GEMM）
                       const void *seqlens_ptr, const void *cu_seqlens_ptr,
-                      const void *tiles_ptr, int n, int k, int num_group,
+                      const void *tiles_ptr, const void *cu_tiles_ptr, bool use_vert,
+                      int n, int k, int num_group,
                       int tile_m, bool is_half, bool use_pdl,
                       cudaStream_t stream) {
   using namespace cute;  // NOLINT
@@ -746,7 +885,7 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
     constexpr int kNThreads = GemmConfig::kNThreads;
     const int shm_size =
         GemmConfig::shm_xw + GemmConfig::shm_c_alloc +
-        num_group * static_cast<int>(sizeof(int));
+        (num_group + 1) * static_cast<int>(sizeof(int));  // 调度表（tiles 或 cu_tiles）
 
     auto kernel = scatter ? kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/true>
                           : kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/false>;
@@ -761,8 +900,9 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                       w_ptr, reinterpret_cast<const int *>(row_indices_ptr),
                       reinterpret_cast<const int *>(seqlens_ptr),
                       reinterpret_cast<const int *>(cu_seqlens_ptr),
-                      reinterpret_cast<const int *>(tiles_ptr), n, k, num_group,
-                      flat_divider);
+                      reinterpret_cast<const int *>(tiles_ptr),
+                      reinterpret_cast<const int *>(cu_tiles_ptr), use_vert ? 1 : 0, n, k,
+                      num_group, flat_divider);
   };
 
   auto dispatch_m = [&](auto t_tag) {
@@ -803,8 +943,9 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
 // 由跨 tile 连续流水补偿）。
 void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void *w_ptr,
                                    const void *row_indices_ptr, const void *seqlens_ptr,
-                                   const void *cu_seqlens_ptr, const void *tiles_ptr, int n,
-                                   int k, int num_group, int tile_m, bool is_half, bool use_pdl,
+                                   const void *cu_seqlens_ptr, const void *tiles_ptr,
+                                   const void *cu_tiles_ptr, bool use_vert, int n, int k,
+                                   int num_group, int tile_m, bool is_half, bool use_pdl,
                                    cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
@@ -832,7 +973,8 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
     // operands = X + 2×W 面板 = shm_xw + 额外一个 W 面板
     const int shm_size =
         GemmConfig::shm_xw + static_cast<int>(sizeof(T)) * 64 * kTileK * kStage +
-        GemmConfig::shm_c_alloc + num_group * static_cast<int>(sizeof(int));
+        GemmConfig::shm_c_alloc +
+        (num_group + 1) * static_cast<int>(sizeof(int));  // 调度表（tiles 或 cu_tiles）
     // 防回归：双面板预算必须落在 sm120 每块动态 smem 硬限内（超限的
     // launch 静默失败 → 输出 NaN，见 dispatch_k 的降级注释）
     assert(shm_size <= 101376);
@@ -849,8 +991,9 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
                       w_ptr, reinterpret_cast<const int *>(row_indices_ptr),
                       reinterpret_cast<const int *>(seqlens_ptr),
                       reinterpret_cast<const int *>(cu_seqlens_ptr),
-                      reinterpret_cast<const int *>(tiles_ptr), n, k, num_group,
-                      flat_divider);
+                      reinterpret_cast<const int *>(tiles_ptr),
+                      reinterpret_cast<const int *>(cu_tiles_ptr), use_vert ? 1 : 0, n, k,
+                      num_group, flat_divider);
   };
 
   auto dispatch_m = [&](auto t_tag) {
@@ -859,6 +1002,96 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
       //（仅 M32：90KB ✓）；M64/K128 需 104KB、M128/K128 需 148KB，均超
       // sm120 每块动态 smem 硬限 101376B（launch 失败 → 输出未定义），
       // 降级 K64。
+      constexpr int kTileM_v = decltype(m_tag)::value;
+      constexpr bool k128_fits =
+          ((kTileM_v + 2 * 64) * 128 * 2 * 2 +
+           (kTileM_v < 64 ? 64 : kTileM_v) * 64 * 2) <= (96 * 1024);
+      if (k % 128 == 0 && k128_fits) {
+        launch(t_tag, m_tag, Int<128>{});
+      } else {
+        launch(t_tag, m_tag, Int<64>{});
+      }
+    };
+    if (tile_m >= 128) {
+      dispatch_k(Int<128>{});
+    } else if (tile_m <= 32) {
+      dispatch_k(Int<32>{});
+    } else {
+      dispatch_k(Int<64>{});
+    }
+  };
+
+  if (is_half) {
+    dispatch_m(config::TypeTag<cutlass::half_t>{});
+  } else {
+    dispatch_m(config::TypeTag<cutlass::bfloat16_t>{});
+  }
+}
+
+// ── gemm2 宽 N 入口（相邻 N-pair，FUSE_MOE_TILE_N=128）────────────────
+// gemm2 的 TileN=128 变体：每 task 覆盖相邻两个 64 宽 N 面板（共享同一 X
+// tile / 同一 smem stage），per-slab MMA 密度 ×2——与 gemm1 的 gate/up 配对
+// 同杠杆，针对 ncu 实测的 gemm2 短板（occupancy 16.7% × kStage=3 浅流水下
+// 的延迟掩盖不足，L2 命中 97% / DRAM 15% 说明并非带宽瓶颈）。A 为连续
+//（compact act_out，M 尾部谓词 ZFILL）。预算与 gateup 同公式：M64/K64→3
+// 级（80KB）、M32/K64→4 级、M128/K64→2 级；K128 仅 M32 可客纳。
+void group_gemm_wide_n_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
+                             const void *seqlens_ptr, const void *cu_seqlens_ptr,
+                             const void *tiles_ptr, const void *cu_tiles_ptr, bool use_vert,
+                             int n, int k, int num_group, int tile_m, bool is_half,
+                             bool use_pdl, cudaStream_t stream) {
+  using namespace cute;  // NOLINT
+
+  assert(n % 128 == 0 && "wide_n: n must be a multiple of 2*kTileN=128");
+  assert(k % 64 == 0 && "wide_n: k must be a multiple of 64");
+  assert(tile_m == 32 || tile_m == 64 || tile_m == 128);
+
+  cutlass::FastDivmod flat_divider(n / 128);  // N-pair 数
+
+  auto launch = [&](auto t_tag, auto m_tag, auto k_tag) {
+    using T = typename decltype(t_tag)::type;
+    constexpr int kTileM = decltype(m_tag)::value;
+    constexpr int kTileK = decltype(k_tag)::value;
+    constexpr int kStage = [] {
+      constexpr int bps = (kTileM + 2 * 64) * kTileK * 2;         // X + 双 W 面板
+      constexpr int sc = (kTileM < 64 ? 64 : kTileM) * 64 * 2;   // sC 预留区
+      constexpr int s = (96 * 1024 - sc) / bps;
+      return (s > 6) ? 6 : ((s < 2) ? 2 : s);
+    }();
+    using GemmConfig = config::MoEGemmConfig<T, kTileM, 64, kTileK, kStage>;
+
+    constexpr int kNThreads = GemmConfig::kNThreads;
+    // operands = X + 2×W 面板（同 gateup：shm_xw + 额外一个 W 面板）
+    const int shm_size =
+        GemmConfig::shm_xw + static_cast<int>(sizeof(T)) * 64 * kTileK * kStage +
+        GemmConfig::shm_c_alloc +
+        (num_group + 1) * static_cast<int>(sizeof(int));  // 调度表（tiles 或 cu_tiles）
+    assert(shm_size <= 101376);
+
+    auto kernel =
+        kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/false,
+                                          /*kScatterA=*/false>;
+
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int max_blocks = 1;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks, kernel, kNThreads, shm_size);
+    if (max_blocks < 1) max_blocks = 1;
+    dim3 grid(static_cast<unsigned>(get_sm_count() * max_blocks));
+
+    launch_kernel_pdl(kernel, grid, dim3(kNThreads), shm_size, stream, use_pdl, y_ptr,
+                      x_ptr, w_ptr,
+                      /*row_indices=*/nullptr,
+                      reinterpret_cast<const int *>(seqlens_ptr),
+                      reinterpret_cast<const int *>(cu_seqlens_ptr),
+                      reinterpret_cast<const int *>(tiles_ptr),
+                      reinterpret_cast<const int *>(cu_tiles_ptr), use_vert ? 1 : 0, n, k,
+                      num_group, flat_divider);
+  };
+
+  auto dispatch_m = [&](auto t_tag) {
+    auto dispatch_k = [&](auto m_tag) {
+      // K=128 门控：双 W 面板 + 2 级流水 + sC 预留须落在 96KB 预算内
+      //（仅 M32：88KB ✓）
       constexpr int kTileM_v = decltype(m_tag)::value;
       constexpr bool k128_fits =
           ((kTileM_v + 2 * 64) * 128 * 2 * 2 +

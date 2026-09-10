@@ -27,6 +27,14 @@
  * 环境开关：
  *   FUSE_MOE_TMA=1    sm120 上启用 TMA 引擎（可选路径）
  *   FUSE_MOE_TILE_M   强制 kTileM：32 / 64 / 128（128 仅 cp.async 引擎）
+ *   FUSE_MOE_TILE_N   gemm2 N 宽度：默认 128（相邻 N-pair 变体，
+ *                     per-slab MMA 密度 ×2，实测全 shape 谱系优 2.3–2.9%；
+ *                     hidden%128!=0 自动回退 64）＝64 可强制回基线（对比用）
+ *   FUSE_MOE_SCHED    cp.async 引擎的 task 遍历序：horizon（默认，M-major，
+ *                     相邻 CTA 共享 X tile）/ vert（N-major，同 expert 连续
+ *                     M-band 相邻，共享 W 面板；适用于 W_per_expert = n·k
+ *                     超出 L2 的大 N 大 K 形状。移植自 hpc-ops TMA 家族，
+ *                     cp.async 家族上游仅有 horizon）
  *   FUSE_MOE_NO_PDL   强制普通 launch（分段计时归因用）
  *   FUSE_MOE_TIME=1   流水线分段计时（各 kernel wall time）
  */
@@ -58,12 +66,14 @@ inline void moe_launch_sm8x_impl(FMOE_params &params, cudaStream_t stream) {
     const int intermediate2 = params.intermediate * 2;
     const bool is_half = !params.is_bf16;
 
-    // ① count / build indices（row_indices / topk_pos / cu_seqlens / tiles）
+    // ① count / build indices（row_indices / topk_pos / cu_seqlens / tiles /
+    //    cu_tiles）
     FM_DEBUG_MARK("count_and_build");
     count_and_build_indices_async(params.topk_ids_ptr, params.row_indices_ptr,
                                   params.topk_pos_ptr, params.seqlens_ptr, params.cu_seqlens_ptr,
-                                  params.tiles_ptr, params.num_seq, params.num_topk,
-                                  params.num_expert, params.tile_m, params.use_pdl, stream);
+                                  params.tiles_ptr, params.cu_tiles_ptr, params.num_seq,
+                                  params.num_topk, params.num_expert, params.tile_m,
+                                  params.use_pdl, stream);
 
     // ② gemm1 融合：gate/up 配对 N-tile + silu·mul epilogue，直写
     //    act_out (T, I)——免 gate_up_out (T, 2I) 物化与独立 act_mul kernel
@@ -72,17 +82,30 @@ inline void moe_launch_sm8x_impl(FMOE_params &params, cudaStream_t stream) {
     FM_DEBUG_MARK("gemm1_fused");
     group_gemm::group_gemm_gateup_fused_async(
         params.act_out_ptr, params.x_ptr, params.w1_ptr, params.row_indices_ptr,
-        params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr,
+        params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+        params.use_vert_sched,
         /*n=*/intermediate2, /*k=*/params.hidden, params.num_expert, params.tile_m, is_half,
         params.use_pdl, stream);
 
-    // ③ down group GEMM（cp.async multistage：激活连续）
+    // ③ down group GEMM（cp.async multistage：激活连续；默认相邻 N-pair
+    //    变体 per-slab MMA 密度 ×2，hidden%128!=0 或 FUSE_MOE_TILE_N=64
+    //    时回退基线）
     FM_DEBUG_MARK("gemm2_cp");
-    group_gemm::group_gemm_async(
-        params.down_out_ptr, params.act_out_ptr, params.w2_ptr, /*row_indices=*/nullptr,
-        params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr,
-        /*n=*/params.hidden, /*k=*/params.intermediate, params.num_expert, params.tile_m, is_half,
-        params.use_pdl, stream);
+    if (params.use_wide_n && params.hidden % 128 == 0) {
+        group_gemm::group_gemm_wide_n_async(
+            params.down_out_ptr, params.act_out_ptr, params.w2_ptr, params.seqlens_ptr,
+            params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+            params.use_vert_sched,
+            /*n=*/params.hidden, /*k=*/params.intermediate, params.num_expert, params.tile_m,
+            is_half, params.use_pdl, stream);
+    } else {
+        group_gemm::group_gemm_async(
+            params.down_out_ptr, params.act_out_ptr, params.w2_ptr, /*row_indices=*/nullptr,
+            params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+            params.use_vert_sched,
+            /*n=*/params.hidden, /*k=*/params.intermediate, params.num_expert, params.tile_m,
+            is_half, params.use_pdl, stream);
+    }
 
     // ④ topk 加权 reduce
     FM_DEBUG_MARK("reduce");
@@ -136,8 +159,9 @@ inline void moe_launch_sm120_impl(FMOE_params &params, cudaStream_t stream) {
     FM_DEBUG_MARK("count_and_build");
     count_and_build_indices_async(params.topk_ids_ptr, params.row_indices_ptr,
                                   params.topk_pos_ptr, params.seqlens_ptr, params.cu_seqlens_ptr,
-                                  params.tiles_ptr, params.num_seq, params.num_topk,
-                                  params.num_expert, params.tile_m, params.use_pdl, stream);
+                                  params.tiles_ptr, params.cu_tiles_ptr, params.num_seq,
+                                  params.num_topk, params.num_expert, params.tile_m,
+                                  params.use_pdl, stream);
 
     // ②a gather：x → x_sorted（expert 有序 compact，TMA gemm1 的 A 前提）
     FM_DEBUG_MARK("gather_sorted");
@@ -202,6 +226,18 @@ inline void moe_fwd_launch(FMOE_params &params, cudaStream_t stream) {
     const int major = arch_targets::gpu_major();
 
     params.use_pdl = (major >= 9) && (std::getenv("FUSE_MOE_NO_PDL") == nullptr);
+    // task 遍历序（仅 cp.async 引擎消费；见文件头 FUSE_MOE_SCHED 说明）
+    {
+        const char *sched = std::getenv("FUSE_MOE_SCHED");
+        params.use_vert_sched = (sched != nullptr && std::string(sched) == "vert");
+    }
+    // gemm2 宽 N 变体：默认启用（ncu 归因 gemm2 延迟掩盖不足后引入，
+    // 4090D 实测全 shape 谱系 e2e 优 2.3–2.9%）；FUSE_MOE_TILE_N=64 强制
+    // 回基线，hidden%128==0 在调用点校验。
+    {
+        const char *tn = std::getenv("FUSE_MOE_TILE_N");
+        params.use_wide_n = !(tn != nullptr && std::string(tn) == "64");
+    }
     params.marks.bind(stream);
 
 #if FA_HAS_SM120

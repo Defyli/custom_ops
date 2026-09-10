@@ -114,6 +114,8 @@ struct FMOE_params {
     int *seqlens_ptr;      // (E)
     int *cu_seqlens_ptr;   // (E+1) compact 前缀和
     int *tiles_ptr;        // (E) 每 expert 的 kTileM tile 数
+    int *cu_tiles_ptr;     // (E+1) tiles 的 exclusive 前缀和；[E] = total_m
+                           //（vert 调度用，见 sm89/group_gemm_sm89.cuh）
     void *gate_up_out_ptr;  // (T, 2I)，仅 TMA 家族
     void *act_out_ptr;      // (T, I)
     void *down_out_ptr;     // (T, H)
@@ -131,6 +133,12 @@ struct FMOE_params {
 
     // 策略（fuse_moe_launch 分发时填写）
     int tile_m;    // count/GEMM 共用 kTileM（moe_pick_tile_m）
+    bool use_vert_sched;  // task 调度序：false=horizon（M-major，默认）；
+                          // true=vert（N-major，W 面板跨 M-band 复用；
+                          // FUSE_MOE_SCHED=vert A/B 用，见 launch 层）
+    bool use_wide_n;      // gemm2 相邻 N-pair 变体（每 task 覆盖 128 列，
+                          // per-slab MMA 密度 ×2；默认启用，仅 hidden%128==0
+                          // 时生效，FUSE_MOE_TILE_N=64 可强制关闭）
     bool use_pdl;  // sm90+ 硬件且未设 FUSE_MOE_NO_PDL
 
     // 分段计时（FUSE_MOE_TIME）

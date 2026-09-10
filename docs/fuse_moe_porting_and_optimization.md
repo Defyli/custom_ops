@@ -126,6 +126,25 @@ kTileM=128 将每 M-tile 装载的 W 复用面扩大一倍（W 流量随 task �
 - 16384 case：2322 → **2187µs**（gemm1_fused 1432 → 1322µs）
 - 4096×4096×1408：1633 → **1490.8µs，190.1 TFLOPS**（mma.sync 峰值的 91%）
 
+### Phase 7：ncu 归因 gemm2 延迟掩盖不足 → 相邻 N-pair（TileN=128）
+
+sm89 移植完成后的后续优化（4090D，ncu 2025.1，sudo 计数器权限）。
+
+**归因**（S=16384，gemm1 vs gemm2 对照）：两者占用率同为 16.67%（smem 限制每 SM 仅驻 1 CTA，8 warps），带宽均不缺（gemm2 L2 命中 97.1%、DRAM 15%）——gemm1 的 92% vs gemm2 的 85% 差在**每 slab 的 compute 密度**：gemm1 双 MMA（gate/up 配对）共享一次装载，同样的 kStage 深度下延迟掩盖预算等效翻倍；gemm2 单 MMA + kStage=3，每发射指令等待 16.26 周期。**不是带宽问题，是延迟掩盖问题**。
+
+**方案**：把 gemm1 的配对杠杆复制到 gemm2——每 task 覆盖相邻两个 64 宽 N 面板（共享同一 X tile / 同一 smem stage），per-slab MMA 密度 ×2。实现零新骨架：`group_gemm_gateup_kernel` 泛化为 `kPairGateUp × kScatterA` 双模板维（gate/up 半区配对 scatter / 相邻 N-pair 连续 A），预算同公式（M64/K64→S3、M128/K64→S2）。默认启用，`hidden%128!=0` 自动回退，`FUSE_MOE_TILE_N=64` 强制回基线。
+
+**实测**（4090D，全 shape 谱系 gemm2 单核 -6.7~-7.6%，e2e -2.3~-2.7%）：
+
+| S (H=2048) | gemm2 旧 | gemm2 N-pair | e2e 旧 | e2e 新 |
+|---:|---:|---:|---:|---:|
+| 512 | 59µs | 57µs | 186µs | 184µs |
+| 1024 | 106µs | 98µs | 315µs | 306µs |
+| 4096 | 341µs | 315µs | 990µs | 965µs |
+| 16384 | 1233µs | 1151µs | 3713µs | 3627µs |
+
+5090D 同路径受益：16384 case 2187→2133µs（193.3 TF），峰值 190.1→**194.3 TF**。一个测量教训：首轮 full benchmark 中 (4096,4096,1408) 显示 N-pair 慢 3.5%，三轮背靠背复测实为**稳定快 2.0%**（旧基线 run 恰逢高 boost 时段，时钟漂移 6%）——单次跨 run 对比在 ±5% 量级时必须复测。
+
 ![优化演进](assets/fuse_moe_evolution.png)
 
 ---
@@ -152,6 +171,18 @@ RTX 5090D（sm_120a，bf16，PyTorch 2.6 / CUDA 12.8；`vs FG` 为 `torch.compil
 ![引擎与 tile 选择](assets/fuse_moe_engines.png)
 
 各环节效率水位（16384 case）：gemm1_fused ≈208 TFLOPS（mma.sync 峰值 209.5 的 ≈99%）、gemm2 ≈185（88%）、reduce 1.54TB/s（DRAM 峰值的 86%）——三者均接近各自瓶颈，剩余可优化空间主要在 reduce 与 gemm2 epilogue 的融合（需接受 bf16 累加精度权衡，未启用）。
+
+### 4.1 调度遍历序消融：horizon vs vert（4090D）
+
+hpc-ops 的 TMA 家族另有 vert 调度（`get_next_tile_vert`，host 门控 k>1024 且 n>1024 时选用；cp_async 家族上游仅有 horizon）。两者本质是「哪个操作数驻留 L2」的抉择：horizon 为 N-minor（同 M-tile 扫完全部 N，相邻任务**共享 X tile**）；vert 为 M-minor（同 N-tile 扫完全部 M-band，相邻任务**共享 W 面板**）。移植成 `FUSE_MOE_SCHED=vert` 可选路径后做了背靠背 A/B（`FUSE_MOE_TIME` 分段计时，稳态中位数）：
+
+| shape（4090D, bf16） | horizon µs | vert µs | vert vs horizon |
+|---|---:|---:|---:|
+| 16384, H=2048（k=n=2048，hpc 门控会选 vert） | 3711 | 3778 | **-1.8%** |
+| 4096, E=64, K=8（W 总量 806MB ≫ 72MB L2） | 4079 | 4212 | **-3.3%** |
+| 4096, H=4096, I=1408（W_per_expert 最大 23MB） | 2682 | 2706 | **-0.9%** |
+
+**结论：本仓 shape 族上 vert 全败，horizon 保持默认**。原因不在调度器实现而在容量账：vert 的收益前提是「W 面板在 horizon 的跨 band 重读距离内无法 L2 驻留」，而 MoE FFN 的 W_per_expert = n·k·2B 在典型形状（≤4096×4096）下为 4–23MB，远小于 4090D 的 72MB L2——收益机制不存在；代价却是真实的（X 复用被破坏 + 二分定位开销）。hpc-ops 的 1024 门控是其 fp8/特定 GPU（H100 50MB L2）上的定标，不可直接搬。vert 保留为可选路径：若未来遇到 W_per_expert > L2 的形状（超大 I/H），可直接打开验证。教训：**调度序选择应由「per-expert 面板尺寸 vs L2 容量」裁决，而非绝对 K/N 值**。
 
 ---
 

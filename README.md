@@ -343,31 +343,31 @@ mixed **8.0e-3** vs bf16 1.2e-2；RMS 误差 **1.7e-3** vs 4.0e-3（低 2.3x）�
 3–15%）；`FUSE_MOE_TMA=1` 可选切换 TMA + mbarrier 引擎（16384 case
 2807µs vs 默认 2197µs）。sm89（RTX 4090D）走同一 cp.async 路径。
 
-大 shape 有效算力 **171–190 TFLOPS**（mma.sync 峰值的 82–91%）；
-vs eager **1.9–14.8x**，vs `torch.compile` **1.4–2.5x**，vs
-compile+reduce-overhead（CUDA graph）最高 **98x**；vs sglang 生产
-Triton MoE（本机 tuned，`benchmark/benchmark_fuse_moe_vs_sglang.py` +
-自包含移植包 `benchmark/sglang_triton_moe/`，无需安装 sglang）
-**5090D 1.3–4.9x / 4090D 1.1–3.9x**（小 batch 2.3–4.9x，大 batch
-1.1–1.7x，详见 docs 第 5 节）。
+大 shape 有效算力 **171–194 TFLOPS**（mma.sync 峰值的 82–94%；峰值 194.3 TF
+@4096×4096×1408，含 gemm2 相邻 N-pair 变体）；vs eager **1.9–14.8x**，vs
+`torch.compile` **1.4–2.5x**，vs compile+reduce-overhead（CUDA graph）最高
+**98x**；vs sglang 生产 Triton MoE（本机 tuned，
+`benchmark/benchmark_fuse_moe_vs_sglang.py` + 自包含移植包
+`benchmark/sglang_triton_moe/`，无需安装 sglang）
+**5090D 1.3–5.2x / 4090D 1.1–3.9x**（详见 docs 第 5 节）。
 
 5090D（sm120）：
 
 | Shape (S,H,I,E,K) | custom µs | sglang-def µs | sglang-tuned µs | vs tuned |
 |---|---|---|---|---|
-| (512,2048,1024,8,2) | 102.1 | 505.9 | 498.7 | **4.9x** |
-| (1024,2048,1024,8,2) | 175.3 | 518.3 | 529.5 | 3.0x |
-| (4096,2048,1024,8,2) | 574.3 | 949.9 | 956.4 | 1.7x |
-| (16384,2048,1024,8,2) | 2175.4 | 2785.3 | 2759.4 | 1.3x |
+| (512,2048,1024,8,2) | 99.6 | 513.5 | 513.7 | **5.2x** |
+| (1024,2048,1024,8,2) | 171.0 | 534.3 | 533.9 | 3.1x |
+| (4096,2048,1024,8,2) | 574.3 | 961.8 | 966.2 | 1.7x |
+| (16384,2048,1024,8,2) | 2132.4 | 2790.0 | 2771.8 | 1.3x |
 
-4090D（sm89，同一移植包与 tuning 流程，121.9 TF vs sglang 107.4 TF）：
+4090D（sm89，同一移植包与 tuning 流程，125.0 TF vs sglang 106.8 TF）：
 
 | Shape (S,H,I,E,K) | custom µs | sglang-def µs | sglang-tuned µs | vs tuned |
 |---|---|---|---|---|
-| (512,2048,1024,8,2) | 178.8 | 709.2 | 701.6 | **3.9x** |
-| (1024,2048,1024,8,2) | 306.8 | 695.5 | 698.2 | 2.3x |
-| (4096,2048,1024,8,2) | 956.3 | 1293.4 | 1310.5 | 1.4x |
-| (16384,2048,1024,8,2) | 3381.5 | 3838.9 | 3818.6 | 1.1x |
+| (512,2048,1024,8,2) | 176.4 | 718.0 | 721.5 | **4.1x** |
+| (1024,2048,1024,8,2) | 299.0 | 701.0 | 700.8 | 2.3x |
+| (4096,2048,1024,8,2) | 914.9 | 1307.5 | 1304.9 | 1.4x |
+| (16384,2048,1024,8,2) | 3299.4 | 3860.0 | 3856.7 | 1.2x |
 
 | Shape (S,H,I,E,K) | custom µs | TFLOPS | eager µs | vs eager | comp µs | comp+RO µs | FG+graph µs | vs FG |
 |---|---|---|---|---|---|---|---|---|
@@ -391,6 +391,9 @@ Triton MoE（本机 tuned，`benchmark/benchmark_fuse_moe_vs_sglang.py` +
   直写 act_out——免 `gate_up_out (T, 2I)` 物化与独立激活 kernel
 - **compact 直读**：激活按 expert 有序紧凑布局流动，无 padded 空洞；
   cp.async scatter 路径 gather-on-load 直读 token 序 x
+- **gemm2 相邻 N-pair**：每 task 覆盖相邻两个 64 宽 N 面板（共享 X tile
+  与 smem stage），per-slab MMA 密度 ×2——ncu 归因 gemm2 延迟掩盖不足
+  （occupancy 16.7% × 浅流水）后引入，全 shape 谱系 e2e 优 2–3%
 - **tile 自适应**：kTileM 按 avg tokens/expert 选 32/64/128（128 将 W
   复用面翻倍，avg≥256 启用）；kTileK 按 k%128 选 64/128（smem 门控）
 - **PDL 串联**：count → gemm1 → gemm2 → reduce 四个 kernel 以
@@ -540,6 +543,8 @@ count / 路由重排 / 两个 group GEMM / 激活 / topk 加权归约全部融�
 | `GEMM_MIXED_FORCE_SPLITK=n` | 强制 mixed_gemm 的 split-K 值（1/2/4/8/16，调试用） |
 | `FUSE_MOE_TMA=1` | sm120 上启用 TMA + mbarrier 引擎（默认 cp.async） |
 | `FUSE_MOE_TILE_M=32/64/128` | 强制 fuse_moe 的 kTileM（默认按 avg tokens 自适应） |
+| `FUSE_MOE_TILE_N=64` | 强制 gemm2 回单 64 宽 N 基线（默认相邻 N-pair 128 宽，per-slab MMA 密度 ×2，实测全 shape 优 2–3%；hidden%128!=0 自动回退） |
+| `FUSE_MOE_SCHED=vert` | cp.async 引擎 task 遍历序改为 N-major/vert（默认 horizon；实测本仓 shape 族均不优，见 docs 第 4 节，W_per_expert > L2 时可选） |
 | `FUSE_MOE_TIME=1` | 打印 fuse_moe 各 kernel 分段耗时 |
 
 ## Examples
