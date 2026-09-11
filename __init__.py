@@ -633,13 +633,14 @@ class CustomOps:
 # ─────────────────────────────────────────────────────────────────────────────
 # RecsysOps — 推荐系统核心算子库（分组懒加载门面）
 #
-# 按算子分组拆分为独立 .so（fa / mixed_gemm / fuse_moe），首次访问某算子
+# 按算子分组拆分为独立 .so（fa / mixed_gemm / fuse_moe / swiglu），首次访问某算子
 # 时才 JIT 编译对应分组——只测/只用一个算子时不再全量编译。
 #
 # 用法：
 #   from custom_ops import ops            # import 零编译
 #   out = ops.mha_fwd_with_mask(q,k,v,mask)  # 首次调用才编译 FA 分组
 #   y   = ops.fuse_moe(...)                  # 首次调用才编译 MoE 分组
+#   act = ops.swiglu(x, w)                  # 首次调用才编译 SwiGLU 分组
 #   ops.ensure_loaded()                       # 显式全量加载（旧行为）
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -5,6 +5,8 @@ custom_ops/recsys.py — RecsysOps：推荐系统核心 CUDA 算子库（分组�
 - fa         mha_fwd_with_mask      Flash Attention 2 前向，任意 fp16/bf16 加法 mask
 - mixed_gemm mixed_gemm (+fp8 查询)  混合精度 GEMM：bf16 主项 + fp8/int8 residual
 - fuse_moe   fuse_moe                MoE 前向融合（group GEMM + silu*mul + reduce）
+- swiglu     swiglu                  SwiGLU 融合（配对 GEMM + silu*mul epilogue）
+
 
 快速使用
 --------
@@ -140,6 +142,7 @@ class FuseMoeOps(CustomOps):
         return [
             os.path.join(moe, "fuse_moe_bindings.cpp"),
             os.path.join(moe, "fuse_moe_op.cu"),
+
         ]
 
     def get_include_dirs(self) -> list:
@@ -156,6 +159,46 @@ class FuseMoeOps(CustomOps):
             "fuse_moe",
             lambda x, gate_up_weight, down_weight, topk_ids, topk_scale:
                 torch.empty_like(x),
+        )
+
+
+
+# ── SwiGLU 独立分组（自包含 kernel，与 fuse_moe 完全解耦）─────────────
+
+class SwigluOps(CustomOps):
+    """swiglu 分组：SwiGLU 融合算子（配对 GEMM + silu*mul epilogue）。
+
+    设备 kernel 自包含于 csrc/swiglu/（不含任何 fuse_moe 头）——编译
+    swiglu 分组完全不会触碰 fuse_moe 的代码，两组互不影响。
+    """
+
+    namespace    = "recsys_ops"
+    so_name      = "recsys_swiglu_kernel"
+    required_ops = ["swiglu"]
+    optional_ops = []
+    build_dir_fallback = "./torch_extensions"
+
+    def get_sources(self) -> list:
+        return [
+            os.path.join(_THIS_DIR, "csrc", "swiglu", "swiglu_bindings.cpp"),
+            os.path.join(_THIS_DIR, "csrc", "swiglu", "swiglu_op.cu"),
+        ]
+
+    def get_include_dirs(self) -> list:
+        csrc       = os.path.join(_THIS_DIR, "csrc")
+        thirdparty = os.path.join(_THIS_DIR, "thirdparty")
+        return [
+            thirdparty,
+            csrc,
+            os.path.join(csrc, "swiglu"),
+        ]
+
+    def register_fake_impls(self) -> None:
+        self.register_fake_for(
+            "swiglu",
+            lambda x, weight: torch.empty(
+                x.shape[:-1] + (weight.shape[0] // 2,),
+                dtype=x.dtype, device=x.device),
         )
 
 
@@ -186,6 +229,7 @@ class RecsysOps:
         "fa": FAOps,
         "mixed_gemm": MixedGemmOps,
         "fuse_moe": FuseMoeOps,
+        "swiglu": SwigluOps,
     }
 
     _OP_TO_GROUP = {
@@ -193,6 +237,7 @@ class RecsysOps:
         "mixed_gemm": "mixed_gemm",
         "mixed_gemm_fp8_available": "mixed_gemm",
         "fuse_moe": "fuse_moe",
+        "swiglu": "swiglu",
     }
 
     def __init__(self) -> None:
@@ -334,6 +379,21 @@ class RecsysOps:
         """
         return self._group("fuse_moe").fuse_moe(
             x, gate_up_weight, down_weight, topk_ids, topk_scale)
+
+    def swiglu(
+        self,
+        x:      torch.Tensor,   # (M, K) bf16/fp16
+        weight: torch.Tensor,   # (2N, K) 同 dtype，gate 行在前 up 在后
+    ) -> torch.Tensor:
+        """
+        SwiGLU 融合算子（单 GPU，bf16/fp16 输入，fp32 累加）：
+
+            y = silu(x @ Wg^T) * (x @ Wu^T)
+
+        单 kernel 完成配对 GEMM + 激活（无 (M, 2N) gate_up 中间量物化）。
+        限制：K % 64 == 0，N % 64 == 0；M 任意；SM80+（sm89 / sm120）。
+        """
+        return self._group("swiglu").swiglu(x, weight)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
