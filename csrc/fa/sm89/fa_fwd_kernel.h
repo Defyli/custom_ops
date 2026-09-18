@@ -7,6 +7,9 @@
  *   - 新增：通过 cute GmemTiledCopyMask + smem 缓冲读取 fp16/bf16 additive mask，
  *           在 gemm 后对 acc_s 做 smem→reg copy + 逐元素加法（零分支，无 warp divergence）
  *   - 保留 Is_even_MN / Is_even_K 分支以保证边界正确性
+ *   - K/Q 的 M-OOB 清零走 cp.async ZFILL（src-size 谓词，硬件零填充目标 smem，
+ *     取代「跳过拷贝 + cute::clear 手动清零」两步，见 common/utils.h copy_zfill）；
+ *     倒序遍历下 K/V 的边界 tile 恒为首个处理块，谓词装载只在首块发生一次
  *
  * Mask 语义（加法 mask，与 SDPA 对齐，即 softmax(S·scale + mask)）：
  *   mask=0    → 可见（score 不变）
@@ -18,8 +21,8 @@
  *   - q 维：mask_seqlen_q ∈ [seqlen_q, 任意]，无需 pad——copy_g2s_mask 用 cute copy_if
  *     按行谓词跳过越界行（这些行的输出反正被 epilogue 丢弃）
  *   - k 维：mask_seqlen_k ∈ [seqlen_k, 任意] 且 %8==0（128-bit cp.async 行对齐），
- *     无需 pad 到 kBlockN——边界 tile 的越界列由列谓词跳过拷贝、smem 预清 -inf
- *     （语义：col ≥ Sk 恒为屏蔽，mask 越界列内容被忽略）
+ *     无需 pad 到 kBlockN——边界 tile 的越界列由列谓词 ZFILL 零填充，-inf 屏蔽
+ *     语义由 apply 点按列坐标强制（col ≥ Sk 恒为屏蔽，mask 越界列内容被忽略）
  *   - 通过 params.mask_ptr / mask_batch_stride / mask_row_stride / mask_seqlen_q / mask_seqlen_k 寻址
  *
  * copy_g2s_mask 行/列联合谓词（Sk%8==0 保证 128-bit 向量不跨 Sk 边界）：
@@ -166,54 +169,44 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
     auto sMask_s0 = sMask(_, _, _0{});  // 2D: (kBlockM, kBlockN)
     Tensor tQsMask = gmem_thr_copy_Mask.partition_D(sMask_s0);  // (COPY_V, COPY_M, COPY_N)
 
-    // ── mask 行谓词（q 维不 pad）：行坐标 >= mask 实际剩余行数的 copy 向量被跳过 ──
-    // kMaskQFull（host 保证 mask_seqlen_q % kBlockM == 0）时编译期裁掉谓词，纯 copy
+    // ── mask 谓词（prologue 一次构建，全部 tile 复用；OOB 统一 ZFILL）─────────
+    // atom 为 ZFILL 变体（fa_fwd_mask.h）：谓词为假的向量照常发射 cp.async
+    // （src-size=0 → 硬件零填充目标 smem），取代「跳过拷贝 + 手动清零 /
+    // 预清 -inf」的软件两段式：
+    //   行 OOB（row ≥ mask_rows_left，!kMaskQFull）：ZFILL 写 0——这些行的输出
+    //     被 epilogue 丢弃，有限值即防住未初始化 smem 的 NaN 垃圾模式；
+    //   列 OOB（col ≥ mask_k_tail，仅全局尾 tile）：ZFILL 写 0，屏蔽语义
+    //     （col ≥ Sk 恒 -inf）由 apply_mask_from_smem 按列坐标在消费端强制
+    //     ——仅尾 tile 首块付出一次坐标比较，消灭发射前的 -inf 预清循环。
+    // tMpMask     ：行谓词（非尾 tile 的发射谓词；kMaskQFull 时不构建不读）
+    // tMpMaskTail ：行 && 列联合谓词（尾 tile 的发射谓词——倒序遍历下尾 tile
+    //               恒为首个处理块，谓词装载与 -inf 强制均只在首块发生一次）
     Tensor cMask   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
     Tensor tMcMask = gmem_thr_copy_Mask.partition_S(cMask);      // (CPY_V, CPY_M, CPY_N) 坐标
-    Tensor tMpMask = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+    Tensor tMpMask     = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+    Tensor tMpMaskTail = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
     const int mask_rows_left = params.mask_seqlen_q - m_block * kBlockM;
+    // 全局尾 tile 的界内列数（Sk%8==0 → 向量粒度谓词成立；Is_even_MN 编译期为 0）
+    const int mask_k_tail = Is_even_MN ? 0 : (actual_seqlen_k % kBlockN);
+    const bool tail_tile  = (mask_k_tail != 0);
     if constexpr (!Kernel_traits::kMaskQFull) {
         #pragma unroll
         for (int m = 0; m < size<0>(tMpMask); ++m) {
             #pragma unroll
             for (int n = 0; n < size<1>(tMpMask); ++n) {
-                tMpMask(m, n) = get<0>(tMcMask(_0{}, m, n)) < mask_rows_left;
+                const bool row_ok = get<0>(tMcMask(_0{}, m, n)) < mask_rows_left;
+                tMpMask(m, n) = row_ok;
+                tMpMaskTail(m, n) =
+                    row_ok && (!tail_tile || get<1>(tMcMask(_0{}, m, n)) < mask_k_tail);
             }
         }
-        // 边界 CTA：谓词跳过的 smem 行一次性清 0（这些行的输出被 epilogue 丢弃，清 0 仅避免
-        // 未初始化 smem 可能出现的 NaN 位模式；与 cp.async 写入位置不重叠，无 race）
-        if (mask_rows_left < kBlockM) {
+    } else if (tail_tile) {
+        // kMaskQFull：行全界内，尾 tile 只需列谓词
+        #pragma unroll
+        for (int m = 0; m < size<0>(tMpMaskTail); ++m) {
             #pragma unroll
-            for (int m = 0; m < size<1>(tQsMask); ++m) {
-                #pragma unroll
-                for (int n = 0; n < size<2>(tQsMask); ++n) {
-                    if (!tMpMask(m, n)) { clear(tQsMask(_, m, n)); }
-                }
-            }
-        }
-    }
-
-    // ── mask 列谓词（k 维不 pad）：Sk 非 kBlockN 倍数时，全局边界 tile 的越界列 ───
-    // 由 copy 列谓词跳过拷贝（见 copy_g2s_mask），其 smem 一次性预清 -inf——softmax
-    // 语义屏蔽位（col ≥ Sk 恒为 -inf）。Sk%8==0 → 128-bit 向量整段落在界内/界外，
-    // 向量粒度谓词即可。与 cp.async 写入位置不重叠（谓词为假的向量从不被写入）；
-    // 非边界 tile 的整块拷贝在边界 tile 消费之后（迭代间 __syncthreads 分隔）。
-    // Is_even_MN（Sk%kBlockN==0）时编译期消除。
-    if constexpr (!Is_even_MN) {
-        const int mask_k_tail = actual_seqlen_k % kBlockN;
-        if (mask_k_tail != 0) {
-            const Element mask_neg_inf(static_cast<float>(-INFINITY));
-            #pragma unroll
-            for (int m = 0; m < size<1>(tQsMask); ++m) {
-                #pragma unroll
-                for (int n = 0; n < size<2>(tQsMask); ++n) {
-                    if (get<1>(tMcMask(_0{}, m, n)) >= mask_k_tail) {
-                        #pragma unroll
-                        for (int v = 0; v < size<0>(tQsMask); ++v) {
-                            tQsMask(v, m, n) = mask_neg_inf;
-                        }
-                    }
-                }
+            for (int n = 0; n < size<1>(tMpMaskTail); ++n) {
+                tMpMaskTail(m, n) = get<1>(tMcMask(_0{}, m, n)) < mask_k_tail;
             }
         }
     }
@@ -263,69 +256,64 @@ __forceinline__ __device__ void compute_attn_1rowblock_mask(
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
     }
 
-        // ── copy_g2s_mask：将一个 mask tile 从 gmem 搬到 smem（行/列联合谓词）──────
-    // 行方向（!kMaskQFull）：越界行的向量被跳过（smem 已预清 0）。
-    // 列方向（!Is_even_MN）：仅全局边界 tile（n_block_id == n_block_max-1）且
-    // Sk%kBlockN!=0 时存在越界列——联合谓词跳过（smem 已预清 -inf）；其余 tile
-    // 整块在界内，走无谓词/行谓词原路径（Is_even_MN 时编译期全部消除列谓词）。
-auto copy_g2s_mask = [&](int n_block_id) {
-    // tQsMask 是 3D (COPY_V, COPY_M, COPY_N)；tQgMask(_, _, _, n_block_id) rank 匹配
-    const bool cols_full = Is_even_MN || (n_block_id < n_block_max - 1) ||
-                           (actual_seqlen_k % kBlockN == 0);
-    if (cols_full) {
-        if constexpr (Kernel_traits::kMaskQFull) {
-            cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
-        } else {
-            cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
+    // ── copy_g2s_mask：mask tile gmem → smem（谓词选择发射，无循环内重建）────
+    // tail：本 tile 是否全局尾 tile（倒序遍历下仅首个处理块为 true，CTA-uniform）。
+    // 谓词为假的向量由 ZFILL 硬件零填充（见上方谓词段注释）；列 OOB 的 -inf 屏蔽
+    // 语义由 apply_mask_from_smem 在消费端按列坐标强制，与发射端彻底解耦。
+    auto copy_g2s_mask = [&](int n_block_id, bool tail) {
+        // tQsMask 是 3D (COPY_V, COPY_M, COPY_N)；tQgMask(_, _, _, n_block_id) rank 匹配
+        if (!Kernel_traits::kMaskQFull || tail) {
+            cute::copy_if(gmem_tiled_copy_Mask, tail ? tMpMaskTail : tMpMask,
                           tQgMask(_, _, _, n_block_id), tQsMask);
+        } else {
+            cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
         }
-    } else {
-        // 行+列联合谓词（分支 CTA-uniform，无 warp divergence；谓词向量的 smem
-        // 位置已预清 -inf/0，跳过即保持语义）
-        const int cols_left = actual_seqlen_k - n_block_id * kBlockN;  // 8 对齐
-        Tensor predK = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
-        #pragma unroll
-        for (int m = 0; m < size<0>(predK); ++m) {
-            #pragma unroll
-            for (int n = 0; n < size<1>(predK); ++n) {
-                predK(m, n) = (get<1>(tMcMask(_0{}, m, n)) < cols_left)
-                           && (Kernel_traits::kMaskQFull ||
-                               get<0>(tMcMask(_0{}, m, n)) < mask_rows_left);
-            }
-        }
-        cute::copy_if(gmem_tiled_copy_Mask, predK,
-                      tQgMask(_, _, _, n_block_id), tQsMask);
-    }
-};
+    };
 
-    // ── apply_mask_from_smem：smem → register，然后对 acc_s 做加法 ───────────
+    // ── apply_mask_from_smem：smem → register，acc_s 加法 / 列 OOB 强制 -inf ──
     //
     // mask 语义（加法 mask，与 SDPA 对齐，即 softmax(S·scale + mask)）：
     //   mask=0    → 可见，score 不变（acc_s += 0）
-    //   mask=-inf → 屏蔽，score → -inf（acc_s += -inf）
+    //   mask=-inf → 屏蔽，score → -inf
     //
-    // 由于越界列已由 prologue 预清 -inf（列谓词跳过拷贝）、越界行清 0，这里只需纯加法，
-    // 无任何分支，SIMD 效率最优，零 warp divergence。
+    // ZFILL 化后 OOB 向量的 smem 值为 0：行 OOB 无语义（输出被 epilogue 丢弃）；
+    // 列 OOB 的屏蔽语义在此按 acc_s fragment 的列坐标强制 -inf——仅全局尾 tile
+    // 的首块处理时为真（force_oob_inf，CTA-uniform），其余块保持纯加法零开销。
+    // 坐标张量 taccScS 与 acc_s 同构（partition_C），列坐标为编译期布局的线性
+    // 函数，仅尾块首 apply 付出一次逐元素比较 + select。
     // 注意：acc_s 此时尚未乘 softmax_scale，mask 需乘 1/scale 预先还原
-    // （0/-inf mask 行为不变；有限值 mask 此前被错误地乘了 scale）。
-    auto apply_mask_from_smem = [&](auto &acc_s) {
+    // （0/-inf mask 行为不变；有限值 mask 正确还原 scale）。
+    Tensor cS_ = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor taccScS = thr_mma.partition_C(cS_);   // (4, MMA_M, MMA_N) fragment 坐标
+    auto apply_mask_from_smem = [&](auto &acc_s, bool force_oob_inf) {
         const float mask_inv_scale = 1.f / params.scale_softmax;
         Tensor rMask = make_tensor<Element>(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
         auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
         // tSsMask 是 partition_S(sMask) 的结果，rank 与 partition_D 返回的不同（无 stage 维度）
         cute::copy(smem_tiled_copy_mask, tSsMask, tSrMask_view);
-        // 纯加法，无分支：可见位加 0，屏蔽位加 -inf，均匀指令流，无 warp divergence
-        #pragma unroll
-        for (int i = 0; i < size(acc_s); ++i) {
-            acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
+        if (force_oob_inf) {
+            // 尾 tile 首块：列 OOB（col ≥ mask_k_tail）强制 -inf（softmax 屏蔽位）
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) = (get<1>(taccScS(i)) >= mask_k_tail)
+                    ? -INFINITY
+                    : acc_s(i) + static_cast<float>(rMask(i)) * mask_inv_scale;
+            }
+        } else {
+            // 常规块：纯加法，无分支，SIMD 效率最优，零 warp divergence
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
+            }
         }
     };
 
     // ── Prologue：异步加载 Q + 第一个 K + 第一个 Mask ────────────────────────
-    // Clear_OOB_MN=true: 当 Is_even_MN=false 时，将 OOB 行（>= actual_seqlen_q）在 smem 中清零
-    // 防止 smem 中的垃圾 Q 值 × 大 K 值 → +inf，再 + mask(-inf) → NaN
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+    // OOB 清零语义（防 smem 垃圾 Q 值 × 大 K 值 → +inf，再 + mask(-inf) → NaN）
+    // 由 cp.async ZFILL 硬件完成：M-OOB 向量 src-size=0，目标 smem 零填充，
+    // 取代「跳过拷贝 + cute::clear 手动清零」两步（见 utils.h copy_zfill）
+    FLASH_NAMESPACE::copy_zfill<Is_even_MN, Is_even_K>(
         gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
         actual_seqlen_q - m_block * kBlockM
     );
@@ -337,14 +325,16 @@ auto copy_g2s_mask = [&](int n_block_id) {
     // ── 主循环：从最后一个 n_block 倒序迭代（非 causal，无下三角约束）────────
     int n_block = n_block_max - 1;
 
-    // 加载第一个 K tile（边界 block）
-    // Clear_OOB_MN=true: 清零 K 的 OOB 行，防止垃圾 K 值 × Q → +inf + mask(-inf) → NaN
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+    // 加载第一个 K tile（全局尾块：M-OOB 行由 cp.async ZFILL 硬件零填充）。
+    // 逆序谓词收敛：Sk%kBlockN!=0 时唯一需要 M-谓词的 K/V tile 恰是全局尾块，
+    // 亦即首个处理块——谓词装载只在此发生一次，主循环预载的全部后续块
+    // 整块在界内、走无谓词 copy（下方预载点 Is_even_MN=true 硬编码）
+    FLASH_NAMESPACE::copy_zfill<Is_even_MN, Is_even_K>(
         gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
         actual_seqlen_k - n_block * kBlockN
     );
     // 异步加载第一个 Mask tile 到 sMask（无条件搬运，越界列 gmem 已填 -inf）
-    copy_g2s_mask(n_block);
+    copy_g2s_mask(n_block, tail_tile);
     cute::cp_async_fence();
 
     // 等待 Q / K / Mask 加载完成
@@ -356,8 +346,8 @@ auto copy_g2s_mask = [&](int n_block_id) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s);
 
-        // 异步加载当前 V tile
-        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+        // 异步加载当前 V tile（全局尾块：M-OOB 行由 cp.async ZFILL 硬件零填充）
+        FLASH_NAMESPACE::copy_zfill<Is_even_MN, Is_even_K>(
             gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV,
             actual_seqlen_k - n_block * kBlockN
         );
@@ -371,7 +361,7 @@ auto copy_g2s_mask = [&](int n_block_id) {
         );
 
         // ── smem mask → reg，纯加法（越界列已是 -inf）────────────────────────
-        apply_mask_from_smem(acc_s);
+        apply_mask_from_smem(acc_s, tail_tile);
 
         // ── Softmax（第一个 block，Is_first=true，Check_inf=true）────────────
         softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/true>(
@@ -387,7 +377,7 @@ auto copy_g2s_mask = [&](int n_block_id) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
                 gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV
             );
-            copy_g2s_mask(n_block - 1);
+            copy_g2s_mask(n_block - 1, /*tail=*/false);
             cute::cp_async_fence();
         }
 
@@ -420,7 +410,7 @@ auto copy_g2s_mask = [&](int n_block_id) {
         );
 
         // ── smem mask → reg，纯加法 ──────────────────────────────────────────
-        apply_mask_from_smem(acc_s);
+        apply_mask_from_smem(acc_s, /*force_oob_inf=*/false);
 
         // 等待 V 加载完成
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -431,7 +421,7 @@ auto copy_g2s_mask = [&](int n_block_id) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
                 gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV
             );
-            copy_g2s_mask(n_block - 1);
+            copy_g2s_mask(n_block - 1, /*tail=*/false);
             cute::cp_async_fence();
         }
 
@@ -446,8 +436,8 @@ auto copy_g2s_mask = [&](int n_block_id) {
     }
 
     // ── Epilogue：归一化 + 写 O ──────────────────────────────────────────────
-    softmax.template normalize_softmax_lse</*Is_dropout=*/false>(
-        acc_o, params.scale_softmax, /*rp_dropout=*/1.0f
+    softmax.template normalize_softmax_lse(
+        acc_o, params.scale_softmax
     );
 
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
@@ -594,51 +584,37 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
     auto sMask_s0 = sMask(_, _, _0{});
     Tensor tQsMask = gmem_thr_copy_Mask.partition_D(sMask_s0);
 
-    // ── mask 行谓词（q 维不 pad，与 base kernel 一致）────────────────────────
+    // ── mask 谓词（prologue 一次构建，全部 tile 复用；OOB 统一 ZFILL）─────────
+    // 语义与 base kernel 一致（见其注释）：行/列 OOB 向量由 ZFILL 硬件零填充，
+    // 列 OOB 的 -inf 屏蔽语义由 apply_mask_from_smem 按列坐标在消费端强制。
+    // tail_tile：本 split 是否包含全局尾 tile（Sk%kBlockN!=0 时尾 tile 只属于
+    // 最后一个 split，倒序遍历下必为 n_first——谓词装载与 -inf 强制均只在首块
+    // 发生一次）；其余 split 恒 false，所有 tile 整块在界内，无谓词拷贝。
     Tensor cMask   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
     Tensor tMcMask = gmem_thr_copy_Mask.partition_S(cMask);
-    Tensor tMpMask = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+    Tensor tMpMask     = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+    Tensor tMpMaskTail = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
     const int mask_rows_left = params.mask_seqlen_q - m_block * kBlockM;
+    const int mask_k_tail = Is_even_MN ? 0 : (actual_seqlen_k % kBlockN);
+    const bool tail_tile = (mask_k_tail != 0) && (n_end == n_block_max);
     if constexpr (!Kernel_traits::kMaskQFull) {
         #pragma unroll
         for (int m = 0; m < size<0>(tMpMask); ++m) {
             #pragma unroll
             for (int n = 0; n < size<1>(tMpMask); ++n) {
-                tMpMask(m, n) = get<0>(tMcMask(_0{}, m, n)) < mask_rows_left;
+                const bool row_ok = get<0>(tMcMask(_0{}, m, n)) < mask_rows_left;
+                tMpMask(m, n) = row_ok;
+                tMpMaskTail(m, n) =
+                    row_ok && (!tail_tile || get<1>(tMcMask(_0{}, m, n)) < mask_k_tail);
             }
         }
-        // 边界 CTA：谓词跳过的 smem 行一次性清 0（防止未初始化 smem 的 NaN 垃圾模式）
-        if (mask_rows_left < kBlockM) {
+    } else if (tail_tile) {
+        // kMaskQFull：行全界内，尾 tile 只需列谓词
+        #pragma unroll
+        for (int m = 0; m < size<0>(tMpMaskTail); ++m) {
             #pragma unroll
-            for (int m = 0; m < size<1>(tQsMask); ++m) {
-                #pragma unroll
-                for (int n = 0; n < size<2>(tQsMask); ++n) {
-                    if (!tMpMask(m, n)) { clear(tQsMask(_, m, n)); }
-                }
-            }
-        }
-    }
-
-    // ── mask 列谓词（k 维不 pad，与 base kernel 同策略；仅含全局边界 tile 的 split）──
-    // 守卫 n_end == n_block_max：边界 tile 只属于最后一个 split。其余 split 的所有
-    // tile 均整块在界内，首轮即整块拷贝——若也预清 -inf 会与跨线程的清零构成
-    // write-after-write race（拷贝在首个 __syncthreads 之前发射），必须跳过。
-    // 本 split 首个处理块恰为边界 tile（倒序遍历），列谓词拷贝与预清不重叠，无 race。
-    if constexpr (!Is_even_MN) {
-        const int mask_k_tail = actual_seqlen_k % kBlockN;
-        if (mask_k_tail != 0 && n_end == n_block_max) {
-            const Element mask_neg_inf(static_cast<float>(-INFINITY));
-            #pragma unroll
-            for (int m = 0; m < size<1>(tQsMask); ++m) {
-                #pragma unroll
-                for (int n = 0; n < size<2>(tQsMask); ++n) {
-                    if (get<1>(tMcMask(_0{}, m, n)) >= mask_k_tail) {
-                        #pragma unroll
-                        for (int v = 0; v < size<0>(tQsMask); ++v) {
-                            tQsMask(v, m, n) = mask_neg_inf;
-                        }
-                    }
-                }
+            for (int n = 0; n < size<1>(tMpMaskTail); ++n) {
+                tMpMaskTail(m, n) = get<1>(tMcMask(_0{}, m, n)) < mask_k_tail;
             }
         }
     }
@@ -684,66 +660,68 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
     }
 
-    // ── copy_g2s_mask（行/列联合谓词，与 base kernel 同策略）──────────────────
-    // 仅全局边界 tile（落在包含它的那个 split）且 Sk%kBlockN!=0 时存在列越界
-    auto copy_g2s_mask = [&](int n_block_id) {
-        const bool cols_full = Is_even_MN || (n_block_id < n_block_max - 1) ||
-                               (actual_seqlen_k % kBlockN == 0);
-        if (cols_full) {
-            if constexpr (Kernel_traits::kMaskQFull) {
-                cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
-            } else {
-                cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
-                              tQgMask(_, _, _, n_block_id), tQsMask);
-            }
-        } else {
-            const int cols_left = actual_seqlen_k - n_block_id * kBlockN;  // 8 对齐
-            Tensor predK = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
-            #pragma unroll
-            for (int m = 0; m < size<0>(predK); ++m) {
-                #pragma unroll
-                for (int n = 0; n < size<1>(predK); ++n) {
-                    predK(m, n) = (get<1>(tMcMask(_0{}, m, n)) < cols_left)
-                               && (Kernel_traits::kMaskQFull ||
-                                   get<0>(tMcMask(_0{}, m, n)) < mask_rows_left);
-                }
-            }
-            cute::copy_if(gmem_tiled_copy_Mask, predK,
+    // ── copy_g2s_mask：mask tile gmem → smem（谓词选择发射，无循环内重建）────
+    // tail：本 tile 是否全局尾 tile（倒序遍历下仅首个处理块为 true，CTA-uniform）。
+    // 谓词为假的向量由 ZFILL 硬件零填充；列 OOB 的 -inf 屏蔽语义由
+    // apply_mask_from_smem 在消费端按列坐标强制，与发射端彻底解耦。
+    auto copy_g2s_mask = [&](int n_block_id, bool tail) {
+        if (!Kernel_traits::kMaskQFull || tail) {
+            cute::copy_if(gmem_tiled_copy_Mask, tail ? tMpMaskTail : tMpMask,
                           tQgMask(_, _, _, n_block_id), tQsMask);
+        } else {
+            cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, n_block_id), tQsMask);
         }
     };
 
-    // ── apply_mask_from_smem（与 base kernel 一致：纯加法，零分支）────────────
-    auto apply_mask_from_smem = [&](auto &acc_s) {
+    // ── apply_mask_from_smem：smem → register，acc_s 加法 / 列 OOB 强制 -inf ──
+    // ZFILL 化后 OOB 向量的 smem 值为 0：行 OOB 无语义（输出被 epilogue 丢弃）；
+    // 列 OOB 的屏蔽语义按 acc_s fragment 的列坐标强制 -inf——仅含全局尾 tile 的
+    // split 的首块处理时为真（force_oob_inf，CTA-uniform），其余块纯加法零开销。
+    // 坐标张量 taccScS 与 acc_s 同构（partition_C），列坐标为编译期布局的线性函数。
+    Tensor cS_ = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor taccScS = thr_mma.partition_C(cS_);   // (4, MMA_M, MMA_N) fragment 坐标
+    auto apply_mask_from_smem = [&](auto &acc_s, bool force_oob_inf) {
         const float mask_inv_scale = 1.f / params.scale_softmax;
         Tensor rMask = make_tensor<Element>(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
         auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
         cute::copy(smem_tiled_copy_mask, tSsMask, tSrMask_view);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s); ++i) {
-            acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
+        if (force_oob_inf) {
+            // 尾 tile 首块：列 OOB（col ≥ mask_k_tail）强制 -inf（softmax 屏蔽位）
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) = (get<1>(taccScS(i)) >= mask_k_tail)
+                    ? -INFINITY
+                    : acc_s(i) + static_cast<float>(rMask(i)) * mask_inv_scale;
+            }
+        } else {
+            // 常规块：纯加法，无分支，零 warp divergence
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
+            }
         }
     };
 
-    // ── K/V 装载：全局边界块（n_block_max-1）需行谓词搬运，其余块整块在界内 ────
-    // 边界块仅落在包含它的那个 split，其它 split 的所有块都走无谓词路径
-    auto load_K = [&](int nb) {
-        if (Is_even_MN || nb < n_block_max - 1) {
+    // ── K/V 装载：谓词一次性判定（逆序遍历下全局边界块只可能是首个处理块）──
+    // tail_tile（上方 mask 谓词段定义）为真时首块走 ZFILL 谓词装载（OOB 行硬件
+    // 零填充）；循环内全部以字面量 false 调用，内联后分支编译期消解。
+    auto load_K = [&](int nb, bool boundary) {
+        if (!boundary) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
                 gmem_tiled_copy_QKV, tKgK(_, _, _, nb), tKsK, tKVcKV, tKVpKV);
         } else {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
+            FLASH_NAMESPACE::copy_zfill</*Is_even_MN=*/false, Is_even_K>(
                 gmem_tiled_copy_QKV, tKgK(_, _, _, nb), tKsK, tKVcKV, tKVpKV,
                 actual_seqlen_k - nb * kBlockN);
         }
     };
-    auto load_V = [&](int nb) {
-        if (Is_even_MN || nb < n_block_max - 1) {
+    auto load_V = [&](int nb, bool boundary) {
+        if (!boundary) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
                 gmem_tiled_copy_QKV, tVgV(_, _, _, nb), tVsV, tKVcKV, tKVpKV);
         } else {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
+            FLASH_NAMESPACE::copy_zfill</*Is_even_MN=*/false, Is_even_K>(
                 gmem_tiled_copy_QKV, tVgV(_, _, _, nb), tVsV, tKVcKV, tKVpKV,
                 actual_seqlen_k - nb * kBlockN);
         }
@@ -757,14 +735,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
         const int n_first = n_end - 1;   // 本 split 首个处理块（倒序遍历）
 
         // ── Prologue：异步加载 Q + 首个 K + 首个 Mask ────────────────────────
-        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+        FLASH_NAMESPACE::copy_zfill<Is_even_MN, Is_even_K>(
             gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
             actual_seqlen_q - m_block * kBlockM
         );
         cute::cp_async_fence();
 
-        load_K(n_first);
-        copy_g2s_mask(n_first);
+        load_K(n_first, tail_tile);
+        copy_g2s_mask(n_first, tail_tile);
         cute::cp_async_fence();
 
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -775,7 +753,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
             Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
             clear(acc_s);
 
-            load_V(n_first);
+            load_V(n_first, tail_tile);
             cute::cp_async_fence();
 
             FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
@@ -784,7 +762,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
                 smem_thr_copy_Q, smem_thr_copy_K
             );
 
-            apply_mask_from_smem(acc_s);
+            apply_mask_from_smem(acc_s, tail_tile);
 
             softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/true>(
                 acc_s, acc_o, params.scale_softmax_log2
@@ -794,8 +772,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
             __syncthreads();
 
             if (n_first > n_begin) {
-                load_K(n_first - 1);
-                copy_g2s_mask(n_first - 1);
+                load_K(n_first - 1, /*boundary=*/false);
+                copy_g2s_mask(n_first - 1, /*tail=*/false);
                 cute::cp_async_fence();
             }
 
@@ -814,7 +792,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
             FLASH_NAMESPACE::cp_async_wait<0>();
             __syncthreads();
 
-            load_V(n_block);
+            load_V(n_block, /*boundary=*/false);
             cute::cp_async_fence();
 
             FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
@@ -823,7 +801,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
                 smem_thr_copy_Q, smem_thr_copy_K
             );
 
-            apply_mask_from_smem(acc_s);
+            apply_mask_from_smem(acc_s, /*force_oob_inf=*/false);
 
             // 等待 V 就绪
             FLASH_NAMESPACE::cp_async_wait<0>();
@@ -831,8 +809,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
 
             // 预载下一轮 K + Mask（若有）
             if (n_block > n_begin) {
-                load_K(n_block - 1);
-                copy_g2s_mask(n_block - 1);
+                load_K(n_block - 1, /*boundary=*/false);
+                copy_g2s_mask(n_block - 1, /*tail=*/false);
                 cute::cp_async_fence();
             }
 
@@ -848,8 +826,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask(
 
         // Split 约定（与 sm120/FA3 combine 配套）：O_s 按本地 l 归一化；
         // lse_s = m*scale + log(l)；全屏蔽行 sum=0 → lse=-inf
-        lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, /*Split=*/true>(
-            acc_o, params.scale_softmax, /*rp_dropout=*/1.0f
+        lse = softmax.template normalize_softmax_lse</*Split=*/true>(
+            acc_o, params.scale_softmax
         );
     } else {
         // 空 split（尾部分裂）：O_partial 写 0（acc_o 已 clear），LSE 写 -inf
@@ -1026,59 +1004,37 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
     Tensor tQgMask = gmem_thr_copy_Mask.partition_S(gMask);
     Tensor tQsMask = gmem_thr_copy_Mask.partition_D(sMask);   // (CPY_V, CPY_M, CPY_N, stage)
 
-    // ── mask 行谓词（q 维不 pad）；边界 CTA 需把所有 stage 的越界行一次性清 0 ──
+    // ── mask 谓词（prologue 一次构建，全部 tile 复用；OOB 统一 ZFILL）─────────
+    // 语义与 base kernel 一致（见其注释）：行/列 OOB 向量由 ZFILL 硬件零填充，
+    // 列 OOB 的 -inf 屏蔽语义由 apply_mask_from_smem 按列坐标在消费端强制。
+    // tail_tile：本 split 是否包含全局尾 tile（Sk%kBlockN!=0 时尾 tile 只属于
+    // 最后一个 split，倒序遍历下必为 n_first——谓词装载与 -inf 强制均只在首块
+    // 发生一次）；其余 split 恒 false，所有 tile 整块在界内，无谓词拷贝。
     Tensor cMask   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
     Tensor tMcMask = gmem_thr_copy_Mask.partition_S(cMask);
-    Tensor tMpMask = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+    Tensor tMpMask     = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
+    Tensor tMpMaskTail = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
     const int mask_rows_left = params.mask_seqlen_q - m_block * kBlockM;
+    const int mask_k_tail = Is_even_MN ? 0 : (actual_seqlen_k % kBlockN);
+    const bool tail_tile = (mask_k_tail != 0) && (n_end == n_block_max);
     if constexpr (!Kernel_traits::kMaskQFull) {
         #pragma unroll
         for (int m = 0; m < size<0>(tMpMask); ++m) {
             #pragma unroll
             for (int n = 0; n < size<1>(tMpMask); ++n) {
-                tMpMask(m, n) = get<0>(tMcMask(_0{}, m, n)) < mask_rows_left;
+                const bool row_ok = get<0>(tMcMask(_0{}, m, n)) < mask_rows_left;
+                tMpMask(m, n) = row_ok;
+                tMpMaskTail(m, n) =
+                    row_ok && (!tail_tile || get<1>(tMcMask(_0{}, m, n)) < mask_k_tail);
             }
         }
-        // 边界 CTA：copy_if 谓词跳过的 smem 行在任何 stage 中都不会被写入
-        // （行谓词与 n_block 无关），一次性清 0 防止未初始化 smem 的 NaN 垃圾模式
-        if (mask_rows_left < kBlockM) {
+    } else if (tail_tile) {
+        // kMaskQFull：行全界内，尾 tile 只需列谓词
+        #pragma unroll
+        for (int m = 0; m < size<0>(tMpMaskTail); ++m) {
             #pragma unroll
-            for (int st = 0; st < kStages; ++st) {
-                #pragma unroll
-                for (int m = 0; m < size<1>(tQsMask); ++m) {
-                    #pragma unroll
-                    for (int n = 0; n < size<2>(tQsMask); ++n) {
-                        if (!tMpMask(m, n)) { clear(tQsMask(_, m, n, st)); }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── mask 列谓词（k 维不 pad，与单缓冲版同策略；仅含全局边界 tile 的 split）──
-    // 边界 tile 是本 split 首个处理块（j=0 → stage 0），所有 stage 一并预清
-    //（stage 1 的预清随后即被首个整块拷贝覆写，无害）；stage 0 的 -inf 列在
-    // 迭代 j=0 消费完毕（尾部 __syncthreads）之后才会被流水回绕的整块拷贝覆写，
-    // 无 race。其余 split 必须跳过（其 tile 全部整块在界内，预清会与首轮整块
-    // 拷贝构成跨线程 write-after-write race，见单缓冲版注释）。
-    if constexpr (!Is_even_MN) {
-        const int mask_k_tail = actual_seqlen_k % kBlockN;
-        if (mask_k_tail != 0 && n_end == n_block_max) {
-            const Element mask_neg_inf(static_cast<float>(-INFINITY));
-            #pragma unroll
-            for (int st = 0; st < kStages; ++st) {
-                #pragma unroll
-                for (int m = 0; m < size<1>(tQsMask); ++m) {
-                    #pragma unroll
-                    for (int n = 0; n < size<2>(tQsMask); ++n) {
-                        if (get<1>(tMcMask(_0{}, m, n)) >= mask_k_tail) {
-                            #pragma unroll
-                            for (int v = 0; v < size<0>(tQsMask); ++v) {
-                                tQsMask(v, m, n, st) = mask_neg_inf;
-                            }
-                        }
-                    }
-                }
+            for (int n = 0; n < size<1>(tMpMaskTail); ++n) {
+                tMpMaskTail(m, n) = get<1>(tMcMask(_0{}, m, n)) < mask_k_tail;
             }
         }
     }
@@ -1124,69 +1080,66 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
     }
 
-    // ── 装载 lambda（带 stage 维；全局边界块 n_block_max-1 需行谓词搬运，
-    //    其余块整块在界内——与单缓冲版一致）─────────────────────────────────
-    auto load_K = [&](int nb, int stage) {
+    // ── 装载 lambda（带 stage 维；谓词一次性判定，与单缓冲版一致）──────────
+    // tail_tile（上方 mask 谓词段定义）为真时首块走 ZFILL 谓词装载；循环内全部
+    // 以字面量 false 调用，内联后分支编译期消解。
+    auto load_K = [&](int nb, int stage, bool boundary) {
         // stage 切片先绑定到具名局部变量：FLASH copy 的 dst 形参是非 const
         // 左值引用，不能绑定临时右值
         Tensor tKsK_st = tKsK(_, _, _, stage);
-        if (Is_even_MN || nb < n_block_max - 1) {
+        if (!boundary) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
                 gmem_tiled_copy_QKV, tKgK(_, _, _, nb), tKsK_st, tKVcKV, tKVpKV);
         } else {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
+            FLASH_NAMESPACE::copy_zfill</*Is_even_MN=*/false, Is_even_K>(
                 gmem_tiled_copy_QKV, tKgK(_, _, _, nb), tKsK_st, tKVcKV, tKVpKV,
                 actual_seqlen_k - nb * kBlockN);
         }
     };
-    auto load_V = [&](int nb, int stage) {
+    auto load_V = [&](int nb, int stage, bool boundary) {
         Tensor tVsV_st = tVsV(_, _, _, stage);
-        if (Is_even_MN || nb < n_block_max - 1) {
+        if (!boundary) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
                 gmem_tiled_copy_QKV, tVgV(_, _, _, nb), tVsV_st, tKVcKV, tKVpKV);
         } else {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
+            FLASH_NAMESPACE::copy_zfill</*Is_even_MN=*/false, Is_even_K>(
                 gmem_tiled_copy_QKV, tVgV(_, _, _, nb), tVsV_st, tKVcKV, tKVpKV,
                 actual_seqlen_k - nb * kBlockN);
         }
     };
-    auto copy_g2s_mask = [&](int nb, int stage) {
+    auto copy_g2s_mask = [&](int nb, int stage, bool tail) {
         Tensor tQsMask_st = tQsMask(_, _, _, stage);
-        // 列谓词（k 维不 pad）：仅全局边界 tile 且 Sk%kBlockN!=0 时非平凡
-        const bool cols_full = Is_even_MN || (nb < n_block_max - 1) ||
-                               (actual_seqlen_k % kBlockN == 0);
-        if (cols_full) {
-            if constexpr (Kernel_traits::kMaskQFull) {
-                cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, nb), tQsMask_st);
-            } else {
-                cute::copy_if(gmem_tiled_copy_Mask, tMpMask,
-                              tQgMask(_, _, _, nb), tQsMask_st);
-            }
-        } else {
-            const int cols_left = actual_seqlen_k - nb * kBlockN;  // 8 对齐
-            Tensor predK = make_tensor<bool>(make_shape(size<1>(tMcMask), size<2>(tMcMask)));
-            #pragma unroll
-            for (int m = 0; m < size<0>(predK); ++m) {
-                #pragma unroll
-                for (int n = 0; n < size<1>(predK); ++n) {
-                    predK(m, n) = (get<1>(tMcMask(_0{}, m, n)) < cols_left)
-                               && (Kernel_traits::kMaskQFull ||
-                                   get<0>(tMcMask(_0{}, m, n)) < mask_rows_left);
-                }
-            }
-            cute::copy_if(gmem_tiled_copy_Mask, predK,
+        // 谓词选择发射（与单缓冲版一致）：tail 为真用联合谓词（列 OOB 由 ZFILL
+        // 零填充 + apply 点强制 -inf），否则行谓词 / 无谓词直拷
+        if (!Kernel_traits::kMaskQFull || tail) {
+            cute::copy_if(gmem_tiled_copy_Mask, tail ? tMpMaskTail : tMpMask,
                           tQgMask(_, _, _, nb), tQsMask_st);
+        } else {
+            cute::copy(gmem_tiled_copy_Mask, tQgMask(_, _, _, nb), tQsMask_st);
         }
     };
-    auto apply_mask_from_smem = [&](auto &acc_s, int stage) {
+    // 坐标张量与 acc_s 同构（partition_C），列坐标为编译期布局的线性函数
+    Tensor cS_ = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor taccScS = thr_mma.partition_C(cS_);   // (4, MMA_M, MMA_N) fragment 坐标
+    auto apply_mask_from_smem = [&](auto &acc_s, int stage, bool force_oob_inf) {
         const float mask_inv_scale = 1.f / params.scale_softmax;
         Tensor rMask = make_tensor<Element>(
             partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
         auto tSrMask_view = smem_thr_copy_mask.retile_D(rMask);
         cute::copy(smem_tiled_copy_mask, tSsMask(_, _, _, stage), tSrMask_view);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s); ++i) {
-            acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
+        if (force_oob_inf) {
+            // 尾 tile 首块：列 OOB（col ≥ mask_k_tail）强制 -inf（softmax 屏蔽位）
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) = (get<1>(taccScS(i)) >= mask_k_tail)
+                    ? -INFINITY
+                    : acc_s(i) + static_cast<float>(rMask(i)) * mask_inv_scale;
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) += static_cast<float>(rMask(i)) * mask_inv_scale;
+            }
         }
     };
 
@@ -1198,15 +1151,15 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
         const int n_first = n_end - 1;   // 本 split 首个处理块（倒序遍历）
 
         // ── Prologue：Q + 首个 tile 的 K+V+Mask → stage 0 ────────────────
-        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+        FLASH_NAMESPACE::copy_zfill<Is_even_MN, Is_even_K>(
             gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
             actual_seqlen_q - m_block * kBlockM
         );
         cute::cp_async_fence();
 
-        load_K(n_first, 0);
-        load_V(n_first, 0);
-        copy_g2s_mask(n_first, 0);
+        load_K(n_first, 0, tail_tile);
+        load_V(n_first, 0, tail_tile);
+        copy_g2s_mask(n_first, 0, tail_tile);
         cute::cp_async_fence();
 
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -1224,9 +1177,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
 
             // 预发射下一 tile 的 K+V+Mask → 另一级 stage（与本次计算完全重叠）
             if (has_next) {
-                load_K(n_block - 1, stage ^ 1);
-                load_V(n_block - 1, stage ^ 1);
-                copy_g2s_mask(n_block - 1, stage ^ 1);
+                load_K(n_block - 1, stage ^ 1, /*boundary=*/false);
+                load_V(n_block - 1, stage ^ 1, /*boundary=*/false);
+                copy_g2s_mask(n_block - 1, stage ^ 1, /*tail=*/false);
                 cute::cp_async_fence();
             }
 
@@ -1237,7 +1190,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
                 smem_thr_copy_Q, smem_thr_copy_K
             );
 
-            apply_mask_from_smem(acc_s, stage);
+            apply_mask_from_smem(acc_s, stage, tail_tile && (n_block == n_first));
 
             if (n_block == n_first) {
                 softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/true>(
@@ -1267,8 +1220,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mask_db(
 
         // Split 约定（与单缓冲版/sm120 combine 配套）：O_s 按本地 l 归一化；
         // lse_s = m*scale + log(l)；全屏蔽行 sum=0 → lse=-inf
-        lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, /*Split=*/true>(
-            acc_o, params.scale_softmax, /*rp_dropout=*/1.0f
+        lse = softmax.template normalize_softmax_lse</*Split=*/true>(
+            acc_o, params.scale_softmax
         );
     } else {
         // 空 split（尾部分裂）：O_partial 写 0（acc_o 已 clear），LSE 写 -inf

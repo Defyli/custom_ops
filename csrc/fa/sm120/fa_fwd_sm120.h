@@ -535,8 +535,8 @@ flash_fwd_mask_kernel_sm120(
     }
 
     // ── Epilogue：归一化 → sO（复用 sQ / sK smem）→ TMA store ────────────
-    softmax.template normalize_softmax_lse</*Is_dropout=*/false>(
-        acc_o, p.scale_softmax, /*rp_dropout=*/1.0f);
+    softmax.template normalize_softmax_lse(
+        acc_o, p.scale_softmax);
 
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
     // kQInRegs 时无 sQ 区域，sO 复用 sK（kStages*kBlockN >= kBlockM 由 traits 保证）
@@ -1329,8 +1329,8 @@ flash_fwd_mask_kernel_sm120_splitkv(
         }
 
         // Split 约定（FA3 combine 配套）：O_s 按本地 l 归一化；lse_s = m*scale + log(l)，全屏蔽行 = -inf
-        lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, /*Split=*/true>(
-            acc_o, p.scale_softmax, /*rp_dropout=*/1.0f);
+        lse = softmax.template normalize_softmax_lse</*Split=*/true>(
+            acc_o, p.scale_softmax);
     } else {
         // 空 split（尾部分裂）：写 0 / -inf，combine 中 scale=0 跳过
         cute::fill(lse, -INFINITY);

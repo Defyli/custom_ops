@@ -13,8 +13,9 @@
  *   - q 维：mask_seqlen_q ∈ [seqlen_q, 任意]，无需对齐——kernel 行谓词跳过越界行，
  *     这些行的输出被 epilogue 丢弃
  *   - k 维：mask_seqlen_k ∈ [seqlen_k, 任意] 且 %8==0（128-bit cp.async 行对齐），
- *     无需 pad 到 kBlockN——边界 tile 的越界列由列谓词跳过拷贝、smem 预清 -inf
- *     （语义：col ≥ Sk 恒为屏蔽，mask 越界列内容被忽略）
+ *     无需 pad 到 kBlockN——边界 tile 的越界列由列谓词 ZFILL 零填充，-inf 屏蔽
+ *     语义由 kernel 的 apply 点按列坐标强制（col ≥ Sk 恒为屏蔽，mask 越界列
+ *     内容被忽略）
  *
  * Mask 语义：加法 mask（与 PyTorch SDPA 对齐，softmax(S·scale + mask)）
  *   0 → 可见，-inf → 屏蔽，有限值 → 任意偏置（ALiBi 风格）
@@ -131,7 +132,11 @@ struct FA_mask_kernel_traits : public Base {
     // Val layout：每次 128-bit = kGmemElemsPerLoad elem，跨 kBlockKSmemMask 填满 kBlockN
     static constexpr int kMaskRowSize = kBlockN / kBlockKSmemMask;
     using GmemTiledCopyMask = decltype(make_tiled_copy(
-        Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, Element>{},
+        // ZFILL：谓词为假的向量 src-size=0 → 硬件零填充目标 smem。mask 的行 OOB
+        // 写 0 即可（输出丢弃）；列 OOB 写 0 后由 kernel 的 apply 点按列坐标强制
+        // -inf（消费端语义，见 fa_fwd_kernel.h apply_mask_from_smem），消灭发射
+        // 前的「预清 -inf / 清 0」循环与谓词为假的跳过式分支。
+        Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>, Element>{},
         GmemLayoutAtomMask{},
         Layout<Shape<Int<kMaskRowSize>, Int<kGmemElemsPerLoad>>,
                Stride<Int<kGmemElemsPerLoad>, _1>>{}

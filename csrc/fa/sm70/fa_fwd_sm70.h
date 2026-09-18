@@ -77,9 +77,16 @@
  * Mask 语义与 sm89/sm120 一致：softmax(S·scale + mask)，越界 -inf。
  * mask 契约（无 pad，同 sm89/sm120）：(B, mask_seqlen_q, mask_seqlen_k)，
  *   Sk%8==0 即可（gmem copy 128-bit 向量对齐）、Sq 任意；语义 col ≥ Sk 恒为屏蔽。
- *   与 sm89 的 prologue 一次性预清不同：sMask 与 sP 时间复用，每轮 Phase C 的
- *   P store 覆写全 tile → 边界 tile 越界列的 -inf 必须逐轮回写（Phase A 内，
- *   受上轮 sync6 保护，无 race）。
+ * OOB 处理（对齐 sm89 的收敛设计；Volta 无 cp.async/ZFILL 的差异点单独注明）：
+ *   - K/V：仍为「谓词跳过拷贝 + cute::clear 手动清零」——Volta 无 ZFILL 硬件
+ *     可依赖，ld/STS 必须显式补零防 smem 垃圾值；全 tile 由模板参数
+ *     Is_even_MN/Is_even_K 编译期裁掉全部边界逻辑
+ *   - Mask：128-bit 向量粒度拷贝（per-slice cute::copy + 显式向量谓词分支，
+ *     取代旧实现 per-element 16-bit 循环）；越界列向量整段跳过拷贝，消费端
+ *     Phase B2 按列
+ *     坐标强制 -inf（与 sm89/sm120 的 apply 点收敛一致）——取代旧实现的
+ *     「谓词拷贝 + 逐向量 -inf 回写」两步。sMask=sP 时间复用下，被跳过向量
+ *     的 smem 残留为上一轮 P 值（∈[0,1] 有限），消费端永不读取
  */
 
 #pragma once
@@ -390,7 +397,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_sm70(
                            Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, 0));
 
     // mask 列数 = mask 实际列数（≥ seqlen_k 且 %8==0，无需 pad 到 kBlockN）；
-    // 边界 tile 的越界列由主循环 Phase A 的列谓词跳过拷贝 + -inf 回写
+    // 边界 tile 的越界列由主循环 Phase A 的向量谓词跳过拷贝 + Phase B2 按列
+    // 坐标强制 -inf（消费端语义，与 sm89/sm120 收敛一致）
     Tensor mMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<const Element*>(params.mask_ptr)
                       + bidb * params.mask_batch_stride),
@@ -531,47 +539,44 @@ __forceinline__ __device__ void compute_attn_1rowblock_sm70(
         //    K[n] 已在 prologue 或上一轮 prefetch 中 load 到 sK[n&1]
         //    （沿用 v8.1：三个 gmem 访问并行发射，与 QK^T 计算重叠）
         {
-            // mask copy（行/列联合谓词，k 维不 pad 契约：Sk%8==0 即可）
-            //   行：越界行跳过（该行输出被 epilogue 丢弃，残留 P 值无害）
-            //   列：仅全局边界 tile（!Is_even_MN 且 Sk%kBlockN!=0）存在越界列——
-            //     谓词跳过拷贝（防 gmem 越界读，mask_seqlen_k 可非 kBlockN 倍数）
-            //     并回写 -inf。sMask 与 sP 时间复用，每轮 P store 覆写全 64×64，
-            //     sm89 式 prologue 一次性预清不可用 → -inf 逐轮回写
-            //     （Phase A 受上轮 sync6 保护，与 P 读消费不 race）
-            const bool mask_cols_full = Is_even_MN || (n_block < n_block_max - 1) ||
-                                        (actual_seqlen_k % kBlockN == 0);
-            if (mask_cols_full) {
+            // mask copy：128-bit 向量粒度 + 向量谓词（k 维不 pad 契约：
+            // Sk%8==0 → 列边界整向量对齐，64 halves/行 = 8 向量）。
+            // 每向量一条 LDG.128+STS.128——取代旧实现 per-element 16-bit 循环
+            //   - 行谓词（prologue 一次构建）：越界行向量跳过（该行输出被
+            //     epilogue 丢弃，残留 P 值有限无害）
+            //   - 列谓词（仅全局边界 tile 非平凡）：越界列向量整段跳过拷贝，
+            //     取代旧实现「谓词拷贝 + 逐向量 -inf 回写」两步——被跳过向量
+            //     的 smem 残留（上一轮 P，∈[0,1] 有限）由消费端 Phase B2 按列
+            //     坐标强制 -inf，永不读取（Phase A 受上轮 sync6 保护，与 P 读
+            //     消费不 race）
+            const int mask_cols_left = actual_seqlen_k - n_block * kBlockN;
+            // per-slice cute::copy（rank-1 size-8 → 单条 LDG.128+STS.128，与
+            // FLASH_NAMESPACE::copy / QKV 拷贝同路径）+ 显式向量谓词分支。
+            // 注：不用 cute::copy_if——非谓词 atom（AutoVectorizing）下其
+            // per-vector 分派会把 val 元素误当向量起点，发射 2-byte 步长的
+            // 16B 访问（misaligned address，V100 实测）
+            if (mask_cols_left >= kBlockN) {
+                // 整块列在界内（主场景，含全部非边界 tile）：行谓词
                 #pragma unroll
                 for (int m = 0; m < size<1>(tQgMask(_, _, _, n_block)); ++m) {
                     #pragma unroll
                     for (int n = 0; n < size<2>(tQgMask(_, _, _, n_block)); ++n) {
                         if (tMpMask(m, n)) {
-                            #pragma unroll
-                            for (int v = 0; v < size<0>(tQgMask(_, m, n, n_block)); ++v) {
-                                tQsMask_g2s(v, m, n) = tQgMask(v, m, n, n_block);
-                            }
+                            cute::copy(gmem_tiled_copy_Mask,
+                                       tQgMask(_, m, n, n_block), tQsMask_g2s(_, m, n));
                         }
                     }
                 }
             } else {
-                const int mask_cols_left = actual_seqlen_k - n_block * kBlockN;  // 8 对齐
-                const Element mask_neg_inf(static_cast<float>(-INFINITY));
+                // 列边界 tile：行×列联合谓词，越界列向量不发射
                 #pragma unroll
                 for (int m = 0; m < size<1>(tQgMask(_, _, _, n_block)); ++m) {
                     #pragma unroll
                     for (int n = 0; n < size<2>(tQgMask(_, _, _, n_block)); ++n) {
-                        if (get<1>(tMcMask(_0{}, m, n)) < mask_cols_left) {
-                            if (tMpMask(m, n)) {
-                                #pragma unroll
-                                for (int v = 0; v < size<0>(tQgMask(_, m, n, n_block)); ++v) {
-                                    tQsMask_g2s(v, m, n) = tQgMask(v, m, n, n_block);
-                                }
-                            }
-                        } else {  // 列越界（≥ Sk）：回写 -inf，softmax 语义屏蔽位
-                            #pragma unroll
-                            for (int v = 0; v < size<0>(tQsMask_g2s); ++v) {
-                                tQsMask_g2s(v, m, n) = mask_neg_inf;
-                            }
+                        if (tMpMask(m, n) &&
+                            get<1>(tMcMask(_0{}, m, n)) < mask_cols_left) {
+                            cute::copy(gmem_tiled_copy_Mask,
+                                       tQgMask(_, m, n, n_block), tQsMask_g2s(_, m, n));
                         }
                     }
                 }
@@ -638,8 +643,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_sm70(
 
         // B2. mask 加法 + scale → log2 域（读 sMask，4×LDS.32/lane）
         //     关键：避免 inf + (-inf) = nan，mask=-inf 时直接设 s=-inf
+        //     列 OOB（全局边界 tile，Phase A 跳过拷贝的向量）：按列坐标强制
+        //     -inf——消费端语义与 sm89（mask_k_tail）/sm120（apply 点）收敛一致
         {
             const float mask_inv_scale = 1.f / params.scale_softmax;
+            const int mask_cols_left = actual_seqlen_k - n_block * kBlockN;
             float mask_vals[8];   // [rr][cc_pair] 对应 acc x[i] 的 mask 值
             const __half* smask_sp = reinterpret_cast<const __half*>(sP_ptr);
             #pragma unroll
@@ -658,9 +666,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_sm70(
             for (int i = 0; i < 8; ++i) {
                 const int rr = (i >> 1) & 1;                       // 行（0/1）
                 const int cc = (i & 1) + 2 * ((i >> 2) & 1);       // 0..3 mask_vals 索引
+                // 列偏移 {0,1,4,5}；列 OOB 判定与 Phase A 的向量谓词同粒度对齐
+                const int col_off = (i & 1) + 4 * ((i >> 2) & 1);
                 const float mask_val = mask_vals[rr * 4 + cc];
                 float s;
-                if (isinf(mask_val) && mask_val < 0.f) {
+                if (s_col_base + col_off >= mask_cols_left) {
+                    s = -INFINITY;   // 列 OOB：强制屏蔽（OOB 向量未拷贝，残留值不可信）
+                } else if (isinf(mask_val) && mask_val < 0.f) {
                     s = -INFINITY;
                 } else {
                     s = acc_s.x[i] + mask_val * mask_inv_scale;

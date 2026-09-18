@@ -30,65 +30,6 @@ namespace FLASH_NAMESPACE {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T>
-__forceinline__ __device__ uint32_t relu2(const uint32_t x);
-
-template<>
-__forceinline__ __device__ uint32_t relu2<cutlass::half_t>(const uint32_t x) {
-    uint32_t res;
-    const uint32_t zero = 0u;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("max.f16x2 %0, %1, %2;\n" : "=r"(res) : "r"(x), "r"(zero));
-#else
-    asm volatile( \
-        "{\n" \
-        "\t .reg .f16x2 sela;\n" \
-        "\t set.gtu.u32.f16x2 sela, %1, %2;\n" \
-        "\t and.b32 %0, sela, %1;\n" 
-        "}\n" : "=r"(res) : "r"(x), "r"(zero));
-#endif
-    return res;
-}
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-template<>
-__forceinline__ __device__ uint32_t relu2<cutlass::bfloat16_t>(const uint32_t x) {
-    uint32_t res;
-    const uint32_t zero = 0u;
-    asm volatile("max.bf16x2 %0, %1, %2;\n" : "=r"(res) : "r"(x), "r"(zero));
-    return res;
-}
-#endif
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-
-template<typename T>
-__forceinline__ __device__ uint32_t convert_relu2(const float2 x);
-
-template<>
-__forceinline__ __device__ uint32_t convert_relu2<cutlass::half_t>(const float2 x) {
-    uint32_t res;
-    const uint32_t a = reinterpret_cast<const uint32_t&>(x.x);
-    const uint32_t b = reinterpret_cast<const uint32_t&>(x.y);
-    asm volatile("cvt.rn.relu.f16x2.f32 %0, %1, %2;\n" : "=r"(res) : "r"(b), "r"(a));
-    return res;
-}
-
-template<>
-__forceinline__ __device__ uint32_t convert_relu2<cutlass::bfloat16_t>(const float2 x) {
-    uint32_t res;
-    const uint32_t a = reinterpret_cast<const uint32_t&>(x.x);
-    const uint32_t b = reinterpret_cast<const uint32_t&>(x.y);
-    asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;\n" : "=r"(res) : "r"(b), "r"(a));
-    return res;
-}
-
-#endif
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<typename T>
 struct MaxOp {
 __device__ __forceinline__ T operator()(T const & x, T const & y) { return x > y ? x : y; }
 };
@@ -213,18 +154,6 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-template<typename Layout>
-__forceinline__ __device__ auto convert_layout_acc_dropout(Layout acc_layout) {
-    using X = Underscore;
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
-    return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
@@ -233,47 +162,6 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tenso
     // HACK: this requires tensor to be "contiguous"
     auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
     return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename Engine, typename Layout>
-__forceinline__ __device__ void relu_(Tensor<Engine, Layout> &tensor) {
-    constexpr int numel = decltype(size(tensor))::value;
-    static_assert(numel % 2 == 0);
-    using value_t = typename Engine::value_type;
-    // HACK: this requires tensor to be "contiguous"
-    Tensor tensor_uint32 = recast<uint32_t>(tensor);
-    #pragma unroll
-    for (int i = 0; i < size(tensor_uint32); ++i) {
-        tensor_uint32(i) = relu2<value_t>(tensor_uint32(i));
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// On SM80 and above, we can fuse fp32 -> fp16/bf16 conversion and relu into 1 instruction
-template <typename To_type, typename Engine, typename Layout>
-__forceinline__ __device__ auto convert_type_relu(Tensor<Engine, Layout> const &tensor) {
-    using From_type = typename Engine::value_type;
-    static_assert(std::is_same_v<To_type, cutlass::half_t> || std::is_same_v<To_type, cutlass::bfloat16_t>);
-    static_assert(std::is_same_v<float, From_type>);
-    constexpr int numel = decltype(size(tensor))::value;
-    static_assert(numel % 2 == 0);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    // HACK: this requires tensor to be "contiguous"
-    Tensor tensor_float2 = recast<float2>(tensor);
-    Tensor out_uint32 = make_tensor<uint32_t>(tensor_float2.layout());
-    #pragma unroll
-    for (int i = 0; i < size(out_uint32); ++i) {
-        out_uint32(i) = convert_relu2<To_type>(tensor_float2(i));
-    }
-    Tensor out = make_tensor(make_rmem_ptr<To_type>(out_uint32.data()), tensor.layout());
-#else
-    Tensor out = FLASH_NAMESPACE::convert_type<To_type>(tensor);
-    FLASH_NAMESPACE::relu_(out);
-#endif
-    return out;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -321,90 +209,58 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
             cute::clear(D(_, m, _));
         }
     }
-    // TD [2023-04-13]: Strange that the code below can cause race condition.
-    // I think it's because the copies are under an if statement.
-    // if (Is_even_K) {
-    //     #pragma unroll
-    //     for (int m = 0; m < size<1>(S); ++m) {
-    //         if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
-    //             copy(tiled_copy, S(_, m, _), D(_, m, _));
-    //         } else if (Clear_OOB_MN) {
-    //             clear(D(_, m, _));
-    //         }
-    //     }
-    // } else {  // It's slightly faster in this case if iterate over K first
-    //     #pragma unroll
-    //     for (int k = 0; k < size<2>(S); ++k) {
-    //         if (predicate_K(k)) {
-    //             #pragma unroll
-    //             for (int m = 0; m < size<1>(S); ++m) {
-    //                 if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
-    //                     copy(tiled_copy, S(_, m, k), D(_, m, k));
-    //                 } else if (Clear_OOB_MN) {
-    //                     clear(D(_, m, k));
-    //                 }
-    //             }
-    //         } else if (Clear_OOB_K) {  // There's no case where !Clear_OOB_K && Clear_OOB_MN
-    //             if (Clear_OOB_MN || Is_even_MN) {
-    //                 clear(D(_, _, k));
-    //             } else {
-    //                 #pragma unroll
-    //                 for (int m = 0; m < size<1>(S); ++m) {
-    //                     if (!(Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN)) {
-    //                         clear(D(_, m, k));
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool Is_even_K=true,
-          typename Engine0, typename Layout0, typename Engine1, typename Layout1,
+// copy_zfill — gmem→smem 谓词拷贝（cp.async ZFILL 版，sm80+）。
+//
+// 语义对应 copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>（OOB 清零，防
+// smem 垃圾值 × 大值 → ±inf，再 + mask(-inf) → NaN），实现取而代之：
+//   - M/K-OOB 的 128-bit 向量由 cp.async 的 src-size 谓词硬件零填充目标 smem
+//     （四操作数形式，src_size = pred ? 16 : 0）——取代「跳过拷贝 +
+//     cute::clear 手动清零」两步：谓词为假也发射同一条 cp.async，发射路径
+//     无分支（谓词仅是 src_size 的数据依赖），亦无 OOB 清零指令序列；
+//   - 谓词按向量粒度构造为 (M, K) 布尔张量，单次 copy_if 发射（copy_if 的
+//     back-compat 入口自动 prepend stride-0 的 V 维，每向量的 8 个元素共享
+//     同一谓词位），消除 copy<> 的 per-(m,k) 坐标比较与分支。
+//
+// 前提：tiled_copy 的 atom 为 *_ZFILL 变体（Flash_fwd_kernel_traits 的
+// Gmem_copy_struct 已统一替换；ZFILL traits 谓词默认 true，无谓词路径的
+// cute::copy 与非 ZFILL 版逐位一致，既有调用点零影响）。
+//
+// 与逆序装载的配合：倒序遍历下边界 tile 只可能是首个处理块（全局尾块），
+// 调用方一次判定后仅在首块调用本函数，其余块整块在界内、直接走无谓词
+// copy——「是否需要谓词」的判断从每次装载收敛为一次（见 kernel 调用点）。
+template <bool Is_even_MN=true, bool Is_even_K=true,
+          typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-__forceinline__ __device__ void copy_w_min_idx(Tensor<Engine0, Layout0> const &S,
-                                      Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                                      Tensor<Engine3, Layout3> const &predicate_K,
-                                      const int max_MN=0, const int min_MN=0) {
+__forceinline__ __device__ void copy_zfill(TiledCopy const &tiled_copy,
+                            Tensor<Engine0, Layout0> const &S,
+                            Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
+                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
     CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
-    // if (threadIdx.x == 0 && blockIdx.z == 0) { printf("blockIdx.y = %d, max_MN = %d, min_MN = %d\n", blockIdx.y, max_MN, min_MN); }
-    #pragma unroll
-    for (int m = 0; m < size<1>(S); ++m) {
-        // if (threadIdx.x == 0 && blockIdx.z == 0) { printf("blockIdx.y = %d, m = %d\n", blockIdx.y, get<0>(identity_MN(0, m, 0))); }
-        if (get<0>(identity_MN(0, m, 0)) >= min_MN && get<0>(identity_MN(0, m, 0)) < max_MN) {
-            // if (threadIdx.x == 0 && blockIdx.z == 0) { printf("Inner loop, blockIdx.y = %d, m = %d\n", blockIdx.y, get<0>(identity_MN(0, m, 0))); }
+    if constexpr (Is_even_MN && Is_even_K) {
+        // 编译期即可证明整块在界内：直接无谓词拷贝
+        cute::copy(tiled_copy, S, D);
+    } else {
+        // (M, K) 联合谓词：向量粒度，一次构造（行谓词比较提升到 m 循环外，
+        // 每行仅一次；谓词张量驻留寄存器，发射阶段零分支）
+        Tensor pred = make_tensor<bool>(make_shape(size<1>(S), size<2>(S)));
+        #pragma unroll
+        for (int m = 0; m < size<1>(S); ++m) {
+            const bool m_ok = Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN;
             #pragma unroll
             for (int k = 0; k < size<2>(S); ++k) {
-                if (Is_even_K || predicate_K(k)) {
-                    cute::copy(S(_, m, k), D(_, m, k));
-                }
+                pred(m, k) = m_ok && (Is_even_K || predicate_K(k));
             }
         }
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename Engine, typename Layout>
-__forceinline__ __device__ void apply_softcap(Tensor<Engine, Layout> &tensor, const float softcap){
-    #pragma unroll
-    for (int i = 0; i < size(tensor); ++i) {
-        tensor(i) = cutlass::fast_tanh(tensor(i) * softcap);
-    }
-}
-
-template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-__forceinline__ __device__ void calculate_dtanh(Tensor<Engine0, Layout0> &src_tensor, Tensor<Engine1, Layout1> &dst_tensor, const float softcap){
-    #pragma unroll
-    for (int i = 0; i < size(src_tensor); ++i) {
-        dst_tensor(i) = (1.f - (src_tensor(i) * src_tensor(i))) * softcap;
+        // ZFILL atom：pred=false → cp.async src_size=0 → 目标 smem 硬件清零
+        cute::copy_if(tiled_copy, pred, S, D);
     }
 }
 
