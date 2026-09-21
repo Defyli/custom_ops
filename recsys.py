@@ -29,6 +29,8 @@ custom_ops/recsys.py — RecsysOps：推荐系统核心 CUDA 算子库（分组�
 from __future__ import annotations
 
 import os
+import warnings
+
 import torch
 
 from custom_ops import CustomOps
@@ -45,6 +47,25 @@ DEFAULT_RESIDUAL_SCALE = 1.0 / 256.0
 
 # 激活函数名 → kernel 枚举
 _ACTIVATION_TO_ID = {"identity": 0, "silu": 1, "gelu": 2}
+
+
+def _resolve_backend(backend):
+    """解析 backend 参数：显式传参 > 环境变量 CUSTOM_OPS_BACKEND > "auto"。
+
+    - "cuda"：手写 CUDA/CuTe kernel（默认行为，与历史版本一致）
+    - "tilelang"：Tile-lang 后端（custom_ops.tilelang_ops，无需 nvcc/
+      架构专用路径，Python DSL JIT）
+    - "auto"：CUDA 分组加载成功则用 CUDA；失败（无 nvcc / 架构不支持 /
+      编译错误）时自动回退 Tile-lang
+    """
+    if backend is None:
+        backend = os.environ.get("CUSTOM_OPS_BACKEND", "auto")
+    backend = str(backend).lower()
+    if backend not in ("auto", "cuda", "tilelang"):
+        raise ValueError(
+            f"backend must be 'auto' | 'cuda' | 'tilelang', got {backend!r} "
+            f"(or set CUSTOM_OPS_BACKEND env)")
+    return backend
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,6 +322,37 @@ class RecsysOps:
                 return g.load_error()
         return None
 
+    # ── 后端选择 ──────────────────────────────────────────────────────────
+
+    def _tilelang(self):
+        """返回 Tile-lang 后端门面（懒导入；不可用时抛出 informative 错误）。"""
+        try:
+            from custom_ops.tilelang_ops import tilelang_ops
+        except Exception as e:
+            raise RuntimeError(
+                "Tile-lang 后端不可用：custom_ops.tilelang_ops 导入失败"
+                "（pip install tile-lang 后重试）") from e
+        if not tilelang_ops.is_available():
+            raise RuntimeError("Tile-lang 后端不可用：需要 tile-lang 与 CUDA")
+        return tilelang_ops
+
+    def _dispatch(self, backend, group):
+        """返回 (是否走 tile-lang, tile-lang 门面或 None)。
+
+        auto：CUDA 分组加载成功 → CUDA；失败 → Tile-lang（不可用时抛出
+        包含 CUDA 编译错误信息的 RuntimeError）。"""
+        b = _resolve_backend(backend)
+        if b == "tilelang":
+            return True, self._tilelang()
+        if b == "auto" and not self._group(group).is_available():
+            tl = self._tilelang()   # tile-lang 也不可用时抛错
+            err = self._group(group).load_error()
+            warnings.warn(
+                f"CUDA 分组 '{group}' 加载失败，自动回退 Tile-lang 后端"
+                + (f"（原因：{err}）" if err else ""))
+            return True, tl
+        return False, None
+
     # ── 算子访问 ──────────────────────────────────────────────────────────────
 
     def __getattr__(self, name: str):
@@ -325,8 +377,15 @@ class RecsysOps:
         k:    torch.Tensor,   # (B, Hk, Sk, d)   fp16/bf16 CUDA
         v:    torch.Tensor,   # (B, Hk, Sk, d)   fp16/bf16 CUDA
         mask: torch.Tensor,   # (B, 1, ≥Sq, ≥Sk) 与 q 同 dtype，0=可见 / -inf=屏蔽
+        backend: str | None = None,   # "auto" | "cuda" | "tilelang"
     ) -> torch.Tensor:
-        """Flash Attention 2 前向，支持任意 fp16/bf16 加法 mask（懒加载 FA 分组）。"""
+        """Flash Attention 2 前向，支持任意 fp16/bf16 加法 mask（懒加载 FA 分组）。
+
+        backend="tilelang" 时走 Tile-lang 后端；"auto" 时 CUDA 不可用自动回退。
+        """
+        tl, facade = self._dispatch(backend, "fa")
+        if tl:
+            return facade.mha_fwd_with_mask(q, k, v, mask)
         return self._group("fa").mha_fwd_with_mask(q, k, v, mask)
 
     def mixed_gemm(
@@ -341,8 +400,19 @@ class RecsysOps:
         activation:   str | int = "identity",
         out_dtype:    torch.dtype | None = None,
         force_splitk: int = 0,
+        backend:      str | None = None,   # "auto" | "cuda" | "tilelang"
     ) -> torch.Tensor:
-        """混合精度 GEMM：y = activation(x @ (w_high + w_low*scale)^T + bias)。"""
+        """混合精度 GEMM：y = activation(x @ (w_high + w_low*scale)^T + bias)。
+
+        backend="tilelang" 时走 Tile-lang 后端；"auto" 时 CUDA 不可用自动回退。
+        """
+        tl, facade = self._dispatch(backend, "mixed_gemm")
+        if tl:
+            if isinstance(activation, int):
+                activation = {v: k for k, v in _ACTIVATION_TO_ID}[activation]
+            return facade.mixed_gemm(
+                x, w_high, w_low, w_scale, scale=scale, bias=bias,
+                activation=activation, out_dtype=out_dtype)
         if isinstance(activation, str):
             if activation not in _ACTIVATION_TO_ID:
                 raise ValueError(
@@ -368,6 +438,7 @@ class RecsysOps:
         down_weight:    torch.Tensor,                      # (E, H, I) 同 dtype
         topk_ids:       torch.Tensor,                      # (S, K) int32
         topk_scale:     torch.Tensor,                      # (S, K) fp32
+        backend:        str | None = None,   # "auto" | "cuda" | "tilelang"
     ) -> torch.Tensor:
         """
         MoE 前向融合算子（单 GPU，bf16/fp16 输入，fp32 累加）：
@@ -376,7 +447,13 @@ class RecsysOps:
 
         限制：H % 64 == 0 且 I % 64 == 0；num_topk <= 128；num_expert <= 512；
         SM80+（sm89 / sm120）。
+
+        backend="tilelang" 时走 Tile-lang 后端；"auto" 时 CUDA 不可用自动回退。
         """
+        tl, facade = self._dispatch(backend, "fuse_moe")
+        if tl:
+            return facade.fuse_moe(x, gate_up_weight, down_weight,
+                                   topk_ids, topk_scale)
         return self._group("fuse_moe").fuse_moe(
             x, gate_up_weight, down_weight, topk_ids, topk_scale)
 
@@ -384,6 +461,7 @@ class RecsysOps:
         self,
         x:      torch.Tensor,   # (M, K) bf16/fp16
         weight: torch.Tensor,   # (2N, K) 同 dtype，gate 行在前 up 在后
+        backend: str | None = None,   # "auto" | "cuda" | "tilelang"
     ) -> torch.Tensor:
         """
         SwiGLU 融合算子（单 GPU，bf16/fp16 输入，fp32 累加）：
@@ -392,7 +470,12 @@ class RecsysOps:
 
         单 kernel 完成配对 GEMM + 激活（无 (M, 2N) gate_up 中间量物化）。
         限制：K % 64 == 0，N % 64 == 0；M 任意；SM80+（sm89 / sm120）。
+
+        backend="tilelang" 时走 Tile-lang 后端；"auto" 时 CUDA 不可用自动回退。
         """
+        tl, facade = self._dispatch(backend, "swiglu")
+        if tl:
+            return facade.swiglu(x, weight)
         return self._group("swiglu").swiglu(x, weight)
 
 
