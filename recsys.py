@@ -29,11 +29,12 @@ custom_ops/recsys.py — RecsysOps：推荐系统核心 CUDA 算子库（分组�
 from __future__ import annotations
 
 import os
+import threading
 import warnings
 
 import torch
 
-from custom_ops import CustomOps
+from custom_ops import CustomOps, CustomOpsError
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,8 +80,13 @@ class FAOps(CustomOps):
     """
 
     namespace    = "recsys_ops"
+    requires_cuda = True
     so_name      = "recsys_fa_kernel"
     required_ops = ["mha_fwd_with_mask"]
+    op_schemas = {
+        "mha_fwd_with_mask": "mha_fwd_with_mask(Tensor q, Tensor k, Tensor v, Tensor mask) -> Tensor",
+    }
+    fake_ops = ["mha_fwd_with_mask"]
     optional_ops = []
     build_dir_fallback = "./torch_extensions"
 
@@ -111,8 +117,18 @@ class MixedGemmOps(CustomOps):
     """mixed_gemm 分组：混合精度 GEMM（bf16 主项 + fp8/int8 residual 补偿）。"""
 
     namespace    = "recsys_ops"
+    requires_cuda = True
     so_name      = "recsys_mixed_gemm_kernel"
     required_ops = ["mixed_gemm", "mixed_gemm_fp8_available"]
+    op_schemas = {
+        "mixed_gemm": (
+            "mixed_gemm(Tensor x, Tensor w_high, Tensor w_low, Tensor? w_scale=None, "
+            "float scale=0.00390625, Tensor? bias=None, int activation=0, "
+            "bool fp32_output=True, int force_splitk=0) -> Tensor"
+        ),
+        "mixed_gemm_fp8_available": "mixed_gemm_fp8_available() -> bool",
+    }
+    fake_ops = ["mixed_gemm", "mixed_gemm_fp8_available"]
     optional_ops = []
     build_dir_fallback = "./torch_extensions"
 
@@ -153,17 +169,86 @@ class FuseMoeOps(CustomOps):
     """fuse_moe 分组：MoE 前向融合算子（group GEMM + silu*mul + reduce）。"""
 
     namespace    = "recsys_ops"
+    requires_cuda = True
     so_name      = "recsys_fuse_moe_kernel"
-    required_ops = ["fuse_moe"]
+    required_ops = [
+        "fuse_moe", "fuse_moe_offload", "fuse_moe_offload_create",
+        "fuse_moe_offload_bind", "fuse_moe_offload_resident_bind",
+        "fuse_moe_offload_validate", "fuse_moe_offload_close", "fuse_moe_offload_stats",
+        "fuse_moe_offload_begin", "fuse_moe_offload_check", "fuse_moe_offload_status",
+        "fuse_moe_offload_acknowledge",
+    ]
+    op_schemas = {
+        "fuse_moe": (
+            "fuse_moe(Tensor x, Tensor gate_up_weight, Tensor down_weight, "
+            "Tensor topk_ids, Tensor topk_scale) -> Tensor"
+        ),
+        "fuse_moe_offload": (
+            "fuse_moe_offload(Tensor x, Tensor gate_up_weight_cpu, Tensor down_weight_cpu, "
+            "Tensor topk_ids, Tensor topk_scale, Tensor(a!) runtime_token, int layer_id, "
+            "int[]? deployment_config=None, int[]? deployment_manifest=None) -> Tensor"
+        ),
+        "fuse_moe_offload_create": (
+            "fuse_moe_offload_create(int device, int gpu_budget_bytes=0, int ram_budget_bytes=0, "
+            "int pinned_budget_bytes=0, int num_banks=2, int activation_mode=0, "
+            "int max_route_tile_rows=4096, int resident_cache_bytes=0, int dynamic_cache_bytes=0, "
+            "int cache_policy=0, int cache_decay_interval=32, int cache_min_reuse=2, "
+            "int cache_update_bytes=0, bool async_staging=False, bool host_profile=False, "
+            "int tile_m=0, int tile_n=128) -> Tensor"
+        ),
+        "fuse_moe_offload_bind": (
+            "fuse_moe_offload_bind(Tensor runtime_token, int layer_id, Tensor w1, Tensor w2) -> ()"
+        ),
+        "fuse_moe_offload_resident_bind": (
+            "fuse_moe_offload_resident_bind(Tensor token, int layer_id, int[] expert_ids) -> ()"
+        ),
+        "fuse_moe_offload_validate": (
+            "fuse_moe_offload_validate(Tensor runtime_token, int[] deployment_manifest) -> ()"
+        ),
+        "fuse_moe_offload_close": "fuse_moe_offload_close(Tensor runtime_token) -> ()",
+        "fuse_moe_offload_stats": "fuse_moe_offload_stats(Tensor runtime_token) -> Tensor",
+        "fuse_moe_offload_begin": "fuse_moe_offload_begin(Tensor runtime_token) -> ()",
+        "fuse_moe_offload_check": "fuse_moe_offload_check(Tensor runtime_token) -> ()",
+        "fuse_moe_offload_status": "fuse_moe_offload_status(Tensor runtime_token) -> Tensor",
+        "fuse_moe_offload_acknowledge": "fuse_moe_offload_acknowledge(Tensor runtime_token) -> ()",
+    }
+    # Graph-out lifecycle/status ops do not need fake execution. Test-only hooks
+    # are not deployment requirements, but must not appear in production libs.
+    testing_ops = ["_fuse_moe_offload_test_inject", "_fuse_moe_offload_test_worker_states"]
+    fake_ops = ["fuse_moe", "fuse_moe_offload"]
     optional_ops = []
     build_dir_fallback = "./torch_extensions"
+
+    def build(
+        self, output_directory: str | os.PathLike, *,
+        cuda_arch_list: str | None = None, verbose: bool = False,
+        testing: bool = False, extra_cflags: list[str] | tuple[str, ...] = (),
+        extra_cuda_cflags: list[str] | tuple[str, ...] = (),
+    ):
+        """Export production by default; testing=True enables native fault hooks.
+
+        Test artifacts require load_precompiled(..., allow_testing=True) in a
+        separate deployment process. The macro must reach the CPU .cpp compiler,
+        not just nvcc. Additional flags augment, never replace, default flags.
+        """
+        if not isinstance(testing, bool):
+            raise TypeError("testing must be a bool")
+        if not isinstance(extra_cflags, (list, tuple)):
+            raise TypeError("extra_cflags must be a list or tuple of strings")
+        cflags = list(extra_cflags)
+        if testing:
+            cflags.append("-DCUSTOM_OPS_OFFLOAD_TESTING=1")
+        return super().build(
+            output_directory, cuda_arch_list=cuda_arch_list, verbose=verbose,
+            extra_cflags=cflags, extra_cuda_cflags=extra_cuda_cflags,
+        )
 
     def get_sources(self) -> list:
         moe = os.path.join(_THIS_DIR, "csrc", "fuse_moe")
         return [
             os.path.join(moe, "fuse_moe_bindings.cpp"),
             os.path.join(moe, "fuse_moe_op.cu"),
-
+            os.path.join(moe, "fuse_moe_offload.cpp"),
         ]
 
     def get_include_dirs(self) -> list:
@@ -181,7 +266,8 @@ class FuseMoeOps(CustomOps):
             lambda x, gate_up_weight, down_weight, topk_ids, topk_scale:
                 torch.empty_like(x),
         )
-
+        from custom_ops.moe_offload import _fake_offload
+        self.register_fake_for("fuse_moe_offload", _fake_offload)
 
 
 # ── SwiGLU 独立分组（自包含 kernel，与 fuse_moe 完全解耦）─────────────
@@ -194,8 +280,11 @@ class SwigluOps(CustomOps):
     """
 
     namespace    = "recsys_ops"
+    requires_cuda = True
     so_name      = "recsys_swiglu_kernel"
     required_ops = ["swiglu"]
+    op_schemas = {"swiglu": "swiglu(Tensor x, Tensor weight) -> Tensor"}
+    fake_ops = ["swiglu"]
     optional_ops = []
     build_dir_fallback = "./torch_extensions"
 
@@ -258,29 +347,105 @@ class RecsysOps:
         "mixed_gemm": "mixed_gemm",
         "mixed_gemm_fp8_available": "mixed_gemm",
         "fuse_moe": "fuse_moe",
+        "fuse_moe_offload": "fuse_moe",
+        "fuse_moe_offload_create": "fuse_moe",
+        "fuse_moe_offload_bind": "fuse_moe",
+        "fuse_moe_offload_resident_bind": "fuse_moe",
+        "fuse_moe_offload_validate": "fuse_moe",
+        "fuse_moe_offload_close": "fuse_moe",
+        "fuse_moe_offload_stats": "fuse_moe",
+        "fuse_moe_offload_begin": "fuse_moe",
+        "fuse_moe_offload_check": "fuse_moe",
+        "fuse_moe_offload_status": "fuse_moe",
+        "fuse_moe_offload_acknowledge": "fuse_moe",
         "swiglu": "swiglu",
     }
 
-    def __init__(self) -> None:
-        self._groups: dict = {}   # group name -> CustomOps 实例（已尝试加载）
+    def __init__(self, *, allow_jit: bool = True) -> None:
+        self._groups: dict = {}   # group name -> CustomOps instance
+        self._lock = threading.RLock()
+        self._allow_jit = True
+        self.configure(allow_jit=allow_jit)
+
+    @property
+    def allow_jit(self) -> bool:
+        """Facade-wide policy; strict mode also forbids Tile-lang/backend fallback."""
+        return self._allow_jit
+
+    @allow_jit.setter
+    def allow_jit(self, value: bool) -> None:
+        self.configure(allow_jit=value)
+
+    def configure(self, *, allow_jit: bool) -> "RecsysOps":
+        """Explicitly configure all current and future groups, without loading any."""
+        if not isinstance(allow_jit, bool):
+            raise TypeError("allow_jit must be a bool")
+        with self._lock:
+            self._allow_jit = allow_jit
+            for instance in self._groups.values():
+                instance.configure(allow_jit=allow_jit)
+        return self
+
+    def disable_jit(self) -> "RecsysOps":
+        return self.configure(allow_jit=False)
 
     # ── 分组管理 ──────────────────────────────────────────────────────────────
 
+    def _validate_group(self, name: str) -> None:
+        if name not in self._GROUP_CLASSES:
+            raise ValueError(
+                f"unknown group {name!r}; available: {sorted(self._GROUP_CLASSES)}")
+
     def _group(self, name: str) -> CustomOps:
-        """加载（或取已加载的）分组实例。编译失败时实例保留（is_available
-        为 False、load_error 携带原因），后续访问继续抛出同一信息。"""
-        if name not in self._groups:
-            self._groups[name] = self._GROUP_CLASSES[name]().load()
-        return self._groups[name]
+        """Lazy development loading; strict mode accepts only loaded groups."""
+        with self._lock:
+            self._validate_group(name)
+            if not self._allow_jit:
+                instance = self._groups.get(name)
+                if instance is None or not instance.is_available():
+                    error = instance.load_error() if instance is not None else None
+                    raise CustomOpsError(
+                        f"JIT is disabled for group {name!r}; call "
+                        f"load_precompiled({name!r}, library_path, metadata_path=None) first."
+                        + (f" Previous error: {error}" if error else ""))
+                return instance
+            if name not in self._groups:
+                instance = self._GROUP_CLASSES[name](allow_jit=True)
+                self._groups[name] = instance
+                instance.load()
+            return self._groups[name]
+
+    def load_precompiled(
+        self, group: str, library_path: str | os.PathLike,
+        metadata_path: str | os.PathLike | None = None, *, allow_testing: bool = False,
+    ) -> "RecsysOps":
+        """Explicit deployment load; disables JIT/backend fallback for ALL groups.
+
+        Returns self. Default metadata path is '<library_path>.json'. The package
+        singleton follows exactly the same policy, so PrefillMoERuntime's later
+        global ops.ensure_loaded('fuse_moe') only observes the already loaded group.
+        Failure leaves strict policy enabled and the group unavailable; no native
+        sources, nvcc or Ninja are needed for loading. Never swaps dispatcher libs.
+        Test-hook artifacts are rejected unless allow_testing=True is explicit.
+        """
+        with self._lock:
+            self._validate_group(group)
+            self.configure(allow_jit=False)
+            if group not in self._groups:
+                self._groups[group] = self._GROUP_CLASSES[group](allow_jit=False)
+            self._groups[group].load_precompiled(
+                library_path, metadata_path, allow_testing=allow_testing,
+            )
+        return self
 
     def ensure_loaded(self, *names) -> "RecsysOps":
-        """显式加载分组。无参 = 全部分组（旧 eager 行为）。返回 self。"""
+        """Development: lazy load selected/all groups. Strict: verify, never compile."""
         targets = names if names else tuple(self._GROUP_CLASSES)
-        for n in targets:
-            if n not in self._GROUP_CLASSES:
-                raise ValueError(
-                    f"unknown group {n!r}; available: {sorted(self._GROUP_CLASSES)}")
-            self._group(n)
+        with self._lock:
+            for name in targets:
+                self._validate_group(name)
+            for name in targets:
+                self._group(name)
         return self
 
     # load() 保持旧 API 兼容：RecsysOps().load() == 全量 eager 加载
@@ -290,36 +455,42 @@ class RecsysOps:
     @property
     def groups(self) -> dict:
         """{分组名: 状态} 视图（loaded/failed/not_loaded）。"""
-        status = {}
-        for n in self._GROUP_CLASSES:
-            if n in self._groups:
-                status[n] = "loaded" if self._groups[n].is_available() else "failed"
-            else:
-                status[n] = "not_loaded"
-        return status
+        with self._lock:
+            return {
+                name: ("loaded" if self._groups[name].is_available() else "failed")
+                if name in self._groups else "not_loaded"
+                for name in self._GROUP_CLASSES
+            }
 
     def is_available(self, group: str | None = None) -> bool:
+        """Development: a named group loads lazily. Strict: a read-only query.
+
+        Without a group, CUDA availability and all attempted groups are checked;
+        strict mode additionally requires at least one explicitly loaded group.
         """
-        group 非空：加载该分组并返回其可用性（会触发编译）。
-        group 为空：CUDA 可用 且 所有已尝试加载的分组均成功（不触发编译；
-                    未加载的分组不影响结果——这正是懒加载语义）。
-        """
-        if group is not None:
-            if group not in self._GROUP_CLASSES:
-                raise ValueError(
-                    f"unknown group {group!r}; available: {sorted(self._GROUP_CLASSES)}")
-            return self._group(group).is_available()
-        if not torch.cuda.is_available():
-            return False
-        return all(g.is_available() for g in self._groups.values())
+        with self._lock:
+            if group is not None:
+                self._validate_group(group)
+                if not self._allow_jit:
+                    instance = self._groups.get(group)
+                    return instance is not None and instance.is_available()
+                return self._group(group).is_available()
+            if not torch.cuda.is_available():
+                return False
+            if not self._allow_jit and not self._groups:
+                return False
+            return all(instance.is_available() for instance in self._groups.values())
 
     def load_error(self, group: str | None = None):
-        """返回分组（或首个失败分组）的加载错误信息；无失败返回 None。"""
-        if group is not None:
-            return self._group(group).load_error()
-        for g in self._groups.values():
-            if not g.is_available():
-                return g.load_error()
+        """Read-only error query; unlike ensure_loaded, never starts a build."""
+        with self._lock:
+            if group is not None:
+                self._validate_group(group)
+                instance = self._groups.get(group)
+                return instance.load_error() if instance is not None else None
+            for instance in self._groups.values():
+                if not instance.is_available():
+                    return instance.load_error()
         return None
 
     # ── 后端选择 ──────────────────────────────────────────────────────────
@@ -341,7 +512,15 @@ class RecsysOps:
 
         auto：CUDA 分组加载成功 → CUDA；失败 → Tile-lang（不可用时抛出
         包含 CUDA 编译错误信息的 RuntimeError）。"""
-        b = _resolve_backend(backend)
+        with self._lock:
+            if not self._allow_jit:
+                # No environment-based backend switch and no implicit Tile-lang JIT
+                # in deployment mode. An explicitly requested non-native backend fails.
+                if backend is not None and _resolve_backend(backend) == "tilelang":
+                    raise CustomOpsError("Tile-lang/backend fallback is disabled when allow_jit=False")
+                self._group(group)
+                return False, None
+            b = _resolve_backend(backend)
         if b == "tilelang":
             return True, self._tilelang()
         if b == "auto" and not self._group(group).is_available():
@@ -367,7 +546,8 @@ class RecsysOps:
         return getattr(self._group(group), name)
 
     def __repr__(self) -> str:
-        return (f"RecsysOps(lazy, namespace='recsys_ops', groups={self.groups})")
+        return (f"RecsysOps(lazy, allow_jit={self.allow_jit}, "
+                f"namespace='recsys_ops', groups={self.groups})")
 
     # ── 显式方法：带类型标注，供 IDE 补全（与门面语义一致，均懒加载）──────
 

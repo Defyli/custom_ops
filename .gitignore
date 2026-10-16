@@ -21,5 +21,8 @@ torch_extensions/
 # benchmark 输出
 result.csv
 
+# 可再生成的预编译库、AOTI package 与原始验收证据
+artifacts/
+
 # 临时文件
 remote.txt

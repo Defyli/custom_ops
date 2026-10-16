@@ -33,6 +33,187 @@
 #include "cutlass/numeric_types.h"
 
 #include "fuse_moe_launch.h"
+#include "fuse_moe_offload.h"
+
+namespace {
+__global__ void offload_validate_ids(const int* ids, int64_t n, int experts, int* invalid) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        if (ids[i] < -1 || ids[i] >= experts) atomicExch(invalid, 1);
+    }
+}
+
+// Small preflight histogram, independent of O(S*K) route storage. Shared counts
+// avoid a global atomic per route on the capacity-pressure slow path.
+__global__ void offload_count_ids(const int* ids, int64_t n, int experts,
+                                  int first, int bins, int* summary) {
+    __shared__ int counts[128];
+    if (threadIdx.x <= bins) counts[threadIdx.x] = 0;
+    __syncthreads();
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        const int expert = ids[i];
+        if (expert < -1 || expert >= experts) atomicExch(counts + bins, 1);
+        else if (expert >= first && expert < first + bins) atomicAdd(counts + expert - first, 1);
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e <= bins; e += blockDim.x) {
+        if (e == bins) {
+            if (counts[e]) atomicExch(summary + e, 1);
+        } else if (counts[e]) atomicAdd(summary + e, counts[e]);
+    }
+}
+
+// Scatter valid, unique route positions into the global compact scale array.
+__global__ void offload_scales_kernel(const int* topk_pos, const float* scale,
+                                      float* sorted_scale, int routes) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < routes;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        const int pos = topk_pos[i];
+        if (pos >= 0 && pos < routes) sorted_scale[pos] = scale[i];
+    }
+}
+
+// Build grouped metadata and weight tables from launch arguments, not pinned DMA.
+// A single-expert fallback keeps the original 24-byte metadata and direct address.
+__global__ void offload_resident_meta_kernel(int* meta, int groups, MoEResidentWave wave,
+                                            int64_t gate_bytes, int tile_m) {
+    int* prefix = meta + groups;
+    int* tiles = prefix + groups + 1;
+    int* cu_tiles = tiles + groups;
+    prefix[0] = 0; cu_tiles[0] = 0;
+    // (4*groups+2)*sizeof(int) is always 8-byte aligned for device pointers.
+    auto** weights = reinterpret_cast<const void**>(meta + 4 * groups + 2);
+    for (int g = 0; g < groups; ++g) {
+        meta[g] = wave.rows[g];
+        prefix[g + 1] = prefix[g] + wave.rows[g];
+        tiles[g] = wave.rows[g] / tile_m + (wave.rows[g] % tile_m != 0);
+        cu_tiles[g + 1] = cu_tiles[g] + tiles[g];
+        if (groups > 1) {
+            weights[g] = wave.weights[g];
+            weights[groups + g] = static_cast<const uint8_t*>(wave.weights[g]) + gate_bytes;
+        }
+    }
+}
+
+// Clip only the participating expert interval and rebuild tile-local prefixes.
+__global__ void offload_tile_meta_kernel(const int* wave_meta, int* tile_meta,
+                                         int wave_groups, int first_group, int groups,
+                                         int begin, int rows, int tile_m) {
+    const int* wave_prefix = wave_meta + wave_groups + first_group;
+    int* lens = tile_meta;
+    int* prefix = lens + groups;
+    int* tiles = prefix + groups + 1;
+    int* cu_tiles = tiles + groups;
+    const int64_t end = int64_t(begin) + rows;
+    prefix[0] = 0;
+    cu_tiles[0] = 0;
+    for (int g = 0; g < groups; ++g) {
+        const int64_t original_start = wave_prefix[g];
+        const int64_t original_end = wave_prefix[g + 1];
+        const int64_t start = original_start < begin ? begin : original_start;
+        const int64_t stop = original_end > end ? end : original_end;
+        const int len = stop > start ? static_cast<int>(stop - start) : 0;
+        lens[g] = len;
+        prefix[g + 1] = prefix[g] + len;
+        tiles[g] = len / tile_m + (len % tile_m != 0);
+        cu_tiles[g + 1] = cu_tiles[g] + tiles[g];
+    }
+}
+
+// Convert only after FP32 accumulation, using baseline CUTLASS RN dtype casts.
+template <typename T>
+__global__ void offload_cast_kernel(const float* accumulator, T* out, int rows, int hidden) {
+    const int64_t n = int64_t(rows) * hidden;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        out[i] = static_cast<T>(accumulator[i]);
+    }
+}
+}
+
+void moe_offload_count(const int* ids, int64_t routes, int experts, int first, int bins,
+                       int* summary, cudaStream_t stream) {
+    C10_CUDA_CHECK(cudaMemsetAsync(summary, 0, (bins + 1) * sizeof(int), stream));
+    if (routes) offload_count_ids<<<128, 256, 0, stream>>>(ids, routes, experts, first, bins, summary);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_offload_route(fuse_moe::FMOE_params& p, int* invalid, cudaStream_t stream) {
+    C10_CUDA_CHECK(cudaMemsetAsync(p.seqlens_ptr, 0, p.num_expert * sizeof(int), stream));
+    C10_CUDA_CHECK(cudaMemsetAsync(invalid, 0, sizeof(int), stream));
+    if (p.total_num_seq) {
+        offload_validate_ids<<<128, 256, 0, stream>>>(
+            p.topk_ids_ptr, p.total_num_seq, p.num_expert, invalid);
+        fuse_moe::count_and_build_indices_async(p.topk_ids_ptr, p.row_indices_ptr,
+            p.topk_pos_ptr, p.seqlens_ptr, p.cu_seqlens_ptr, p.tiles_ptr, p.cu_tiles_ptr,
+            p.num_seq, p.num_topk, p.num_expert, p.tile_m, false, stream,
+            /*explicit_config=*/true);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_offload_compute(fuse_moe::FMOE_params& p, cudaStream_t stream) {
+    TORCH_CHECK(arch_targets::gpu_major() >= 8, "offload requires SM80+");
+    fuse_moe::moe_compute_sm8x(p, stream, /*explicit_config=*/true);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_offload_reduce(fuse_moe::FMOE_params& p, cudaStream_t stream) {
+    if (p.is_bf16) {
+        fuse_moe::reduce_async(static_cast<cutlass::bfloat16_t*>(p.out_ptr),
+            static_cast<const cutlass::bfloat16_t*>(p.down_out_ptr), p.topk_pos_ptr,
+            p.topk_scale_ptr, p.num_seq, p.hidden, p.num_topk, false, stream,
+            /*explicit_config=*/true);
+    } else {
+        fuse_moe::reduce_async(static_cast<cutlass::half_t*>(p.out_ptr),
+            static_cast<const cutlass::half_t*>(p.down_out_ptr), p.topk_pos_ptr,
+            p.topk_scale_ptr, p.num_seq, p.hidden, p.num_topk, false, stream,
+            /*explicit_config=*/true);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_offload_scales(const int* topk_pos, const float* scale, float* sorted_scale,
+                        int routes, cudaStream_t stream) {
+    if (routes <= 0) return;
+    offload_scales_kernel<<<128, 256, 0, stream>>>(topk_pos, scale, sorted_scale, routes);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_offload_resident_meta(int* meta, int groups, const MoEResidentWave& wave,
+                               int64_t gate_bytes, int tile_m, cudaStream_t stream) {
+    TORCH_CHECK(groups > 0 && groups <= kOffloadResidentGroups,
+        "invalid resident group size");
+    offload_resident_meta_kernel<<<1, 1, 0, stream>>>(meta, groups, wave, gate_bytes, tile_m);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_offload_tile_meta(const int* wave_meta, int* tile_meta, int wave_groups,
+                           int first_group, int groups, int begin, int rows,
+                           int tile_m, cudaStream_t stream) {
+    if (rows <= 0) return;
+    TORCH_CHECK(wave_groups > 0 && wave_groups <= 512 && first_group >= 0 &&
+                groups > 0 && first_group <= wave_groups - groups,
+                "offload tile metadata requires a valid expert interval within 512 groups");
+    TORCH_CHECK(tile_m > 0, "offload tile_m must be positive");
+    offload_tile_meta_kernel<<<1, 1, 0, stream>>>(wave_meta, tile_meta, wave_groups,
+        first_group, groups, begin, rows, tile_m);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_offload_cast(const float* accumulator, void* out, int rows, int hidden,
+                      bool bf16, cudaStream_t stream) {
+    if (rows <= 0 || hidden <= 0) return;
+    if (bf16) {
+        offload_cast_kernel<<<128, 256, 0, stream>>>(
+            accumulator, static_cast<cutlass::bfloat16_t*>(out), rows, hidden);
+    } else {
+        offload_cast_kernel<<<128, 256, 0, stream>>>(
+            accumulator, static_cast<cutlass::half_t*>(out), rows, hidden);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 // ── CUDA 实现 ─────────────────────────────────────────────────────────────────
 torch::Tensor fuse_moe_cuda(
@@ -123,7 +304,7 @@ torch::Tensor fuse_moe_cuda(
     }
 
     // ── 填 params 并分发（tile/PDL/引擎策略全部内封在 launch 层）──────────
-    fuse_moe::FMOE_params params;
+    fuse_moe::FMOE_params params{};
     params.x_ptr = x.data_ptr();
     params.w1_ptr = gate_up_weight.data_ptr();
     params.w2_ptr = down_weight.data_ptr();

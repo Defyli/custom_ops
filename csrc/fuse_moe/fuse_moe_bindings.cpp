@@ -14,6 +14,7 @@
 
 // Step 3: 包含算子声明头文件
 #include "fuse_moe/fuse_moe_op.h"
+#include "fuse_moe/fuse_moe_offload.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 4: 分发函数
@@ -41,10 +42,47 @@ CUSTOM_OPS_LIBRARY_BEGIN
         "Tensor topk_ids, Tensor topk_scale",
         "-> Tensor"
     )
+    m.def("fuse_moe_offload(Tensor x, Tensor gate_up_weight_cpu, Tensor down_weight_cpu, "
+          "Tensor topk_ids, Tensor topk_scale, Tensor(a!) runtime_token, int layer_id, "
+          "int[]? deployment_config=None, int[]? deployment_manifest=None) -> Tensor");
+    m.def("fuse_moe_offload_create(int device, int gpu_budget_bytes=0, int ram_budget_bytes=0, "
+          "int pinned_budget_bytes=0, int num_banks=2, int activation_mode=0, "
+          "int max_route_tile_rows=4096, int resident_cache_bytes=0, int dynamic_cache_bytes=0, "
+          "int cache_policy=0, int cache_decay_interval=32, int cache_min_reuse=2, "
+          "int cache_update_bytes=0, bool async_staging=False, bool host_profile=False, "
+          "int tile_m=0, int tile_n=128) -> Tensor");
+    m.def("fuse_moe_offload_bind(Tensor runtime_token, int layer_id, Tensor w1, Tensor w2) -> ()");
+    m.def("fuse_moe_offload_resident_bind(Tensor token, int layer_id, int[] expert_ids) -> ()");
+    m.def("fuse_moe_offload_validate(Tensor runtime_token, int[] deployment_manifest) -> ()");
+    m.def("fuse_moe_offload_begin(Tensor runtime_token) -> ()");
+    m.def("fuse_moe_offload_check(Tensor runtime_token) -> ()");
+    m.def("fuse_moe_offload_status(Tensor runtime_token) -> Tensor");
+    m.def("fuse_moe_offload_acknowledge(Tensor runtime_token) -> ()");
+#if defined(CUSTOM_OPS_OFFLOAD_TESTING) && CUSTOM_OPS_OFFLOAD_TESTING
+    m.def("_fuse_moe_offload_test_inject(Tensor token, str point, int countdown=1) -> ()");
+    m.def("_fuse_moe_offload_test_worker_states() -> Tensor");
+#endif
+    m.def("fuse_moe_offload_close(Tensor runtime_token) -> ()");
+    m.def("fuse_moe_offload_stats(Tensor runtime_token) -> Tensor");
 CUSTOM_OPS_LIBRARY_END
 
 CUSTOM_OPS_IMPL_BEGIN
     CUSTOM_OP_BIND(fuse_moe)
+    m.impl("fuse_moe_offload", &fuse_moe_offload);
+    m.impl("fuse_moe_offload_create", &fuse_moe_offload_create);
+    m.impl("fuse_moe_offload_bind", &fuse_moe_offload_bind);
+    m.impl("fuse_moe_offload_resident_bind", &fuse_moe_offload_resident_bind);
+    m.impl("fuse_moe_offload_validate", &fuse_moe_offload_validate);
+    m.impl("fuse_moe_offload_begin", &fuse_moe_offload_begin);
+    m.impl("fuse_moe_offload_check", &fuse_moe_offload_check);
+    m.impl("fuse_moe_offload_status", &fuse_moe_offload_status);
+    m.impl("fuse_moe_offload_acknowledge", &fuse_moe_offload_acknowledge);
+#if defined(CUSTOM_OPS_OFFLOAD_TESTING) && CUSTOM_OPS_OFFLOAD_TESTING
+    m.impl("_fuse_moe_offload_test_inject", &fuse_moe_offload_test_inject);
+    m.impl("_fuse_moe_offload_test_worker_states", &fuse_moe_offload_test_worker_states);
+#endif
+    m.impl("fuse_moe_offload_close", &fuse_moe_offload_close);
+    m.impl("fuse_moe_offload_stats", &fuse_moe_offload_stats);
 CUSTOM_OPS_IMPL_END
 
 // ─────────────────────────────────────────────────────────────────────────────

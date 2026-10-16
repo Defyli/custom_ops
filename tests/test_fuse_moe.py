@@ -24,7 +24,7 @@ if _PKG_PARENT not in sys.path:
 
 import torch  # noqa: E402
 
-from custom_ops import ops  # noqa: E402  (import 时 JIT 编译)
+from custom_ops import ops  # noqa: E402  (import 不编译；开发期首次访问懒加载)
 
 torch.manual_seed(0)
 DEV = "cuda"
@@ -104,8 +104,11 @@ def run_case(name, S, H, I, E, K, dtype, mode="uniform"):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--ops-library", help="Explicit precompiled fuse_moe library; no implicit JIT")
     args = parser.parse_args()
 
+    if args.ops_library:
+        ops.load_precompiled("fuse_moe", args.ops_library)
     assert ops.is_available(), "extension load failed"
 
     dtypes = [torch.bfloat16, torch.float16]

@@ -394,7 +394,7 @@ inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indi
                                           int *cu_seqlens_ptr, int *tiles_ptr,
                                           int *cu_tiles_ptr, int num_seq,
                                           int num_topk, int num_expert, int tile_m, bool use_pdl,
-                                          cudaStream_t stream) {
+                                          cudaStream_t stream, bool explicit_config = false) {
   constexpr int kThreadPerBlock = 256;
   constexpr int kGroupPerThread = 2;
   int total_num_topk = num_seq * num_topk;
@@ -406,19 +406,22 @@ inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indi
     size_t smem = num_expert * sizeof(int);
     if (tile_m <= 32) {
       auto kernel = kernels::count_and_build_kernel<kThreadPerBlock, kGroupPerThread, 32>;
-      launch_kernel_pdl(kernel, grid, block, smem, stream, use_pdl, topk_ids_ptr,
-                        row_indices_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                        cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert);
+      launch_kernel_pdl_config(kernel, grid, block, smem, stream, use_pdl, !explicit_config,
+                               topk_ids_ptr, row_indices_ptr, topk_pos_ptr, seqlens_ptr,
+                               cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, num_seq, num_topk,
+                               total_num_topk, num_expert);
     } else if (tile_m >= 128) {
       auto kernel = kernels::count_and_build_kernel<kThreadPerBlock, kGroupPerThread, 128>;
-      launch_kernel_pdl(kernel, grid, block, smem, stream, use_pdl, topk_ids_ptr,
-                        row_indices_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                        cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert);
+      launch_kernel_pdl_config(kernel, grid, block, smem, stream, use_pdl, !explicit_config,
+                               topk_ids_ptr, row_indices_ptr, topk_pos_ptr, seqlens_ptr,
+                               cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, num_seq, num_topk,
+                               total_num_topk, num_expert);
     } else {
       auto kernel = kernels::count_and_build_kernel<kThreadPerBlock, kGroupPerThread, 64>;
-      launch_kernel_pdl(kernel, grid, block, smem, stream, use_pdl, topk_ids_ptr,
-                        row_indices_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                        cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert);
+      launch_kernel_pdl_config(kernel, grid, block, smem, stream, use_pdl, !explicit_config,
+                               topk_ids_ptr, row_indices_ptr, topk_pos_ptr, seqlens_ptr,
+                               cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, num_seq, num_topk,
+                               total_num_topk, num_expert);
     }
     return;
   }
@@ -428,8 +431,9 @@ inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indi
     dim3 grid((total_num_topk + kThreadPerBlock - 1) / kThreadPerBlock);
     dim3 block(kThreadPerBlock);
     size_t smem = num_expert * sizeof(int);
-    launch_kernel_pdl(kernels::count_seq_kernel, grid, block, smem, stream, use_pdl, topk_ids_ptr,
-                      topk_pos_ptr, seqlens_ptr, total_num_topk, num_expert);
+    launch_kernel_pdl_config(kernels::count_seq_kernel, grid, block, smem, stream, use_pdl,
+                             !explicit_config, topk_ids_ptr, topk_pos_ptr, seqlens_ptr,
+                             total_num_topk, num_expert);
   }
 
   // Step 2: 前缀和（tile_m 分发）
@@ -438,16 +442,16 @@ inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indi
     dim3 block(kThreadPerBlock);
     if (tile_m <= 32) {
       auto kernel = kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, 32>;
-      launch_kernel_pdl(kernel, grid, block, 0, stream, use_pdl, seqlens_ptr, cu_seqlens_ptr,
-                        tiles_ptr, cu_tiles_ptr, num_expert);
+      launch_kernel_pdl_config(kernel, grid, block, 0, stream, use_pdl, !explicit_config,
+                               seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, num_expert);
     } else if (tile_m >= 128) {
       auto kernel = kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, 128>;
-      launch_kernel_pdl(kernel, grid, block, 0, stream, use_pdl, seqlens_ptr, cu_seqlens_ptr,
-                        tiles_ptr, cu_tiles_ptr, num_expert);
+      launch_kernel_pdl_config(kernel, grid, block, 0, stream, use_pdl, !explicit_config,
+                               seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, num_expert);
     } else {
       auto kernel = kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, 64>;
-      launch_kernel_pdl(kernel, grid, block, 0, stream, use_pdl, seqlens_ptr, cu_seqlens_ptr,
-                        tiles_ptr, cu_tiles_ptr, num_expert);
+      launch_kernel_pdl_config(kernel, grid, block, 0, stream, use_pdl, !explicit_config,
+                               seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, num_expert);
     }
   }
 
@@ -457,9 +461,10 @@ inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indi
     dim3 grid(num_topk_blocks);
     dim3 block(kThreadPerBlock);
     size_t smem = num_expert * sizeof(int);
-    launch_kernel_pdl(kernels::build_indices_kernel, grid, block, smem, stream, use_pdl,
-                      topk_ids_ptr, row_indices_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr,
-                      total_num_topk, num_topk, num_expert, num_topk_blocks);
+    launch_kernel_pdl_config(kernels::build_indices_kernel, grid, block, smem, stream, use_pdl,
+                             !explicit_config, topk_ids_ptr, row_indices_ptr, topk_pos_ptr,
+                             seqlens_ptr, cu_seqlens_ptr, total_num_topk, num_topk, num_expert,
+                             num_topk_blocks);
   }
 }
 
@@ -494,7 +499,7 @@ inline void gather_sorted_async(T *dst_ptr, const T *x_ptr, const int *row_indic
 template <typename T>
 inline void reduce_async(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
                          const float *topk_scale_ptr, int num_seq, int hidden_size, int num_topk,
-                         bool use_pdl, cudaStream_t stream) {
+                         bool use_pdl, cudaStream_t stream, bool explicit_config = false) {
   constexpr int kThreadPerBlock = 256;
   constexpr int kNumTopkMax = 128;
   constexpr int kNumItemPer16B = 16 / sizeof(T);  // 8
@@ -504,9 +509,10 @@ inline void reduce_async(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
   cutlass::FastDivmod block_divider(num_block_col);
   dim3 grid(num_block_total);
   dim3 block(kThreadPerBlock);
-  launch_kernel_pdl(kernels::reduce_kernel<T, kThreadPerBlock, kNumItemPer16B, kNumTopkMax>, grid,
-                    block, 0, stream, use_pdl, y_ptr, x_ptr, topk_pos_ptr, topk_scale_ptr, num_seq,
-                    hidden_size, num_topk, block_divider);
+  launch_kernel_pdl_config(kernels::reduce_kernel<T, kThreadPerBlock, kNumItemPer16B, kNumTopkMax>,
+                           grid, block, 0, stream, use_pdl, !explicit_config,
+                           y_ptr, x_ptr, topk_pos_ptr, topk_scale_ptr, num_seq,
+                           hidden_size, num_topk, block_divider);
 }
 
 }  // namespace fuse_moe

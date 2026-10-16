@@ -179,13 +179,16 @@ __device__ __forceinline__ void scatter_load_x_tile(
 
 // ─── 核心 kernel ─────────────────────────────────────────────────────────────
 // kScatterA=true：gate_up GEMM（X 按行 gather）；false：down GEMM（X 连续）。
-template <typename Config, bool kScatterA>
+template <typename Config, bool kScatterA, bool kFusedAccum = false>
 __global__ void __launch_bounds__(Config::kNThreads, 1)
 group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
                   const int *row_indices_ptr,  // kScatterA 时非空
                   const int *seqlens_ptr, const int *cu_seqlens_ptr, const int *tiles_ptr,
                   const int *cu_tiles_ptr, int use_vert, int n, int k, int num_group,
-                  cutlass::FastDivmod flat_divider) {
+                  cutlass::FastDivmod flat_divider, const void *const *weight_ptrs,
+                  float *accumulator, const int *accum_rows, const float *sorted_scale) {
+  static_assert(!kFusedAccum || !kScatterA,
+                "fused accumulation is only supported for down GEMM");
   using namespace cute;  // NOLINT
   using Tin = typename Config::Tin;
   using Tout = typename Config::Tout;
@@ -356,7 +359,8 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
   auto load_slab = [&](TaskCtx t, int itile_k, int istage,
                        [[maybe_unused]] const int (&rows)[kNumRowIters]) {
     Tensor W = make_tensor(
-        make_gmem_ptr((Tin const *)Wptr + uint64_t(t.igroup) * n * k),
+        make_gmem_ptr(weight_ptrs ? static_cast<const Tin *>(weight_ptrs[t.igroup])
+                                 : (Tin const *)Wptr + uint64_t(t.igroup) * n * k),
         make_shape(n, k), make_stride(k, Int<1>{}));
     Tensor gW =
         local_tile(W, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(t.itile_n, _));
@@ -475,16 +479,38 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
     {
       constexpr int kVecElems = 16 / int(sizeof(Tout));  // 8
       const int nvec = kTileN / kVecElems;
-      Tout *y_base = reinterpret_cast<Tout *>(Cptr) + uint64_t(Tc.start_token) * n;
+      Tout *y_base = nullptr;
+      if constexpr (!kFusedAccum) {
+        y_base = reinterpret_cast<Tout *>(Cptr) + uint64_t(Tc.start_token) * n;
+      }
       const int col_base = Tc.itile_n * kTileN;
       const int row_base = Tc.itile_m * kTileM;
+      if constexpr (kFusedAccum) {
+        // Scalar atomics need adjacent lanes on adjacent FP32 columns. Reusing
+        // the 16B store mapping would give each lane eight columns, so every
+        // atomic instruction spans eight times as many memory sectors.
 #pragma unroll 1
-      for (int i = idx; i < kTileM * nvec; i += kNThreads) {
-        const int r = i / nvec;
-        const int c8 = (i % nvec) * kVecElems;
-        if (row_base + r < Tc.m) {
-          *reinterpret_cast<uint4 *>(y_base + uint64_t(row_base + r) * n + col_base + c8) =
-              *reinterpret_cast<const uint4 *>(&sC(c8, r));
+        for (int i = idx; i < kTileM * kTileN; i += kNThreads) {
+          const int r = i / kTileN;
+          const int col = i % kTileN;
+          if (row_base + r < Tc.m) {
+            // Metadata is tilebase-offset; sC preserves the fp32 -> Tout RN.
+            const uint64_t sorted_row = uint64_t(Tc.start_token) + row_base + r;
+            const int token = accum_rows[sorted_row];
+            const float scale = sorted_scale[sorted_row];
+            atomicAdd(accumulator + uint64_t(token) * n + col_base + col,
+                      static_cast<float>(sC(col, r)) * scale);
+          }
+        }
+      } else {
+#pragma unroll 1
+        for (int i = idx; i < kTileM * nvec; i += kNThreads) {
+          const int r = i / nvec;
+          const int c8 = (i % nvec) * kVecElems;
+          if (row_base + r < Tc.m) {
+            *reinterpret_cast<uint4 *>(y_base + uint64_t(row_base + r) * n + col_base + c8) =
+                *reinterpret_cast<const uint4 *>(&sC(c8, r));
+          }
         }
       }
     }
@@ -520,13 +546,18 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
 //     的 DRAM 写+读）与独立 act_mul kernel。
 // smem：[sX (M,K,S)][sWg (64,K,S)][sWu (64,K,S)][sC 预留][shm_tiles]。
 // flat_divider = (n/2)/64（配对 tile 数，n = 2I）。
-template <typename Config, bool kPairGateUp = true, bool kScatterA = kPairGateUp>
+template <typename Config, bool kPairGateUp = true, bool kScatterA = kPairGateUp,
+          bool kFusedAccum = false>
 __global__ void __launch_bounds__(Config::kNThreads, 1)
 group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
                          const int *row_indices_ptr, const int *seqlens_ptr,
                          const int *cu_seqlens_ptr, const int *tiles_ptr,
                          const int *cu_tiles_ptr, int use_vert, int n, int k,
-                         int num_group, cutlass::FastDivmod flat_divider) {
+                         int num_group, cutlass::FastDivmod flat_divider,
+                         const void *const *weight_ptrs, float *accumulator,
+                         const int *accum_rows, const float *sorted_scale) {
+  static_assert(!kFusedAccum || (!kPairGateUp && !kScatterA),
+                "fused accumulation is only supported for down GEMM");
   using namespace cute;  // NOLINT
   using Tin = typename Config::Tin;
   using Tout = typename Config::Tout;
@@ -681,7 +712,8 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
   auto load_slab = [&](TaskCtx t, int itile_k, int istage,
                        const int (&rows)[kNumRowIters]) {
     Tensor W = make_tensor(
-        make_gmem_ptr((Tin const *)Wptr + uint64_t(t.igroup) * n * k),
+        make_gmem_ptr(weight_ptrs ? static_cast<const Tin *>(weight_ptrs[t.igroup])
+                                 : (Tin const *)Wptr + uint64_t(t.igroup) * n * k),
         make_shape(n, k), make_stride(k, Int<1>{}));
     const int nt0 = kPairGateUp ? t.itile_n : 2 * t.itile_n;
     const int nt1 = kPairGateUp ? (up_tile_base + t.itile_n) : (2 * t.itile_n + 1);
@@ -796,14 +828,31 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
     auto write_c_block = [&](const Tout *y_base, int col_base, int row_base, int m) {
       constexpr int kVecElems = 16 / int(sizeof(Tout));  // 8
       const int nvec = kTileN / kVecElems;
+      if constexpr (kFusedAccum) {
+        // Use contiguous lanes for scalar FP32 atomics, not the 16B-store
+        // thread mapping. Both panels keep the rounded sC values and barriers.
 #pragma unroll 1
-      for (int i = idx; i < kTileM * nvec; i += kNThreads) {
-        const int r = i / nvec;
-        const int c8 = (i % nvec) * kVecElems;
-        if (row_base + r < m) {
-          *reinterpret_cast<uint4 *>(
-              const_cast<Tout *>(y_base) + uint64_t(row_base + r) * out_stride + col_base + c8) =
-              *reinterpret_cast<const uint4 *>(&sC(c8, r));
+        for (int i = idx; i < kTileM * kTileN; i += kNThreads) {
+          const int r = i / kTileN;
+          const int col = i % kTileN;
+          if (row_base + r < m) {
+            const uint64_t sorted_row = uint64_t(Tc.start_token) + row_base + r;
+            const int token = accum_rows[sorted_row];
+            const float scale = sorted_scale[sorted_row];
+            atomicAdd(accumulator + uint64_t(token) * n + col_base + col,
+                      static_cast<float>(sC(col, r)) * scale);
+          }
+        }
+      } else {
+#pragma unroll 1
+        for (int i = idx; i < kTileM * nvec; i += kNThreads) {
+          const int r = i / nvec;
+          const int c8 = (i % nvec) * kVecElems;
+          if (row_base + r < m) {
+            *reinterpret_cast<uint4 *>(
+                const_cast<Tout *>(y_base) + uint64_t(row_base + r) * out_stride + col_base + c8) =
+                *reinterpret_cast<const uint4 *>(&sC(c8, r));
+          }
         }
       }
     };
@@ -830,7 +879,10 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
       cute::copy(tiled_copy_c, thr_copy_c.retile_S(tYc0), tCs4g);
       __syncthreads();
 
-      Tout *y_base = reinterpret_cast<Tout *>(ActPtr) + uint64_t(Tc.start_token) * out_stride;
+      Tout *y_base = nullptr;
+      if constexpr (!kFusedAccum) {
+        y_base = reinterpret_cast<Tout *>(ActPtr) + uint64_t(Tc.start_token) * out_stride;
+      }
       write_c_block(y_base, Tc.itile_n * (2 * kTileN), Tc.itile_m * kTileM, Tc.m);
       __syncthreads();  // sC 读取完成，panel 1 的 r2s 才可覆写
 
@@ -873,13 +925,16 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                       const void *tiles_ptr, const void *cu_tiles_ptr, bool use_vert,
                       int n, int k, int num_group,
                       int tile_m, bool is_half, bool use_pdl,
-                      cudaStream_t stream) {
+                      cudaStream_t stream, const void *const *weight_ptrs = nullptr,
+                      float *accumulator = nullptr, const int *accum_rows = nullptr,
+                      const float *sorted_scale = nullptr, bool explicit_config = false) {
   using namespace cute;  // NOLINT
 
   assert(n % 64 == 0 && "group_gemm: n must be a multiple of kTileN=64");
   assert(k % 64 == 0 && "group_gemm: k must be a multiple of 64");
 
   const bool scatter = (row_indices_ptr != nullptr);
+  assert(!accumulator || (!scatter && accum_rows && sorted_scale));
   assert(tile_m == 32 || tile_m == 64 || tile_m == 128);
 
   cutlass::FastDivmod flat_divider(n / 64);  // num_tile_n
@@ -907,22 +962,33 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
         GemmConfig::shm_xw + GemmConfig::shm_c_alloc +
         (num_group + 1) * static_cast<int>(sizeof(int));  // 调度表（tiles 或 cu_tiles）
 
-    auto kernel = scatter ? kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/true>
-                          : kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/false>;
+    // All specializations share the same signature; select once, then reuse
+    // the existing occupancy/PDL launch and dtype/tile dispatch.
+    auto kernel = accumulator
+                      ? kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/false,
+                                                   /*kFusedAccum=*/true>
+                      : (scatter
+                             ? kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/true,
+                                                          /*kFusedAccum=*/false>
+                             : kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/false,
+                                                          /*kFusedAccum=*/false>);
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    configure_dynamic_shared_memory(kernel, shm_size);
     int max_blocks = 1;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks, kernel, kNThreads, shm_size);
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks, kernel, kNThreads, shm_size));
     if (max_blocks < 1) max_blocks = 1;
     dim3 grid(static_cast<unsigned>(get_sm_count() * max_blocks));
 
-    launch_kernel_pdl(kernel, grid, dim3(kNThreads), shm_size, stream, use_pdl, y_ptr, x_ptr,
+    launch_kernel_pdl_config(kernel, grid, dim3(kNThreads), shm_size, stream, use_pdl,
+                             !explicit_config, y_ptr, x_ptr,
                       w_ptr, reinterpret_cast<const int *>(row_indices_ptr),
                       reinterpret_cast<const int *>(seqlens_ptr),
                       reinterpret_cast<const int *>(cu_seqlens_ptr),
                       reinterpret_cast<const int *>(tiles_ptr),
                       reinterpret_cast<const int *>(cu_tiles_ptr), use_vert ? 1 : 0, n, k,
-                      num_group, flat_divider);
+                      num_group, flat_divider, weight_ptrs, accumulator, accum_rows,
+                      sorted_scale);
   };
 
   auto dispatch_m = [&](auto t_tag) {
@@ -966,7 +1032,8 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
                                    const void *cu_seqlens_ptr, const void *tiles_ptr,
                                    const void *cu_tiles_ptr, bool use_vert, int n, int k,
                                    int num_group, int tile_m, bool is_half, bool use_pdl,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const void *const *weight_ptrs = nullptr,
+                                   bool explicit_config = false) {
   using namespace cute;  // NOLINT
 
   assert(n % 128 == 0 && "gateup_fused: n (=2I) must be a multiple of 128");
@@ -1001,19 +1068,23 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
 
     auto kernel = kernels::group_gemm_gateup_kernel<GemmConfig>;
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    configure_dynamic_shared_memory(kernel, shm_size);
     int max_blocks = 1;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks, kernel, kNThreads, shm_size);
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks, kernel, kNThreads, shm_size));
     if (max_blocks < 1) max_blocks = 1;
     dim3 grid(static_cast<unsigned>(get_sm_count() * max_blocks));
 
-    launch_kernel_pdl(kernel, grid, dim3(kNThreads), shm_size, stream, use_pdl, act_ptr, x_ptr,
+    launch_kernel_pdl_config(kernel, grid, dim3(kNThreads), shm_size, stream, use_pdl,
+                             !explicit_config, act_ptr, x_ptr,
                       w_ptr, reinterpret_cast<const int *>(row_indices_ptr),
                       reinterpret_cast<const int *>(seqlens_ptr),
                       reinterpret_cast<const int *>(cu_seqlens_ptr),
                       reinterpret_cast<const int *>(tiles_ptr),
                       reinterpret_cast<const int *>(cu_tiles_ptr), use_vert ? 1 : 0, n, k,
-                      num_group, flat_divider);
+                      num_group, flat_divider, weight_ptrs,
+                      /*accumulator=*/nullptr, /*accum_rows=*/nullptr,
+                      /*sorted_scale=*/nullptr);
   };
 
   auto dispatch_m = [&](auto t_tag) {
@@ -1059,11 +1130,15 @@ void group_gemm_wide_n_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                              const void *seqlens_ptr, const void *cu_seqlens_ptr,
                              const void *tiles_ptr, const void *cu_tiles_ptr, bool use_vert,
                              int n, int k, int num_group, int tile_m, bool is_half,
-                             bool use_pdl, cudaStream_t stream) {
+                             bool use_pdl, cudaStream_t stream,
+                             const void *const *weight_ptrs = nullptr,
+                             float *accumulator = nullptr, const int *accum_rows = nullptr,
+                             const float *sorted_scale = nullptr, bool explicit_config = false) {
   using namespace cute;  // NOLINT
 
   assert(n % 128 == 0 && "wide_n: n must be a multiple of 2*kTileN=128");
   assert(k % 64 == 0 && "wide_n: k must be a multiple of 64");
+  assert(!accumulator || (accum_rows && sorted_scale));
   assert(tile_m == 32 || tile_m == 64 || tile_m == 128);
 
   cutlass::FastDivmod flat_divider(n / 128);  // N-pair 数
@@ -1088,24 +1163,31 @@ void group_gemm_wide_n_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
         (num_group + 1) * static_cast<int>(sizeof(int));  // 调度表（tiles 或 cu_tiles）
     assert(shm_size <= 101376);
 
-    auto kernel =
-        kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/false,
-                                          /*kScatterA=*/false>;
+    auto kernel = accumulator
+                      ? kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/false,
+                                                          /*kScatterA=*/false,
+                                                          /*kFusedAccum=*/true>
+                      : kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/false,
+                                                          /*kScatterA=*/false,
+                                                          /*kFusedAccum=*/false>;
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    configure_dynamic_shared_memory(kernel, shm_size);
     int max_blocks = 1;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks, kernel, kNThreads, shm_size);
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks, kernel, kNThreads, shm_size));
     if (max_blocks < 1) max_blocks = 1;
     dim3 grid(static_cast<unsigned>(get_sm_count() * max_blocks));
 
-    launch_kernel_pdl(kernel, grid, dim3(kNThreads), shm_size, stream, use_pdl, y_ptr,
+    launch_kernel_pdl_config(kernel, grid, dim3(kNThreads), shm_size, stream, use_pdl,
+                             !explicit_config, y_ptr,
                       x_ptr, w_ptr,
                       /*row_indices=*/nullptr,
                       reinterpret_cast<const int *>(seqlens_ptr),
                       reinterpret_cast<const int *>(cu_seqlens_ptr),
                       reinterpret_cast<const int *>(tiles_ptr),
                       reinterpret_cast<const int *>(cu_tiles_ptr), use_vert ? 1 : 0, n, k,
-                      num_group, flat_divider);
+                      num_group, flat_divider, weight_ptrs, accumulator, accum_rows,
+                      sorted_scale);
   };
 
   auto dispatch_m = [&](auto t_tag) {

@@ -38,7 +38,8 @@ struct FmMarks {
     const char *name[12] = {};
     int n = 0;
 
-    FmMarks() : time_on(std::getenv("FUSE_MOE_TIME") != nullptr) {}
+    explicit FmMarks(bool read_environment = true)
+        : time_on(read_environment && std::getenv("FUSE_MOE_TIME") != nullptr) {}
 
     void bind(cudaStream_t s) { stream = s; }
 
@@ -81,7 +82,7 @@ struct FmMarks {
 // 代价是每 expert 平均 M/2 行 padding 浪费（大 avg 时占比低）。
 // M128 仅 cp.async 家族；TMA 家族（可选路径）固定 64。
 // FUSE_MOE_TILE_M=32/64/128 可强制（调优/复现用）。
-inline int moe_pick_tile_m(int avg_tokens_per_expert, bool allow_128) {
+inline int moe_pick_tile_m_auto(int avg_tokens_per_expert, bool allow_128) {
     int tm;
     if (avg_tokens_per_expert <= 48) {
         tm = 32;
@@ -90,6 +91,12 @@ inline int moe_pick_tile_m(int avg_tokens_per_expert, bool allow_128) {
     } else {
         tm = 64;
     }
+    return tm;
+}
+
+// Legacy full-GPU tuning retains its environment override.
+inline int moe_pick_tile_m(int avg_tokens_per_expert, bool allow_128) {
+    int tm = moe_pick_tile_m_auto(avg_tokens_per_expert, allow_128);
     if (const char *env_tm = std::getenv("FUSE_MOE_TILE_M")) {
         const int v = std::atoi(env_tm);
         if (v == 32 || v == 64 || (v == 128 && allow_128)) tm = v;
@@ -99,47 +106,55 @@ inline int moe_pick_tile_m(int avg_tokens_per_expert, bool allow_128) {
 
 // ── 参数结构（op 层填写；策略字段由家族入口覆盖）────────────────────────
 struct FMOE_params {
+    explicit FMOE_params(bool read_environment = true) : marks(read_environment) {}
+
     // 输入
-    const void *x_ptr;        // (S, H)，token 序
-    const void *w1_ptr;       // (E, 2I, H) gate_up 权重
-    const void *w2_ptr;       // (E, H, I) down 权重
-    const int *topk_ids_ptr;  // (S, K) int32
-    const float *topk_scale_ptr;  // (S, K) fp32
+    const void *x_ptr = nullptr;        // (S, H)，token 序
+    const void *w1_ptr = nullptr;       // (E, 2I, H) gate_up 权重
+    const void *w2_ptr = nullptr;       // (E, H, I) down 权重
+    // Optional device pointer tables for independently allocated cached experts.
+    const void *const *w1_group_ptrs = nullptr;
+    const void *const *w2_group_ptrs = nullptr;
+    const int *topk_ids_ptr = nullptr;  // (S, K) int32
+    const float *topk_scale_ptr = nullptr;  // (S, K) fp32
 
     // workspace（op 层分配，架构无关）。gate_up_out 仅 TMA 家族使用
     //（其 gemm1 无 gate/up 配对融合变体）；cp.async 家族的 gemm1 融合
     // epilogue 直写 act_out，不消费该缓冲。
-    int *row_indices_ptr;  // (T) expert 排序后布局的源行号
-    int *topk_pos_ptr;     // (S, K) (token, topk) → 排序后行号（无效槽位 -1）
-    int *seqlens_ptr;      // (E)
-    int *cu_seqlens_ptr;   // (E+1) compact 前缀和
-    int *tiles_ptr;        // (E) 每 expert 的 kTileM tile 数
-    int *cu_tiles_ptr;     // (E+1) tiles 的 exclusive 前缀和；[E] = total_m
+    int *row_indices_ptr = nullptr;  // (T) expert 排序后布局的源行号
+    int *topk_pos_ptr = nullptr;     // (S, K) (token, topk) → 排序后行号（无效槽位 -1）
+    int *seqlens_ptr = nullptr;      // (E)
+    int *cu_seqlens_ptr = nullptr;   // (E+1) compact 前缀和
+    int *tiles_ptr = nullptr;        // (E) 每 expert 的 kTileM tile 数
+    int *cu_tiles_ptr = nullptr;     // (E+1) tiles 的 exclusive 前缀和；[E] = total_m
                            //（vert 调度用，见 sm89/group_gemm_sm89.cuh）
-    void *gate_up_out_ptr;  // (T, 2I)，仅 TMA 家族
-    void *act_out_ptr;      // (T, I)
-    void *down_out_ptr;     // (T, H)
-    void *out_ptr;          // (S, H) 最终输出
+    void *gate_up_out_ptr = nullptr;  // (T, 2I)，仅 TMA 家族
+    void *act_out_ptr = nullptr;      // (T, I)
+    void *down_out_ptr = nullptr;     // (T, H), unused by fused FP32 accumulation
+    void *out_ptr = nullptr;          // (S, H) 最终输出
+    // Offload GEMM2 epilogue: RN to input dtype before weighted FP32 atomicAdd.
+    float *accumulator_ptr = nullptr;  // (S, H), nullptr keeps normal writeback
+    const float *sorted_scale_ptr = nullptr;  // tile-local compact route scales
 
     // 形状
-    int num_seq;       // S
-    int hidden;        // H（%64==0）
-    int intermediate;  // I（%64==0）
-    int num_expert;    // E（<=512）
-    int num_topk;      // K（<=128）
-    int total_num_seq; // T = S * K
-    int avg_tokens_per_expert;  // T / E
-    bool is_bf16;               // false → fp16
+    int num_seq = 0;       // S
+    int hidden = 0;        // H（%64==0）
+    int intermediate = 0;  // I（%64==0）
+    int num_expert = 0;    // E（<=512）
+    int num_topk = 0;      // K（<=128）
+    int total_num_seq = 0; // T = S * K
+    int avg_tokens_per_expert = 0;  // T / E
+    bool is_bf16 = false;               // false → fp16
 
     // 策略（fuse_moe_launch 分发时填写）
-    int tile_m;    // count/GEMM 共用 kTileM（moe_pick_tile_m）
-    bool use_vert_sched;  // task 调度序：false=horizon（M-major，默认）；
+    int tile_m = 0;    // count/GEMM 共用 kTileM（moe_pick_tile_m）
+    bool use_vert_sched = false;  // task 调度序：false=horizon（M-major，默认）；
                           // true=vert（N-major，W 面板跨 M-band 复用；
                           // FUSE_MOE_SCHED=vert A/B 用，见 launch 层）
-    bool use_wide_n;      // gemm2 相邻 N-pair 变体（每 task 覆盖 128 列，
+    bool use_wide_n = false;      // gemm2 相邻 N-pair 变体（每 task 覆盖 128 列，
                           // per-slab MMA 密度 ×2；默认启用，仅 hidden%128==0
                           // 时生效，FUSE_MOE_TILE_N=64 可强制关闭）
-    bool use_pdl;  // sm90+ 硬件且未设 FUSE_MOE_NO_PDL
+    bool use_pdl = false;  // sm90+ 硬件且未设 FUSE_MOE_NO_PDL
 
     // 分段计时（FUSE_MOE_TIME）
     FmMarks marks;

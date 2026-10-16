@@ -14,6 +14,11 @@
 #include <cuda_runtime.h>
 
 #include <cstdlib>
+#include <map>
+#include <memory>
+#include <mutex>
+
+#include <c10/cuda/CUDAException.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -96,14 +101,14 @@ __device__ __forceinline__ float silu(float x) { return x / (1.0f + __expf(-x));
 //    PDL 辅助（sm90+；低架构编译为空）
 // ============================
 // acquire：等待上游 kernel 全部完成（其 gmem 写入对 本 grid 可见）。
-// 未以 PDL attribute 启动时为 no-op（安全，FA combine kernel 同款用法）。
+// sm90+ 的 griddepcontrol 指令须与硬件对应的 PSS launch 属性配对。
 __device__ __forceinline__ void pdl_acquire() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
 #endif
 }
 
-// release：通知下游可以提前启动。未以 PDL 启动时为 no-op。
+// release：通知下游可以提前启动；sm90+ 同样要求匹配 PSS launch 属性。
 __device__ __forceinline__ void pdl_release() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaTriggerProgrammaticLaunchCompletion();
@@ -114,29 +119,42 @@ __device__ __forceinline__ void pdl_release() {
 // pdl_release，sm90+ 编译目标恒内联）必须与 launch 的 PSS 属性配对——
 // 非 PDL 启动的 kernel 执行 griddepcontrol.wait 是 UB（实测 compute-
 // sanitizer synccheck 表现为部分线程挂起 → mbarrier Missing init → 死锁；
-// 早先「无属性时为 no-op」的假设是错的）。因此 sm90+ 设备上恒带 PSS 属性：
-// 无上游 trigger 时驱动退化为「等上游完成」的正常串行语义，无害；sm89
-// 及以下 kernel 体无指令，普通 launch，天然配对。use_pdl 参数保留仅为
-// 调用方签名兼容（不再控制属性）。
+// 早先「无属性时为 no-op」的假设是错的）。offload 每次按当前设备匹配 PSS：
+// sm90+ 带属性，无上游 trigger 时驱动退化为「等上游完成」的串行语义；
+// sm89 及以下 kernel 体无指令，普通 launch，天然配对。legacy 仍保留
+// 首次设备缓存和诊断环境覆盖；这些覆盖不允许用于 offload。use_pdl
+// 参数保留仅为调用方签名兼容（不再控制属性）。
 template <typename KernelT, typename... Args>
-static inline void launch_kernel_pdl(KernelT kernel, dim3 grid, dim3 block, size_t smem,
-                                      cudaStream_t stream, bool use_pdl, Args... args) {
+static inline void launch_kernel_pdl_config(KernelT kernel, dim3 grid, dim3 block, size_t smem,
+                                            cudaStream_t stream, bool use_pdl,
+                                            bool allow_environment, Args... args) {
   (void)use_pdl;
-  static const bool s_pdl_hw = []() {
+  const auto detect_pdl_hw = []() {
     int dev = 0, major = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return false;
     if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
       return false;
     }
     return major >= 9;
-  }();
-  // FUSE_MOE_NO_PDL / FUSE_MOE_TIME：强制普通 launch（串行化下游启动）。
-  // kernel 体的 griddepcontrol 指令在无 PSS 属性时为 no-op（PTX 规定，
-  // FA combine kernel 同款用法），安全；串行化是 FUSE_MOE_TIME 分段计时
-  // 能归因到单个 kernel 的前提。
-  static const bool s_force_plain = std::getenv("FUSE_MOE_NO_PDL") != nullptr ||
-                                    std::getenv("FUSE_MOE_TIME") != nullptr;
-  if (s_pdl_hw && !s_force_plain) {
+  };
+  bool pdl_hw;
+  if (allow_environment) {
+    // Preserve the legacy first-device cache, initialized only by legacy launches.
+    static const bool s_pdl_hw = detect_pdl_hw();
+    pdl_hw = s_pdl_hw;
+  } else {
+    // Offload may switch between devices with different SM capabilities.
+    pdl_hw = detect_pdl_hw();
+  }
+  // Legacy diagnostic overrides retain their force-plain behavior for serialized
+  // launches/timing; offload must not read them or override hardware-matched PSS.
+  bool force_plain = false;
+  if (allow_environment) {
+    static const bool s_force_plain = std::getenv("FUSE_MOE_NO_PDL") != nullptr ||
+                                      std::getenv("FUSE_MOE_TIME") != nullptr;
+    force_plain = s_force_plain;
+  }
+  if (pdl_hw && !force_plain) {
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -153,19 +171,69 @@ static inline void launch_kernel_pdl(KernelT kernel, dim3 grid, dim3 block, size
   }
 }
 
+// Legacy launches retain environment overrides; explicit offload launches bypass them.
+template <typename KernelT, typename... Args>
+static inline void launch_kernel_pdl(KernelT kernel, dim3 grid, dim3 block, size_t smem,
+                                     cudaStream_t stream, bool use_pdl, Args... args) {
+  launch_kernel_pdl_config(kernel, grid, block, smem, stream, use_pdl,
+                          /*allow_environment=*/true, args...);
+}
+
+// Function attributes belong to a device/kernel, not a context or stream.
+// Publish a stable hardware limit once; never shrink it to a wave's group count.
+// CUDA device reset/module unload while these caches are live is unsupported.
+template <typename KernelT>
+inline void configure_dynamic_shared_memory(KernelT kernel, int requested) {
+  struct State {
+    std::once_flag once;
+    int limit = 0;
+  };
+  using Cache = std::map<int, std::map<KernelT, std::shared_ptr<State>>>;
+  static Cache cache;
+  static std::mutex cache_mutex;
+  // Warm calls avoid the registry mutex; all threads share each state's once flag.
+  static thread_local Cache local_cache;
+  int device = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  auto& state = local_cache[device][kernel];
+  if (!state) {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto& shared = cache[device][kernel];
+    if (!shared) shared = std::make_shared<State>();
+    state = shared;
+  }
+  std::call_once(state->once, [&] {
+    int optin = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    cudaFuncAttributes attributes{};
+    C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+    TORCH_CHECK(optin >= 0 && attributes.sharedSizeBytes <= static_cast<size_t>(optin),
+                "kernel static shared memory exceeds device opt-in limit");
+    const int limit = optin - static_cast<int>(attributes.sharedSizeBytes);
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, limit));
+    state->limit = limit;
+  });
+  TORCH_CHECK(requested >= 0 && requested <= state->limit,
+              "requested dynamic shared memory (", requested,
+              " bytes) exceeds device/kernel limit (", state->limit,
+              " bytes) on CUDA device ", device);
+}
+
 // ============================
 //    Device Information
 // ============================
 inline int get_sm_count() {
-  static int num_sm = -1;
-  if (num_sm == -1) {
-    int dev = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, dev);
-    num_sm = prop.multiProcessorCount;
-  }
-  return num_sm;
+  // Each thread caches checked device queries independently, with no shared writes.
+  static thread_local std::map<int, int> counts;
+  int device = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  const auto found = counts.find(device);
+  if (found != counts.end()) return found->second;
+  int count = 0;
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+  return counts.emplace(device, count).first->second;
 }
 
 // PDL 是否可用于当前设备（compute capability >= 9.0；sm120 为 true，sm89 为 false）

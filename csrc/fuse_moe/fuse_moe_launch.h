@@ -61,6 +61,35 @@ namespace fuse_moe {
 // cp.async kernel 在所有 sm80+ gencode（含 sm_120a）下均有 cubin，故本家族
 // 无 FA_HAS 编译期门槛——运行期 major>=8 即可分发；sm120 的默认引擎亦复用
 // 本接线（见下方 sm120 家族）。
+inline void moe_compute_sm8x(FMOE_params &params, cudaStream_t stream,
+                             bool explicit_config = false) {
+    const int intermediate2 = params.intermediate * 2;
+    const bool is_half = !params.is_bf16;
+    group_gemm::group_gemm_gateup_fused_async(
+        params.act_out_ptr, params.x_ptr, params.w1_ptr, params.row_indices_ptr,
+        params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+        params.use_vert_sched, intermediate2, params.hidden, params.num_expert,
+        params.tile_m, is_half, params.use_pdl, stream, params.w1_group_ptrs,
+        explicit_config);
+    if (params.use_wide_n && params.hidden % 128 == 0) {
+        group_gemm::group_gemm_wide_n_async(
+            params.down_out_ptr, params.act_out_ptr, params.w2_ptr, params.seqlens_ptr,
+            params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+            params.use_vert_sched, params.hidden, params.intermediate, params.num_expert,
+            params.tile_m, is_half, params.use_pdl, stream, params.w2_group_ptrs,
+            params.accumulator_ptr, params.accumulator_ptr ? params.row_indices_ptr : nullptr,
+            params.sorted_scale_ptr, explicit_config);
+    } else {
+        group_gemm::group_gemm_async(
+            params.down_out_ptr, params.act_out_ptr, params.w2_ptr, nullptr,
+            params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+            params.use_vert_sched, params.hidden, params.intermediate, params.num_expert,
+            params.tile_m, is_half, params.use_pdl, stream, params.w2_group_ptrs,
+            params.accumulator_ptr, params.accumulator_ptr ? params.row_indices_ptr : nullptr,
+            params.sorted_scale_ptr, explicit_config);
+    }
+}
+
 template <typename T>
 inline void moe_launch_sm8x_impl(FMOE_params &params, cudaStream_t stream) {
     const int intermediate2 = params.intermediate * 2;
