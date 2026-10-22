@@ -446,7 +446,7 @@ def _load_ops(library=None, wait_seconds=0, *, allow_testing=False, compile_lowe
         "int max_route_tile_rows=4096, int resident_cache_bytes=0, int dynamic_cache_bytes=0, "
         "int cache_policy=0, int cache_decay_interval=32, int cache_min_reuse=2, "
         "int cache_update_bytes=0, bool async_staging=False, bool host_profile=False, "
-        "int tile_m=0, int tile_n=128) -> Tensor")
+        "int tile_m=0, int tile_n=128, int expert_activation=0, int numerical_mode=0, int expert_type=0) -> Tensor")
     assert create_schema.endswith(expected_create), f"Dynamic create schema is not ready: {create_schema}"
     bind_schema = str(torch.ops.recsys_ops.fuse_moe_offload_resident_bind.default._schema)
     assert bind_schema.endswith(
@@ -467,19 +467,60 @@ def _inputs(s, w1, w2, token, device):
     x = (torch.arange(s * H, dtype=torch.float32).cos() * .25).reshape(s, H)
     ids = (torch.arange(s * K, dtype=torch.int64) % E).reshape(s, K)
     scale = torch.full((s, K), 1.0 / K, dtype=torch.float32)
-    return (x.to(device=device, dtype=torch.float16), w1, w2,
+    return (x.to(device=device, dtype=w1.dtype), w1, w2,
             ids.to(device=device, dtype=torch.int32), scale.to(device), token)
 
 
-def _reference(args):
+def _expert_activation(values, expert_activation):
+    """Exact nonlinearity selection used by every independent reference."""
+    if expert_activation == "gelu":
+        # PyTorch F.gelu(approximate='none') is exactly erf based; never tanh.
+        return 0.5 * values * (1.0 + torch.erf(values * 0.7071067811865476))
+    if expert_activation != "silu":
+        raise ValueError(f"unknown expert_activation {expert_activation!r}")
+    return torch.nn.functional.silu(values)
+
+
+def _round(value, dtype):
+    return value.to(dtype).float()
+
+
+def _reference(args, *, expert_activation="silu", numerical_mode="fused", expert_type="glu"):
+    """Independent FP32 reference with explicit mode selection.
+
+    fused keeps the historical single-writeback semantics (Act and Down are
+    rounded to the output dtype, matching the existing SwiGLU fixture).
+    staged rounds gemm1 gate/up, act(gate), the act*up product, gemm2 down,
+    and each weighted route product before the FP32 reduction. The default
+    silently remains silu/fused so legacy acceptance stays byte-identical.
+    """
     x, w1, w2, ids, scale, _ = args
+    if expert_type not in ("glu", "mlp") or w1.shape[1] != (2 if expert_type == "glu" else 1) * w2.shape[2]:
+        raise ValueError("expert_type projection shapes")
+    dtype = args[0].dtype
+    staged = numerical_mode == "staged"
+    if numerical_mode not in ("fused", "staged"):
+        raise ValueError(f"unknown numerical_mode {numerical_mode!r}")
     x, ids, scale = x.float().cpu(), ids.cpu(), scale.cpu()
     out = torch.zeros_like(x)
-    for expert in range(E):
+    for expert in range(w1.shape[0]):
         rows, slots = torch.where(ids == expert)
-        gate, up = (x[rows] @ w1[expert].float().T).chunk(2, dim=-1)
-        values = (torch.nn.functional.silu(gate) * up) @ w2[expert].float().T
-        out.index_add_(0, rows, values * scale[rows, slots, None])
+        projected = x[rows] @ w1[expert].float().T
+        if staged:
+            projected = _round(projected, dtype)
+        gate = projected.chunk(2, -1)[0] if expert_type == "glu" else projected
+        act = _expert_activation(gate, expert_activation)
+        if expert_type == "mlp":
+            product = _round(act, dtype)
+        elif staged:
+            product = _round(_round(act, dtype) * projected.chunk(2, -1)[1], dtype)
+        else:
+            product = _round(act * projected.chunk(2, -1)[1], dtype)
+        values = _round(product @ w2[expert].float().T, dtype)
+        weighted = values * scale[rows, slots, None]
+        if staged:
+            weighted = _round(weighted, dtype)
+        out.index_add_(0, rows, weighted)
     return out
 
 
@@ -642,7 +683,7 @@ class _TwoLayerChain(torch.nn.Module):
         return (self.second(intermediate, w15, w25, ids, scale, token),)
 
 
-def _checkpoint_store(directory, version):
+def _checkpoint_store(directory, version, dtype=torch.float16):
     generator = torch.Generator().manual_seed(20261012 + version)
     # Random scaled weights keep the real two-layer output well above FP16 subnormals.
     state = {name: torch.randn(shape, generator=generator) * .12
@@ -656,7 +697,7 @@ def _checkpoint_store(directory, version):
     keys = {0: LayerKeys(gate_up="layer0.gate_up", down="layer0.down"),
             5: LayerKeys(gate="layer5.gate", up="layer5.up", down="layer5.down")}
     started = time.perf_counter()
-    store = ExpertStore.load(checkpoint, keys, dtype=torch.float16, ram_budget_bytes=RAM_BUDGET)
+    store = ExpertStore.load(checkpoint, keys, dtype=dtype, ram_budget_bytes=RAM_BUDGET)
     checkpoint_load_ms = (time.perf_counter() - started) * 1000
     archive = directory / f"cpp_weights_v{version}.pt"
     store.save_cpp(archive, weight_version=version)
@@ -727,7 +768,8 @@ def _wide_inputs(s, w1, w2, token, device):
             ids[rows].to(device), scale[rows].to(device), token)
 
 
-def _check_wide_call(fn, args, runtime, cache, tile_rows, label, *, check_reuse=False):
+def _check_wide_call(fn, args, runtime, cache, tile_rows, label, *, check_reuse=False,
+                     expert_activation="silu", numerical_mode="fused"):
     x, w1, w2, ids, scale, token = args
     assert x.shape[1] == 128 and w2.shape[2] == 64
     host_ids, host_scale = ids.cpu(), scale.cpu()
@@ -736,7 +778,8 @@ def _check_wide_call(fn, args, runtime, cache, tile_rows, label, *, check_reuse=
     counts = [(host_ids == e).sum().item() for e in range(E)]
     assert min(counts) > 0 and len(set(counts)) > 1, counts
     before, ptr, version = token.clone(), token.data_ptr(), token._version
-    expected = _reference(args)
+    expected = _reference(args, expert_activation=expert_activation,
+                          numerical_mode=numerical_mode)
     assert expected.abs().max().item() > 1e-3, "Wide fixture must reject a zero output"
     output = _single_output(fn(*args))
     torch.cuda.synchronize(x.device)
@@ -797,11 +840,17 @@ def _check_wide_call(fn, args, runtime, cache, tile_rows, label, *, check_reuse=
     print(f"PASS {label}: max_abs={(actual - expected).abs().max().item()} stats={stats}", flush=True)
 
 
-def _check_wide_acceptance(directory, device, *, bf16=True, benchmark_only=False):
+def _check_wide_acceptance(directory, device, *, bf16=True, benchmark_only=False,
+                           expert_activation="silu", numerical_mode="fused",
+                           precision=None):
     # Static H/dtype requires separate official graphs, never reuse the H64 graph.
     # Each package is compiled once and reused across every tile/cache/runtime.
-    half_paths = None
-    for dtype in ((torch.float16, torch.bfloat16) if bf16 else (torch.float16,)):
+    if precision is not None:
+        dtypes = ({"fp16": (torch.float16,), "bf16": (torch.bfloat16,)}[precision])
+    else:
+        dtypes = (torch.float16, torch.bfloat16) if bf16 else (torch.float16,)
+    first_paths = None
+    for dtype in dtypes:
         name = "fp16" if dtype == torch.float16 else "bf16"
         h, intermediate = 128, 64
         generator = torch.Generator().manual_seed(20261012)
@@ -823,7 +872,9 @@ def _check_wide_acceptance(directory, device, *, bf16=True, benchmark_only=False
                         ram_budget_bytes=RAM_BUDGET, pinned_budget_bytes=pinned_cap,
                         num_banks=2, activation_mode="fp32_accumulate",
                         max_route_tile_rows=tile_rows, resident_cache_bytes=cap,
-                        resident_experts={0: expert_ids}))
+                        resident_experts={0: expert_ids},
+                        expert_activation=expert_activation,
+                        numerical_mode=numerical_mode))
                     cache = _get_cache_info(runtime, preset, expert_ids, cap, gpu_cap, expert_bytes)
                     contexts.append((tile_rows, runtime, cache))
             runtime = contexts[0][1]
@@ -860,13 +911,14 @@ def _check_wide_acceptance(directory, device, *, bf16=True, benchmark_only=False
                             _check_wide_call(
                                 loaded, _wide_inputs(s, w1, w2, context.token, device), context,
                                 cache, tile_rows, f"wide Python AOTI {name} H128/I64 tile={tile_rows} "
-                                f"cache={cache.name} S={s} repeat={repeat}", check_reuse=repeat == 1)
+                                f"cache={cache.name} S={s} repeat={repeat}", check_reuse=repeat == 1,
+                                expert_activation=expert_activation, numerical_mode=numerical_mode)
             finally:
                 del loaded
-        if dtype == torch.float16:
-            half_paths = (package_path, str(archive_path))
-    assert half_paths is not None, "FP16 wide package is mandatory for C++ acceptance"
-    return half_paths
+        if first_paths is None:
+            first_paths = (package_path, str(archive_path))
+    assert first_paths is not None, "Wide package is mandatory for C++ acceptance"
+    return first_paths
 
 
 def _check_checkpoint_acceptance(directory, executable, package_path, loaded, library, device, sizes,
@@ -1433,6 +1485,242 @@ def _check_locked_acceptance(directory, executable, library, device, sizes, *,
             print(f"PASS LOCKED C++ invalid archive {kind}/{name}", flush=True)
 
 
+GEGLU_SIZES = (2, 7, 64)
+
+
+def _geglu_config(store, target_sm, *, precision="fp16",
+                  async_staging=False, host_profile=False, expert_type="glu"):
+    # Explicit GEGLU/staged selection; never inferred from activation_mode.
+    return OffloadConfig.from_store(
+        store, gpu_budget_bytes=2 * 1024**2, ram_budget_bytes=RAM_BUDGET,
+        pinned_budget_bytes=PINNED_BUDGET, target_sm=target_sm,
+        resident_experts={layer: (0,) for layer in store.layers},
+        resident_cache_bytes=2 * DYNAMIC_CACHE_CAP, dynamic_cache_bytes=2 * DYNAMIC_CACHE_CAP,
+        activation_mode="fp32_accumulate", max_route_tile_rows="auto",
+        async_staging=async_staging, host_profile=host_profile,
+        tile_m=32, tile_n=64, expert_activation="gelu", numerical_mode="staged", expert_type=expert_type)
+
+
+def _geglu_reference(args, store, config, *, chain=True):
+    dtype = args[0].dtype
+    ids, scale, token = args[-3], args[-2], args[-1]
+    value = args[0]
+    layers = tuple(store.layers) if chain else (next(iter(store.layers)),)
+    for layer in layers:
+        value = _reference(
+            (value, *store.layers[layer], ids, scale, token),
+            expert_activation=config.expert_activation,
+            numerical_mode=config.numerical_mode, expert_type=config.expert_type).to(dtype)
+    return value.float()
+
+
+def _geglu_metric(actual, expected):
+    error = actual.double() - expected.double()
+    finite = bool(torch.isfinite(actual).all() and torch.isfinite(expected).all()
+                  and torch.isfinite(error).all())
+    absolute = error.abs().flatten()
+    relative = (error.abs() / expected.double().abs().clamp_min(1e-3)).flatten()
+    norm = expected.double().norm().item()
+
+    def quantiles(value):
+        if not finite or not value.numel():
+            return dict(p50=None, p99=None, max=None)
+        return dict(p50=value.quantile(.5).item(), p99=value.quantile(.99).item(),
+                    max=value.max().item())
+
+    abs_error, rel_error = quantiles(absolute), quantiles(relative)
+    return dict(max_abs_error=abs_error["max"],
+                rmse=error.square().mean().sqrt().item() if finite and error.numel() else None,
+                relative_l2=error.norm().item() / norm if finite and norm else None,
+                exact_equal=torch.equal(actual, expected), finite=finite,
+                abs_error=abs_error, rel_error=rel_error, numel=error.numel(),
+                relative_denominator_floor=1e-3)
+
+
+def _expert_chain_atol(expected, dtype, expert_type):
+    """An output-scale rounding budget; preserve the legacy GLU fixture threshold.
+
+    MLP chain outputs are not suppressed by a second gate/up product. Near-zero
+    cancellation must be compared against output RMS, not a GLU-only absolute
+    scale. Two dtype epsilon units of that RMS supplement unchanged 2% relative
+    and relative-L2 checks; strict single-stage scalar witnesses stay exact.
+    """
+    if expert_type == "glu":
+        return 2e-6
+    if expert_type != "mlp" or dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("invalid chain dtype/expert_type")
+    rms = expected.double().square().mean().sqrt().item()
+    if not math.isfinite(rms):
+        raise AssertionError("nonfinite chain reference")
+    return 2e-6 + 2 * torch.finfo(dtype).eps * rms
+
+
+def _check_geglu_call(fn, args, runtime, config, label, *, chain=True):
+    token = runtime.token
+    before, version, ptr = token.clone(), token._version, token.data_ptr()
+    expected = _geglu_reference(args, runtime.store, config, chain=chain)
+    # The fixture must discriminate exact GELU from the legacy SiLU default.
+    silu = _geglu_reference(args, runtime.store, replace(
+        config, expert_activation="silu"), chain=chain)
+    discrimination = (expected - silu).norm().item() / expected.norm().clamp_min(1e-12).item()
+    assert discrimination > 1e-3, ("GEGLU fixture cannot distinguish SiLU", discrimination)
+    assert expected.abs().max().item() > 1e-4, "GEGLU fixture underflowed"
+    output = _single_output(fn(*args))
+    torch.cuda.synchronize()
+    invocations = 2 if chain else 1
+    assert token.data_ptr() == ptr and token[0].item() == before[0].item(), label
+    assert token[1].item() == before[1].item() + invocations, label
+    assert token._version == version + invocations, label
+    assert output.shape == args[0].shape and output.dtype == args[0].dtype
+    actual = output.float().cpu()
+    atol = _expert_chain_atol(expected, output.dtype, config.expert_type) if chain else ATOL
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=RTOL)
+    metric = _geglu_metric(actual, expected)
+    metric.update(comparison_atol=atol, comparison_rtol=RTOL,
+                  reference_rms=expected.double().square().mean().sqrt().item())
+    assert metric["relative_l2"] < .02, (label, metric)
+    stats = _stats(runtime)
+    assert stats["activation_mode"] == 1 and stats["route_tile_rows"] > 0, stats
+    assert stats["active_experts"] == 2 and stats["cache_hits"] + stats["cache_misses"] == 2, stats
+    print(f"PASS {'MLP' if config.expert_type == 'mlp' else 'GEGLU'} {label}: {metric}", flush=True)
+    return dict(label=label, expert_type=config.expert_type, **metric, gelu_vs_silu_relative_l2=discrimination)
+
+
+def _check_geglu_mismatch(loaded, runtime, config, label):
+    # A runtime with a different (still v2) mode pair must fail the artifact
+    # preflight before the official loader is entered.
+    _check_locked_rejection(
+        loaded, _geglu_inputs(7, runtime.store, runtime.token,
+                              torch.device(runtime.device), True),
+        runtime, config, f"geglu/{label}")
+    print(f"PASS GEGLU checked abort before downstream {label}", flush=True)
+
+
+def _geglu_inputs(s, store, token, device, chain=True):
+    return _locked_inputs(s, store, token, device, chain)
+
+
+def _run_geglu_only(*, ops_library, sizes=GEGLU_SIZES, wait_seconds=0, allow_testing=False,
+                    output_dir=None, precision="fp16", async_staging=False,
+                    host_profile=False, expert_type="glu"):
+    """Short standalone GEGLU/staged external caller acceptance; never the full suite."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required; the GEGLU acceptance cannot be skipped")
+    if not set(GEGLU_SIZES).issubset(sizes) or any(s < 2 or s > 64 for s in sizes):
+        raise ValueError("GEGLU sizes must include S=2, S=7 and S=64 within [2,64]")
+    test_explicit_expert_modes_v2_config_cpu_contract()
+    test_geglu_staged_reference_cpu_contract()
+    test_prefill_create_explicit_mode_arguments_cpu_contract()
+    test_geglu_metrics_cpu_contract()
+    dtype = _precision_dtype(precision)
+    library = _load_ops(ops_library, wait_seconds, allow_testing=allow_testing)
+    device = torch.device("cuda", torch.cuda.current_device())
+    suite = "mlp" if expert_type == "mlp" else "geglu"
+    with _artifact_directory(f"fuse_moe_offload_{suite}_", output_dir) as temporary, \
+            mock.patch.dict(os.environ, {
+                "TORCHINDUCTOR_CACHE_DIR": str(Path(temporary) / "inductor_cache"),
+                "TRITON_CACHE_DIR": str(Path(temporary) / "triton_cache"),
+            }):
+        directory = Path(temporary)
+        executable = _compile_runner(directory)
+        checkpoint, _ = _checkpoint_store(directory, 31, dtype=dtype)
+        store = _locked_store(checkpoint, True)
+        if expert_type == "mlp":
+            store = ExpertStore({layer: (w1[:, :w2.shape[2]].contiguous(), w2)
+                                 for layer, (w1, w2) in store.layers.items()})
+        target_sm = 10 * torch.cuda.get_device_capability(device)[0] + \
+            torch.cuda.get_device_capability(device)[1]
+        config = _geglu_config(store, target_sm, precision=precision,
+                               async_staging=async_staging,
+                               host_profile=host_profile, expert_type=expert_type)
+        archive = directory / f"{suite}_weights_{precision}.pt"
+        store.save_cpp(archive, weight_version=31, config=config)
+        restored = ExpertStore.load_cpp(archive, ram_budget_bytes=RAM_BUDGET)
+        assert restored.deployment_config == config
+        store = restored
+        vectors = {layer: config.layer_config(layer) for layer in store.layers}
+        for vector in vectors.values():
+            # v2: 25 fixed fields = legacy 23 + activation@23 + numerical@24.
+            assert vector[0] == (3 if expert_type == "mlp" else 2), vector
+            assert len(vector) == (26 if expert_type == "mlp" else 25) + vector[21], vector
+            assert vector[23] == 1 and vector[24] == 1, vector
+            if expert_type == "mlp":
+                assert vector[25] == 1, vector
+        manifest = config.manifest()
+        assert manifest[0] == 1
+        with _LockedPrefillMoERuntime.from_config(store, config, device=device) as runtime:
+            model = _LockedChain(config).eval()
+            cases = []
+            for s in sizes:
+                for repeat in range(2):
+                    cases.append(_check_geglu_call(
+                        model, _geglu_inputs(s, store, runtime.token, device, True),
+                        runtime, config, f"eager S={s} repeat={repeat}"))
+            args = _geglu_inputs(7, store, runtime.token, device, True)
+            snapshot, version = runtime.token.clone(), runtime.token._version
+            dim = torch.export.Dim("geglu_S", min=2, max=64)
+            exported = torch.export.export(model, args, dynamic_shapes=(
+                {0: dim}, None, None, None, None, {0: dim}, {0: dim}, None))
+            assert not exported.state_dict
+            placeholders = [n for n in exported.graph.nodes if n.op == "placeholder"]
+            calls = [n for n in exported.graph.nodes if n.op == "call_function" and
+                     n.target == torch.ops.recsys_ops.fuse_moe_offload.default]
+            assert len(placeholders) == 8 and len(calls) == 2, exported.graph
+            assert [tuple(node.args[7]) for node in calls] == [vectors[0], vectors[5]], exported.graph
+            assert all(tuple(node.args[8]) == manifest for node in calls), exported.graph
+            assert all(node.args[6] == layer for node, layer in zip(calls, (0, 5))), exported.graph
+            torch.testing.assert_close(runtime.token, snapshot, atol=0, rtol=0)
+            assert runtime.token._version == version
+            package = _compile_checked_package(
+                exported, package_path=str(directory / f"{suite}_chain_{precision}.pt2"),
+                inductor_configs={"triton.cudagraphs": False})
+            assert torch.equal(runtime.token, snapshot) and runtime.token._version == version
+            loaded = torch._inductor.aoti_load_package(package)
+            try:
+                for s in (*sizes, sizes[0]):
+                    cases.append(_check_geglu_call(
+                        loaded, _geglu_inputs(s, store, runtime.token, device, True),
+                        runtime, config, f"AOTI S={s}"))
+                for name, wrong in (
+                    ("activation", replace(config, expert_activation="silu")),
+                    ("numerical", replace(config, numerical_mode="fused")),
+                    ("both", replace(config, expert_activation="silu",
+                                     numerical_mode="fused")),
+                ):
+                    # Defaults canonicalize back to v1; explicit non-defaults
+                    # stay v2. Either must mismatch the v2 artifact manifest.
+                    assert wrong.layer_config(0)[0] in ((3,) if expert_type == "mlp" else (1, 2))
+                    with _LockedPrefillMoERuntime.from_config(store, wrong, device=device) as incompatible:
+                        _check_geglu_mismatch(loaded, incompatible, config, name)
+            finally:
+                del loaded
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("PYTHONHOME", None)
+        command = [str(executable), "--mlp" if expert_type == "mlp" else "--geglu", str(package), str(library),
+                   str(device.index), str(archive), *(str(s) for s in sizes)]
+        command += ["--precision", precision]
+        command += _runtime_cli_flags(async_staging, host_profile)
+        print("Standalone GEGLU run: " + shlex.join(command), flush=True)
+        completed = _run_process(command, directory, f"cpp_geglu_{precision}", env=environment)
+        prefix = "ACCEPTANCE_MLP_CPP " if expert_type == "mlp" else "ACCEPTANCE_GEGLU_CPP "
+        cpp_cases = [json.loads(line.removeprefix(prefix))
+                     for line in completed.stdout.splitlines() if line.startswith(prefix)]
+        assert cpp_cases, completed.stdout
+        report = dict(schema_version=1, state="passed", library=str(library),
+                      archive=str(archive), archive_format_version=2, package=str(package),
+                      manifest_framing=manifest[0], precision=precision,
+                      expert_activation=config.expert_activation,
+                      numerical_mode=config.numerical_mode, expert_type=config.expert_type,
+                      layer_configs={str(k): list(v) for k, v in vectors.items()},
+                      config=asdict(config), python_cases=cases, cpp_cases=cpp_cases,
+                      environment_signature=_environment_signature(library))
+        if output_dir is not None:
+            _write_json(Path(output_dir).expanduser().resolve() / f"{suite}_report.json", report)
+        print(("ACCEPTANCE_MLP " if expert_type == "mlp" else "ACCEPTANCE_GEGLU ") + json.dumps(report, sort_keys=True), flush=True)
+        return report
+
+
 # Public-op acceptance only: these are NOT model loaders. Every static H/I/E
 # inventory gets its own official graph/package; only S is dynamic within it.
 _PUBLIC_SPECS = ((0, 3, 64, 64), (5, 5, 128, 128), (11, 2, 64, 192))
@@ -1501,16 +1789,20 @@ def _public_inputs(s, store, device):
     return inputs
 
 
-def _public_reference(inputs, store, *, rounded=True):
+def _public_reference(inputs, store, *, rounded=True, config=None):
     # Inductor fuses adjacent scalar arithmetic in FP32 and casts at the
     # custom-op input/output boundaries, not after every eager scalar op.
+    expert_activation = "silu" if config is None else config.expert_activation
+    numerical_mode = "fused" if config is None else config.numerical_mode
     value = (inputs[2].cpu().float() * .875 + .03125).half()
     for n, (_, (w1, w2)) in enumerate(store.layers.items()):
         h = w1.shape[2]
         value = (torch.cat((value, value), dim=1) if value.shape[1] < h else
                  value[:, :h].contiguous())
         ids, scale = inputs[3 + 4 * n].cpu(), inputs[5 + 4 * n].cpu()
-        expected = _public_layer_reference(value, w1, w2, ids, scale, rounded=rounded)
+        expected = _public_layer_reference(value, w1, w2, ids, scale, rounded=rounded,
+                                           expert_activation=expert_activation,
+                                           numerical_mode=numerical_mode)
         # The native output is FP16. Keep its scalar multiply in FP32 until
         # the next custom op, or the final fused business add, consumes it.
         value = expected.half().float() * .75
@@ -1519,25 +1811,39 @@ def _public_reference(inputs, store, *, rounded=True):
     return (value + inputs[0].cpu().float() * .125).half()
 
 
-def _public_layer_reference(value, w1, w2, ids, scale, *, rounded):
-    """FP32 math, optionally with the native Act and Down storage boundaries.
+def _public_layer_reference(value, w1, w2, ids, scale, *, rounded,
+                            expert_activation="silu", numerical_mode="fused"):
+    """FP32 math with explicit fused/staged storage boundaries.
 
     Gate/up accumulators stay FP32 in the fused epilogue. Act is stored in
     the input dtype; Down is also stored in that dtype *before* route scale
     and FP32 reduction, in both route_buffer and fp32_accumulate modes.
+    staged additionally rounds gemm1 gate/up, act, the act*up product and
+    each weighted route product before the FP32 reduction.
     """
+    dtype = value.dtype
+    staged = numerical_mode == "staged"
     x = value.cpu().float()
     expected = torch.zeros_like(x)
     for expert in range(w1.shape[0]):
         rows, slots = torch.where(ids.cpu() == expert)
         gate, up = (x[rows] @ w1[expert].float().T).chunk(2, dim=-1)
-        act = torch.nn.functional.silu(gate) * up
-        if rounded:
-            act = act.to(value.dtype).float()
+        if staged:
+            gate, up = _round(gate, dtype), _round(up, dtype)
+        act = _expert_activation(gate, expert_activation)
+        if staged:
+            act = _round(_round(act, dtype) * up, dtype)
+        else:
+            act = act * up
+            if rounded:
+                act = act.to(dtype).float()
         down = act @ w2[expert].float().T
-        if rounded:
-            down = down.to(value.dtype).float()
-        expected.index_add_(0, rows, down * scale.cpu()[rows, slots, None])
+        if staged or rounded:
+            down = down.to(dtype).float()
+        route = down * scale.cpu()[rows, slots, None]
+        if staged:
+            route = route.to(dtype).float()
+        expected.index_add_(0, rows, route)
     return expected
 
 
@@ -1591,7 +1897,8 @@ def _run_public_diagnose(options):
         eager = _single_output(runtime.invoke(partial(native_chain, eager_scalar=True), inputs,
                                               artifact_config=config, bindings=bindings)).cpu()
         status = _public_status(runtime)
-    math_value = (saved["inputs"][2].float() * .875 + .03125).half()
+    dtype = saved["inputs"][2].dtype
+    math_value = (saved["inputs"][2].float() * .875 + .03125).to(dtype)
     typed_value = math_value.clone()
     pure_value = saved["inputs"][2].float() * .875 + .03125
     layers = []
@@ -1602,23 +1909,31 @@ def _run_public_diagnose(options):
         math_value, typed_value, pure_value = map(resize, (math_value, typed_value, pure_value))
         ids, scale = saved["inputs"][3 + 4 * n], saved["inputs"][5 + 4 * n]
         actual_input, actual_output = captured[n]
-        local_math = _public_layer_reference(actual_input, w1, w2, ids, scale, rounded=False)
-        local_typed = _public_layer_reference(actual_input, w1, w2, ids, scale, rounded=True)
-        chain_math = _public_layer_reference(math_value, w1, w2, ids, scale, rounded=False).half()
-        chain_typed = _public_layer_reference(typed_value, w1, w2, ids, scale, rounded=True).half()
-        pure_value = _public_layer_reference(pure_value, w1, w2, ids, scale, rounded=False) * .75
+        modes = dict(expert_activation=config.expert_activation,
+                     numerical_mode=config.numerical_mode)
+        local_math = _public_layer_reference(actual_input, w1, w2, ids, scale, rounded=False, **modes)
+        local_typed = _public_layer_reference(actual_input, w1, w2, ids, scale, rounded=True, **modes)
+        chain_math = _public_layer_reference(math_value, w1, w2, ids, scale, rounded=False, **modes).to(dtype)
+        chain_typed = _public_layer_reference(typed_value, w1, w2, ids, scale, rounded=True, **modes).to(dtype)
+        # The pure-FP32 diagonal ignores every storage/rounding boundary but
+        # still uses the artifact's explicit activation selection.
+        pure_value = _public_layer_reference(
+            pure_value, w1, w2, ids, scale, rounded=False,
+            expert_activation=config.expert_activation, numerical_mode="fused") * .75
         legacy = ops.fuse_moe(actual_input.to(device), w1.to(device), w2.to(device),
-                              ids.to(device), scale.to(device)).cpu()
+                              ids.to(device), scale.to(device),
+                              expert_activation=config.expert_activation,
+                              numerical_mode=config.numerical_mode).cpu()
         with PrefillMoERuntime(store, device=device, gpu_budget_bytes=config.gpu_budget_bytes,
                               ram_budget_bytes=config.ram_budget_bytes,
                               pinned_budget_bytes=config.pinned_budget_bytes,
                               activation_mode="route_buffer", max_route_tile_rows=config.max_route_tile_rows,
-                              tile_m=config.tile_m, tile_n=config.tile_n) as route:
+                              tile_m=config.tile_m, tile_n=config.tile_n, **modes) as route:
             route_output = route.forward(actual_input.to(device), ids.to(device), scale.to(device),
                                          layer_id=layer).cpu()
         layers.append(dict(layer=layer, input_shape=list(actual_input.shape),
                            native_vs_local_fp32=_public_diagnostic_metric(actual_output, local_math),
-                           native_vs_local_rounded=_public_diagnostic_metric(actual_output, local_typed.half()),
+                           native_vs_local_rounded=_public_diagnostic_metric(actual_output, local_typed.to(dtype)),
                            native_vs_chain_fp32=_public_diagnostic_metric(actual_output, chain_math),
                            native_vs_chain_rounded=_public_diagnostic_metric(actual_output, chain_typed),
                            native_vs_legacy=_public_diagnostic_metric(actual_output, legacy),
@@ -1628,11 +1943,11 @@ def _run_public_diagnose(options):
                                     chain_rounded=chain_typed, legacy=legacy, route_buffer=route_output)
         math_value, typed_value = chain_math.float() * .75, chain_typed.float() * .75
         if n + 1 < len(store.layers):
-            math_value, typed_value = math_value.half(), typed_value.half()
+            math_value, typed_value = math_value.to(dtype), typed_value.to(dtype)
     business = saved["inputs"][0].float() * .125
-    mathematical, rounded = (math_value + business).half(), (typed_value + business).half()
-    contribution = mathematical.float() - business.half().float()
-    rounded_contribution = rounded.float() - business.half().float()
+    mathematical, rounded = (math_value + business).to(dtype), (typed_value + business).to(dtype)
+    contribution = mathematical.float() - business.to(dtype).float()
+    rounded_contribution = rounded.float() - business.to(dtype).float()
     report = dict(diagnostic_only=True, library=str(library), library_sha256=_sha256(library),
                   package_sha256=_sha256(options.public_package), archive_sha256=_sha256(options.public_archive),
                   saved_sha256=_sha256(options.public_diagnose), config=asdict(config), layers=layers,
@@ -1676,8 +1991,8 @@ def _public_status(runtime):
 def _public_check(loaded, inputs, runtime, config, bindings, directory, label):
     before = _public_status(runtime)
     ptr, version, token = runtime.token.data_ptr(), runtime.token._version, runtime.token.clone()
-    expected = _public_reference(inputs, runtime.store)
-    mathematical = _public_reference(inputs, runtime.store, rounded=False)
+    expected = _public_reference(inputs, runtime.store, config=config)
+    mathematical = _public_reference(inputs, runtime.store, rounded=False, config=config)
     output = _single_output(runtime.invoke(loaded, inputs, artifact_config=config, bindings=bindings))
     torch.cuda.synchronize(runtime.device)
     count = len(config.layer_specs)
@@ -2198,6 +2513,13 @@ def _check_public_acceptance(directory, executable, library, device, sizes, *,
                 _run_process(command, fault_dir, "python_fault")
 
 
+def _precision_dtype(precision):
+    try:
+        return {"fp16": torch.float16, "bf16": torch.bfloat16}[precision]
+    except KeyError as error:
+        raise ValueError(f"precision must be fp16 or bf16, got {precision!r}") from error
+
+
 def _parse_route_tile_rows(value):
     if value == "auto":
         return value
@@ -2215,7 +2537,8 @@ def _parse_route_tile_rows(value):
 @torch.no_grad()
 def run_cpp_benchmark(*, ops_library=None, iterations=20, sizes=(64, 8192, 16384), wait_seconds=0,
                       async_staging=False, host_profile=False, allow_testing=False,
-                      output_dir=None):
+                      output_dir=None, expert_activation="silu", numerical_mode="fused",
+                      precision="fp16"):
     """Export one external-weight H128/I64 graph, then time Python-free AOTI only."""
     if iterations < 1 or any(s < 7 or s > 16384 for s in sizes) or not sizes:
         raise ValueError("positive iterations and S in [7,16384] are required")
@@ -2230,12 +2553,17 @@ def run_cpp_benchmark(*, ops_library=None, iterations=20, sizes=(64, 8192, 16384
                 PrefillMoERuntime, async_staging=async_staging, host_profile=host_profile)):
         directory = Path(temporary)
         executable = _compile_runner(directory)
-        package, archive = _check_wide_acceptance(directory, device, bf16=False, benchmark_only=True)
+        package, archive = _check_wide_acceptance(
+            directory, device, bf16=False, benchmark_only=True,
+            expert_activation=expert_activation, numerical_mode=numerical_mode,
+            precision=precision)
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
         environment.pop("PYTHONHOME", None)
         command = [str(executable), package, str(library), str(device.index), archive,
                    "--benchmark-wide", str(iterations), *(str(s) for s in sizes)]
+        command += ["--precision", precision, "--expert-activation", expert_activation,
+                    "--numerical-mode", numerical_mode]
         command += _runtime_cli_flags(async_staging, host_profile)
         print("Standalone benchmark: " + shlex.join(command), flush=True)
         try:
@@ -2331,7 +2659,8 @@ def _benchmark_summary(samples):
 def run_benchmark(*, ops_library=None, iterations=20, wait_seconds=0,
                   benchmark_profile="all", benchmark_scenario="all", max_route_tile_rows=512,
                   nvtx=False, host_profile=False, async_staging=False,
-                  allow_testing=False, output_dir=None):
+                  allow_testing=False, output_dir=None,
+                  expert_activation="silu", numerical_mode="fused", precision="fp16"):
     """Synthetic eager-native host timings, including promotion drain, not a speedup claim.
 
     Profile/scenario filters are Python parameters for caller-owned CLI integration.
@@ -2346,6 +2675,9 @@ def run_benchmark(*, ops_library=None, iterations=20, wait_seconds=0,
     if iterations < 1:
         raise ValueError("iterations must be positive")
     max_route_tile_rows = _parse_route_tile_rows(max_route_tile_rows)
+    if expert_activation not in ("silu", "gelu") or numerical_mode not in ("fused", "staged"):
+        raise ValueError("expert_activation/numerical_mode must be silu|gelu and fused|staged")
+    dtype = _precision_dtype(precision)
     for scenario in scenarios:
         _benchmark_schedule(scenario, iterations)
     if not torch.cuda.is_available():
@@ -2357,7 +2689,9 @@ def run_benchmark(*, ops_library=None, iterations=20, wait_seconds=0,
                     torch=str(torch.__version__), cuda_build=torch.version.cuda,
                     gpu=properties.name, device_index=device.index,
                     compute_capability=list(torch.cuda.get_device_capability(device)),
-                    gpu_total_memory_bytes=properties.total_memory, ops_library=str(library))
+                    gpu_total_memory_bytes=properties.total_memory, ops_library=str(library),
+                    expert_activation=expert_activation, numerical_mode=numerical_mode,
+                    precision=precision, input_dtype=str(dtype))
     def region(label):
         stack = ExitStack()
         if nvtx:
@@ -2377,12 +2711,12 @@ def run_benchmark(*, ops_library=None, iterations=20, wait_seconds=0,
         layers = {}
         for layer in range(2 if "cross_layer" in scenarios else 1):
             layers[layer] = (
-                (torch.randn(experts, 2 * intermediate, h, generator=generator) * .03).half(),
-                (torch.randn(experts, h, intermediate, generator=generator) * .03).half())
+                (torch.randn(experts, 2 * intermediate, h, generator=generator) * .03).to(dtype),
+                (torch.randn(experts, h, intermediate, generator=generator) * .03).to(dtype))
         store = ExpertStore(layers, ram_budget_bytes=ram_budget)
         assert all(not w.is_pinned() and w.device.type == "cpu"
                    for pair in layers.values() for w in pair)
-        x = (torch.randn(s, h, generator=generator) * .25).to(device=device, dtype=torch.float16)
+        x = (torch.randn(s, h, generator=generator) * .25).to(device=device, dtype=dtype)
         scale = torch.full((s, k), 1.0 / k, dtype=torch.float32, device=device)
         slots = torch.arange(k).reshape(1, k)
         rows = torch.arange(s).reshape(s, 1)
@@ -2408,6 +2742,7 @@ def run_benchmark(*, ops_library=None, iterations=20, wait_seconds=0,
         references = {}
         # Separate per-expert FP32 matmul reference; never call the benchmark op.
         # Keep only CPU results, not a full GPU-weight replica during measurements.
+        staged = numerical_mode == "staged"
         previous_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
         try:
             torch.backends.cuda.matmul.allow_tf32 = False
@@ -2417,11 +2752,21 @@ def run_benchmark(*, ops_library=None, iterations=20, wait_seconds=0,
                     token_rows, token_slots = torch.where(routes[route] == expert)
                     gate, up = (x[token_rows].float() @ layers[layer][0][expert].to(
                         device=device, dtype=torch.float32).T).chunk(2, dim=-1)
-                    values = (torch.nn.functional.silu(gate) * up) @ layers[layer][1][expert].to(
-                        device=device, dtype=torch.float32).T
-                    expected.index_add_(0, token_rows, values * scales[route][token_rows, token_slots, None])
-                references[layer, route] = expected.cpu()
-                del expected, token_rows, token_slots, gate, up, values
+                    if staged:
+                        gate, up = _round(gate, dtype), _round(up, dtype)
+                    act = _expert_activation(gate, expert_activation)
+                    if staged:
+                        product = _round(_round(act, dtype) * up, dtype)
+                    else:
+                        product = _round(act * up, dtype)
+                    values = _round(product @ layers[layer][1][expert].to(
+                        device=device, dtype=torch.float32).T, dtype)
+                    weighted = values * scales[route][token_rows, token_slots, None]
+                    if staged:
+                        weighted = _round(weighted, dtype)
+                    expected.index_add_(0, token_rows, weighted)
+                references[layer, route] = _round(expected.cpu(), dtype)
+                del expected, token_rows, token_slots, gate, up, act, product, values, weighted
         finally:
             torch.backends.cuda.matmul.allow_tf32 = previous_allow_tf32
         torch.cuda.synchronize(device)
@@ -2435,7 +2780,9 @@ def run_benchmark(*, ops_library=None, iterations=20, wait_seconds=0,
                         options = dict(device=device, gpu_budget_bytes=gpu_budget,
                                        ram_budget_bytes=ram_budget, pinned_budget_bytes=pinned_budget,
                                        num_banks=banks, activation_mode=mode,
-                                       max_route_tile_rows=max_route_tile_rows)
+                                       max_route_tile_rows=max_route_tile_rows,
+                                       expert_activation=expert_activation,
+                                       numerical_mode=numerical_mode)
                         if policy == "static_hot":
                             options.update(resident_cache_bytes=cache_cap,
                                            resident_experts={0: tuple(range(8))})
@@ -2608,8 +2955,10 @@ def run_benchmark(*, ops_library=None, iterations=20, wait_seconds=0,
                                       profile=profile, scenario=scenario, mode=mode, cache_policy=policy,
                                       requested_banks=banks, iterations=iterations,
                                       shape=dict(S=s, H=h, I=intermediate, E=experts, K=k),
-                                      fixture="seeded_synthetic_fp16_weights_and_inputs_deterministic_nonrandom_routes",
+                                      fixture="seeded_synthetic_weights_and_inputs_deterministic_nonrandom_routes",
                                       synthetic_weights=True, seed=20261012, layers=len(layers),
+                                      expert_activation=expert_activation, numerical_mode=numerical_mode,
+                                      precision=precision,
                                       gpu_budget_bytes=gpu_budget, ram_budget_bytes=ram_budget,
                                       pinned_budget_bytes=pinned_budget, cache_capacity_experts=8,
                                       resident_cache_cap_bytes=cache_cap if policy == "static_hot" else 0,
@@ -2676,9 +3025,14 @@ def _benchmark_resources():
                 rss_scope="Linux process lifetime high-water, includes compilation/reference; not isolated case RSS")
 
 
-def _locked_benchmark_reference(x, pair, ids, scale):
+def _locked_benchmark_reference(x, pair, ids, scale, *,
+                                expert_activation="silu", numerical_mode="fused"):
     # Independent real FP32 CPU reference for arbitrary E/H/I/K, no benchmark
     # op, model execution, fake output or GPU weight replica used as a reference.
+    dtype = x.dtype
+    staged = numerical_mode == "staged"
+    if numerical_mode not in ("fused", "staged"):
+        raise ValueError(f"unknown numerical_mode {numerical_mode!r}")
     x, ids, scale = x.float().cpu(), ids.cpu(), scale.cpu()
     result = torch.zeros_like(x)
     for expert in range(pair[0].shape[0]):
@@ -2686,9 +3040,19 @@ def _locked_benchmark_reference(x, pair, ids, scale):
         if not rows.numel():
             continue
         gate, up = (x[rows] @ pair[0][expert].float().T).chunk(2, -1)
-        value = (torch.nn.functional.silu(gate) * up) @ pair[1][expert].float().T
-        result.index_add_(0, rows, value * scale[rows, slots, None])
-    return result
+        if staged:
+            gate, up = _round(gate, dtype), _round(up, dtype)
+        act = _expert_activation(gate, expert_activation)
+        if staged:
+            product = _round(_round(act, dtype) * up, dtype)
+        else:
+            product = _round(act * up, dtype)
+        value = _round(product @ pair[1][expert].float().T, dtype)
+        weighted = value * scale[rows, slots, None]
+        if staged:
+            weighted = _round(weighted, dtype)
+        result.index_add_(0, rows, weighted)
+    return _round(result, dtype)
 
 
 @torch.no_grad()
@@ -2696,7 +3060,8 @@ def run_locked_benchmark(*, ops_library=None, iterations=40, wait_seconds=0,
                          benchmark_profile="all", benchmark_scenario="all",
                          max_route_tile_rows=512, nvtx=False, host_profile=False,
                          async_staging=False, allow_testing=False, output_dir=None,
-                         cpp=False, case_filter=None, tile_m=0, tile_n=128):
+                         cpp=False, case_filter=None, tile_m=0, tile_n=128,
+                         expert_activation="silu", numerical_mode="fused", precision="fp16"):
     """Final frozen single-op AOTI wall measurements; legacy benchmark stays separate."""
     from custom_ops.moe_offload import InputBinding
 
@@ -2711,6 +3076,9 @@ def run_locked_benchmark(*, ops_library=None, iterations=40, wait_seconds=0,
     scenarios = ("fixed_hot", "uniform", "skewed_masked", "hotset_transition") if benchmark_scenario == "all" else (benchmark_scenario,)
     schedules = {scenario: _locked_benchmark_schedule(scenario, iterations) for scenario in scenarios}
     max_route_tile_rows = _parse_route_tile_rows(max_route_tile_rows)
+    if expert_activation not in ("silu", "gelu") or numerical_mode not in ("fused", "staged"):
+        raise ValueError("expert_activation/numerical_mode must be silu|gelu and fused|staged")
+    dtype = _precision_dtype(precision)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for frozen AOTI benchmarking")
     library = _load_ops(ops_library, wait_seconds, allow_testing=allow_testing)
@@ -2742,11 +3110,11 @@ def run_locked_benchmark(*, ops_library=None, iterations=40, wait_seconds=0,
         ram_budget = 128 * 1024**2
         pinned_budget = 4 * (experts + 1) + 2 * (2 * expert_bytes + 40)
         generator = torch.Generator().manual_seed(seed)
-        store = ExpertStore({0: ((torch.randn(experts, 2 * intermediate, h, generator=generator) * .03).half(),
-                                 (torch.randn(experts, h, intermediate, generator=generator) * .03).half())},
+        store = ExpertStore({0: ((torch.randn(experts, 2 * intermediate, h, generator=generator) * .03).to(dtype),
+                                 (torch.randn(experts, h, intermediate, generator=generator) * .03).to(dtype))},
                             ram_budget_bytes=ram_budget)
         # Shared exact deterministic fixture also generated directly by C++.
-        x = (torch.arange(s * h, dtype=torch.float32).cos() * .25).reshape(s, h).to(device, torch.float16)
+        x = (torch.arange(s * h, dtype=torch.float32).cos() * .25).reshape(s, h).to(device, dtype)
         rows, slots = torch.arange(s).reshape(s, 1), torch.arange(k).reshape(1, k)
         host_ids = dict(hot_a=((rows + slots) % 8).int(), hot_b=(((rows + slots) % 8) + 8).int(),
                         uniform=((rows * k + slots) % experts).int())
@@ -2758,7 +3126,10 @@ def run_locked_benchmark(*, ops_library=None, iterations=40, wait_seconds=0,
         scales = {name: torch.full((s, k), 1 / k, device=device) for name in routes}
         scales["skewed_masked"] = torch.where(((rows + slots) % 3 == 0).to(device),
                                                -scales["skewed_masked"] * .5, scales["skewed_masked"] * 1.25)
-        references = {name: _locked_benchmark_reference(x, store.layers[0], routes[name], scales[name]) for name in routes}
+        references = {name: _locked_benchmark_reference(
+            x, store.layers[0], routes[name], scales[name],
+            expert_activation=expert_activation, numerical_mode=numerical_mode)
+                      for name in routes}
         reference_path = directory / f"locked_{profile}_references.pt"
         torch.save(dict(x=x.cpu(), ids=host_ids, scales={name: value.cpu() for name, value in scales.items()},
                         expected=references), reference_path)
@@ -2773,7 +3144,8 @@ def run_locked_benchmark(*, ops_library=None, iterations=40, wait_seconds=0,
                     options = dict(gpu_budget_bytes=gpu_budget, ram_budget_bytes=ram_budget,
                                    pinned_budget_bytes=pinned_budget, target_sm=10 * major + minor,
                                    num_banks=banks, activation_mode=mode, max_route_tile_rows=max_route_tile_rows,
-                                   async_staging=async_staging, host_profile=host_profile, tile_m=tile_m, tile_n=tile_n)
+                                   async_staging=async_staging, host_profile=host_profile, tile_m=tile_m, tile_n=tile_n,
+                                   expert_activation=expert_activation, numerical_mode=numerical_mode)
                     if policy == "static_hot":
                         options.update(resident_cache_bytes=cache_cap, resident_experts={0: tuple(range(8))})
                     elif policy in ("reuse", "lru"):
@@ -2879,6 +3251,8 @@ def run_locked_benchmark(*, ops_library=None, iterations=40, wait_seconds=0,
                                       frozen_config=dict(fields=asdict(config), manifest=config.manifest(), layer_config=config.layer_config(0)),
                                       metadata=metadata, artifact=artifact, shape=dict(S=s, H=h, I=intermediate, E=experts, K=k),
                                       seed=seed, route_source="deterministic_arange_hotsets_masked_phase_scan", synthetic_weights=True,
+                                      expert_activation=expert_activation, numerical_mode=numerical_mode,
+                                      precision=precision, input_dtype=str(dtype),
                                       host_profile=host_profile, nvtx=nvtx, timing_kind="diagnostic_trace" if host_profile or nvtx else "normal_wall",
                                       timer="perf_counter_invoke_preflight_begin_loader_check_device_sync", iterations=iterations,
                                       compilation_ms=compilation_ms, model_load_ms=model_load_ms,
@@ -2938,6 +3312,199 @@ def run_locked_benchmark(*, ops_library=None, iterations=40, wait_seconds=0,
                 benchmark_wall_ms=(time.perf_counter() - benchmark_started) * 1000,
                 resources_before=benchmark_resources_before, resources_after=_benchmark_resources(),
                 wall_scope="entire locked benchmark including strict load/reference/export/compile/Python/C++/evidence"))
+
+
+def test_geglu_metrics_cpu_contract():
+    actual = torch.tensor([0., 1., 2.])
+    expected = torch.tensor([0., 1., 1.])
+    metric = _geglu_metric(actual, expected)
+    assert metric["finite"] and metric["numel"] == 3
+    assert metric["max_abs_error"] == 1 and metric["abs_error"]["p50"] == 0
+    assert 0 < metric["abs_error"]["p99"] <= 1
+    assert metric["rel_error"]["max"] == 1
+    assert not metric["exact_equal"]
+    identical = _geglu_metric(actual, actual)
+    assert identical["exact_equal"] and identical["abs_error"]["max"] == 0
+    for bad in (float("nan"), float("inf")):
+        invalid = _geglu_metric(torch.tensor([bad]), torch.zeros(1))
+        assert not invalid["finite"] and invalid["max_abs_error"] is None
+        assert invalid["abs_error"]["p99"] is None
+        json.dumps(invalid, allow_nan=False)
+    empty = _geglu_metric(torch.empty(0), torch.empty(0))
+    assert empty["numel"] == 0 and empty["max_abs_error"] is None
+    print("PASS GEGLU metric finite/nonfinite and quantile evidence")
+
+
+def test_explicit_expert_modes_v2_config_cpu_contract():
+    # CPU-only contract for v2: old 23 fields, activation@23, numerical@24,
+    # IDs from 25, outer manifest framing unchanged at 1, archive format 2.
+    store = ExpertStore({0: _weights()}, ram_budget_bytes=RAM_BUDGET)
+    common = dict(gpu_budget_bytes=2 * 1024**2, ram_budget_bytes=RAM_BUDGET,
+                  pinned_budget_bytes=PINNED_BUDGET, target_sm=89, tile_m=32, tile_n=64)
+    default = OffloadConfig.from_store(store, **common)
+    legacy = default.layer_config(0)
+    assert default.expert_activation == "silu" and default.numerical_mode == "fused"
+    assert legacy[0] == 1 and len(legacy) == 23 + legacy[21]
+    assert default.manifest()[0] == 1
+    for activation, numerical, codes in (
+        ("gelu", "fused", (1, 0)),
+        ("silu", "staged", (0, 1)),
+        ("gelu", "staged", (1, 1)),
+    ):
+        config = OffloadConfig.from_store(store, **common, expert_activation=activation,
+                                          numerical_mode=numerical)
+        vector = config.layer_config(0)
+        assert vector[0] == 2, vector
+        assert len(vector) == 25 + vector[21], vector
+        assert vector[1:23] == legacy[1:23], "v2 must preserve the complete v1 1:23 prefix"
+        assert (vector[23], vector[24]) == codes, vector
+        assert config.manifest() == (1, 1, 0, len(vector), *vector)
+        assert OffloadConfig.from_layer_configs({0: vector}) == config
+        # Neither mode is inferred from activation_mode.
+        assert OffloadConfig.from_store(
+            store, **common, activation_mode="fp32_accumulate",
+            expert_activation=activation, numerical_mode=numerical).layer_config(0)[23:25] == codes
+    # Canonicality: explicit 0/0 must use v1, and mixed records are rejected.
+    canonical_00 = (2, *legacy[1:23], 0, 0, *legacy[23:])
+    try:
+        OffloadConfig.from_layer_configs({0: canonical_00})
+    except ValueError as error:
+        assert "noncanonical" in str(error)
+    else:
+        raise AssertionError("explicit v2 0/0 was accepted as canonical")
+    gelu = OffloadConfig.from_store(store, **common, expert_activation="gelu").layer_config(0)
+    staged = OffloadConfig.from_store(
+        store, **common, numerical_mode="staged").layer_config(0)
+    try:
+        OffloadConfig.from_layer_configs({0: gelu, 5: staged})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("inconsistent layer mode vectors were accepted")
+    with tempfile.TemporaryDirectory(prefix="explicit_modes_v2_") as temporary:
+        path = Path(temporary) / "weights.pt"
+        config = OffloadConfig.from_store(store, **common, expert_activation="gelu",
+                                          numerical_mode="staged")
+        store.save_cpp(path, weight_version=31, config=config)
+        buffers = dict(torch.jit.load(str(path)).named_buffers())
+        assert buffers["format_version"].tolist() == [2], "Outer archive format must stay 2"
+        assert buffers["offload_config_0"].tolist() == list(config.layer_config(0))
+        assert ExpertStore.load_cpp(path).deployment_config == config
+    print("PASS explicit modes: v2 layout, canonicality, manifest framing=1, archive=2", flush=True)
+
+
+def test_geglu_staged_reference_cpu_contract():
+    # Hand-computed single-element chain distinguishes exact-erf GELU, staged
+    # rounding and the legacy SwiGLU fused default.
+    x = torch.tensor([[.21]], dtype=torch.float16)
+    w1 = torch.tensor([[[.3], [.7]]], dtype=torch.float16)
+    w2 = torch.tensor([[[.9]]], dtype=torch.float16)
+    ids = torch.tensor([[0]], dtype=torch.int32)
+    scale = torch.tensor([[1.0]])
+    args = (x, w1, w2, ids, scale, torch.zeros(2, dtype=torch.int64))
+    gate = x.float() * w1[0, 0].float()
+    up = x.float() * w1[0, 1].float()
+    g = gate.half().float()
+    u = up.half().float()
+    act = 0.5 * g * (1.0 + torch.erf(g * 0.7071067811865476))
+    product = (act.half().float() * u).half().float()
+    down = (product @ w2[0].float().T).half().float()
+    expected = down * scale
+    actual = _reference(args, expert_activation="gelu", numerical_mode="staged")
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    silu = _reference(args, expert_activation="silu", numerical_mode="staged")
+    assert not torch.equal(actual, silu), "exact GELU must differ from the SiLU default"
+    # Default stays the historical SwiGLU fused formula (Act and Down rounded to dtype).
+    legacy = _round(_round(torch.nn.functional.silu(gate) * up, x.dtype) @ w2[0].float().T, x.dtype) * scale
+    torch.testing.assert_close(_reference(args), legacy, atol=0, rtol=0)
+    # _locked_benchmark_reference also rounds Act, Down, and final output across FP16/BF16.
+    for dtype in (torch.float16, torch.bfloat16):
+        bx, bw1, bw2 = x.to(dtype), w1.to(dtype), w2.to(dtype)
+        for act_mode in ("silu", "gelu"):
+            for num_mode in ("fused", "staged"):
+                ref_args = (bx, bw1, bw2, ids, scale, torch.zeros(2, dtype=torch.int64))
+                expected_locked = _round(
+                    _reference(ref_args, expert_activation=act_mode, numerical_mode=num_mode), dtype)
+                actual_locked = _locked_benchmark_reference(
+                    bx, (bw1, bw2), ids, scale,
+                    expert_activation=act_mode, numerical_mode=num_mode)
+                torch.testing.assert_close(actual_locked, expected_locked, atol=0, rtol=0)
+    for bad in ("tanh", "relu"):
+        try:
+            _expert_activation(gate, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unknown activation {bad} accepted")
+    print("PASS GEGLU staged reference chain", flush=True)
+
+
+def test_prefill_create_explicit_mode_arguments_cpu_contract():
+    # Native create keeps the explicit 20-argument ABI, including mode codes.
+    store = ExpertStore({0: _weights()}, ram_budget_bytes=RAM_BUDGET)
+    for activation, numerical, expected in (
+        ("silu", "fused", (0, 0)),
+        ("gelu", "staged", (1, 1)),
+    ):
+        with mock.patch.object(torch.ops.recsys_ops, "fuse_moe_offload_create", create=True,
+                               return_value=torch.tensor([123, 0])) as create, \
+                mock.patch.object(torch.ops.recsys_ops, "fuse_moe_offload_bind", create=True), \
+                mock.patch.object(torch.ops.recsys_ops, "fuse_moe_offload_close", create=True), \
+                mock.patch.object(ops, "ensure_loaded"), \
+                mock.patch.object(ops, "is_available", return_value=True):
+            with PrefillMoERuntime(store, device="cuda:0", expert_activation=activation,
+                                    numerical_mode=numerical):
+                arguments = create.call_args.args
+                assert len(arguments) == 20, arguments
+                assert arguments[17:19] == expected, arguments
+                assert arguments[19] == 0, arguments
+    print("PASS native create 20-argument explicit mode ABI", flush=True)
+
+
+def test_mlp_chain_tolerance_cpu_contract():
+    expected = torch.tensor([0.0, 1.0, -1.0])
+    rms = expected.double().square().mean().sqrt().item()
+    assert _expert_chain_atol(expected, torch.float16, "glu") == 2e-6
+    for dtype in (torch.float16, torch.bfloat16):
+        assert _expert_chain_atol(expected, dtype, "mlp") == 2e-6 + 2 * torch.finfo(dtype).eps * rms
+        torch.testing.assert_close(_expert_chain_atol(expected * 2, dtype, "mlp") - 2e-6,
+                                   2 * (_expert_chain_atol(expected, dtype, "mlp") - 2e-6))
+    try:
+        _expert_chain_atol(torch.tensor([float("nan")]), torch.float16, "mlp")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("nonfinite chain reference accepted")
+    print("PASS dtype/RMS MLP chain budget, unchanged GLU threshold")
+
+
+def test_mlp_v3_reference_archive_create_cpu_contract():
+    from test_fuse_moe import mlp_numerical_semantics_fixture
+    from test_fuse_moe_offload import MLPStoreTests
+    contracts = MLPStoreTests()
+    contracts.test_create_twenty_args_explicit_codes()
+    contracts.test_v3_all_modes_roundtrip_archive_and_runtime_options()
+    contracts.test_type_and_mixed_shapes_reject_before_native_create()
+    contracts.test_v3_invalid_codes_crosslayer_and_manifest_rejection()
+    for dtype in (torch.float16, torch.bfloat16):
+        for activation in ("silu", "gelu"):
+            for numerical in ("fused", "staged"):
+                x,w1,w2,ids,scale,expected,alternatives = mlp_numerical_semantics_fixture(dtype,numerical,activation)
+                actual = _reference((x,w1,w2,ids,scale,None), expert_activation=activation,
+                                    numerical_mode=numerical, expert_type="mlp").to(dtype).float()
+                torch.testing.assert_close(actual,expected,atol=0,rtol=0)
+                assert all(not torch.equal(actual,wrong) for wrong in alternatives.values())
+    from custom_ops.examples.fuse_moe_offload_demo import make_store, rounded_reference
+    from custom_ops.examples.fuse_moe_demo import moe_eager_ref
+    store = make_store(layers=2, dtype=torch.float16, expert_type="mlp")
+    assert all(a.shape[1] == b.shape[2] for a,b in store.layers.values())
+    for fn in (rounded_reference,moe_eager_ref):
+        actual = fn(x,w1,w2,ids,scale,expert_activation="gelu",numerical_mode="staged",expert_type="mlp")
+        torch.testing.assert_close(actual.float(),expected,atol=0,rtol=0)
+    with mock.patch.object(torch.cuda, "get_device_capability", return_value=(8,9)):
+        from custom_ops.examples.fuse_moe_offload_demo import make_config
+        config = make_config(store,torch.device("cuda:0"),expert_type="mlp")
+    assert config.layer_config(0)[0] == 3 and config.expert_type == "mlp"
 
 
 def test_locked_chain_fixture_magnitude_cpu_contract():
@@ -3187,7 +3754,7 @@ def test_strict_precompiled_public_loader_contract():
             "int max_route_tile_rows=4096, int resident_cache_bytes=0, int dynamic_cache_bytes=0, "
             "int cache_policy=0, int cache_decay_interval=32, int cache_min_reuse=2, "
             "int cache_update_bytes=0, bool async_staging=False, bool host_profile=False, "
-            "int tile_m=0, int tile_n=128) -> Tensor")
+            "int tile_m=0, int tile_n=128, int expert_activation=0, int numerical_mode=0, int expert_type=0) -> Tensor")
         fake_native.fuse_moe_offload_resident_bind.default._schema = (
             "fuse_moe_offload_resident_bind(Tensor token, int layer_id, int[] expert_ids) -> ()")
         with mock.patch.object(ops, "load_precompiled", side_effect=lambda *args, **kwargs: events.append("strict")) as strict, \
@@ -3315,7 +3882,8 @@ def test_route_tile_auto_frontend_contract():
             with PrefillMoERuntime(store, device="cuda:0", activation_mode="auto", **tile_options):
                 args = create.call_args.args
                 assert args[4:7] == (2, 2, native_rows), args
-                assert args[7:] == (0, 0, 0, 32, 2, 0, False, False, 0, 128), args
+                # Native create is the explicit 20-argument v2-capable ABI.
+                assert args[7:] == (0, 0, 0, 32, 2, 0, False, False, 0, 128, 0, 0, 0), args
             create.reset_mock()
             try:
                 PrefillMoERuntime(store, device="cuda:0", max_route_tile_rows=0)
@@ -3440,6 +4008,10 @@ def test_fuse_moe_offload_aoti():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cpu-contracts", nargs="+", choices=sorted(
+        name for name, value in globals().items()
+        if callable(value) and name.startswith("test_") and name.endswith("_cpu_contract")),
+        help="Run named host contracts only; no GPU probe, native load, export or compile")
     parser.add_argument("--ops-library", help="Strict precompiled ops.so; matching ops.so.json is required")
     parser.add_argument("--allow-testing", action="store_true",
                         help="Explicitly accept testing build metadata and run optional fault hooks")
@@ -3488,9 +4060,33 @@ if __name__ == "__main__":
     parser.add_argument("--benchmark-route-tile-rows", type=_parse_route_tile_rows, default=512,
                         help="Route tile row cap or auto (native 0); native planning may shrink it "
                              "to fit unchanged budgets (runtime default is 4096)")
+    parser.add_argument("--benchmark-activation", choices=["silu", "gelu"], default="silu",
+                        help="Explicit expert nonlinearity for both benchmark families (default silu)")
+    parser.add_argument("--benchmark-numerical-mode", choices=["fused", "staged"], default="fused",
+                        help="Explicit numerical contract for both benchmark families (default fused)")
+    parser.add_argument("--benchmark-precision", choices=["fp16", "bf16"], default="fp16",
+                        help="Explicit benchmark weight/input storage dtype (default fp16)")
+    parser.add_argument("--mlp-only", action="store_true", help="Independent frozen-v3 MLP eager/export/AOTI/C++ suite")
+    parser.add_argument("--mlp-precision", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument("--geglu-only", action="store_true",
+                        help="Short independent GEGLU/staged eager+AOTI+C++ acceptance; never the full suite")
+    parser.add_argument("--geglu-precision", choices=["fp16", "bf16"], default="fp16",
+                        help="Storage dtype for --geglu-only (default fp16)")
     parser.add_argument("--wait-seconds", type=float, default=0,
                         help="Wait for an externally built .so to appear; never start a JIT build")
     options = parser.parse_args()
+    if options.cpu_contracts:
+        if any((options.ops_library, options.allow_testing, options.output_dir,
+                options.compile_native_runner_only, options.public_only, options.deployment_only,
+                options.public_package, options.public_archive, options.public_diagnose,
+                options.public_fault, options.benchmark, options.benchmark_cpp,
+                options.benchmark_locked, options.benchmark_locked_cpp, options.geglu_only, options.mlp_only,
+                options.async_staging, options.host_profile, options.nvtx)):
+            parser.error("cpu-contracts cannot be combined with native/GPU/artifact execution modes")
+        for name in options.cpu_contracts:
+            globals()[name]()
+            print("PASS " + name)
+        raise SystemExit(0)
     if options.compile_native_runner_only:
         if not options.output_dir:
             parser.error("--compile-native-runner-only requires --output-dir")
@@ -3498,10 +4094,21 @@ if __name__ == "__main__":
                 options.deployment_only, options.public_package, options.public_archive,
                 options.public_diagnose, options.public_fault, options.benchmark,
                 options.benchmark_cpp, options.benchmark_locked, options.benchmark_locked_cpp,
-                options.benchmark_case, options.async_staging, options.host_profile, options.nvtx)):
+                options.benchmark_case, options.async_staging, options.host_profile, options.nvtx,
+                options.geglu_only, options.mlp_only)):
             parser.error("compile-native-runner-only cannot be combined with ops/public/deployment/benchmark execution modes")
         _run_compile_native_runner_only(options.output_dir)
         raise SystemExit(0)  # Deliberately bypass GPU-probing _cli_evidence.
+    if options.geglu_only or options.mlp_only:
+        if not options.ops_library:
+            parser.error("--geglu-only requires strict precompiled --ops-library")
+        if any((options.benchmark, options.benchmark_cpp, options.benchmark_locked,
+                options.benchmark_locked_cpp, options.public_only, options.deployment_only,
+                options.public_package, options.public_archive, options.public_diagnose,
+                options.public_fault, options.compile_native_runner_only)):
+            parser.error("geglu-only cannot be combined with public/benchmark/compile-only modes")
+    if options.geglu_only and options.mlp_only:
+        parser.error("choose --geglu-only or --mlp-only")
     if sum((options.benchmark_cpp, options.benchmark, options.benchmark_locked)) > 1:
         parser.error("choose one of --benchmark, --benchmark-cpp or --benchmark-locked")
     if options.benchmark_locked_cpp and not options.benchmark_locked:
@@ -3535,7 +4142,13 @@ if __name__ == "__main__":
                                    options.benchmark_cpp or options.benchmark_locked):
         parser.error("--public-diagnose requires an existing public package/archive/library/output-dir and no other execution mode")
     with _cli_evidence(options.output_dir, options):
-        if options.public_diagnose:
+        if options.geglu_only or options.mlp_only:
+            _run_geglu_only(ops_library=options.ops_library, sizes=tuple(options.sizes),
+                            wait_seconds=options.wait_seconds, allow_testing=options.allow_testing,
+                            output_dir=options.output_dir, precision=options.mlp_precision if options.mlp_only else options.geglu_precision,
+                            async_staging=options.async_staging, host_profile=options.host_profile,
+                            expert_type="mlp" if options.mlp_only else "glu")
+        elif options.public_diagnose:
             _run_public_diagnose(options)
         elif options.deployment_only:
             _run_deployment_child(options)
@@ -3549,12 +4162,18 @@ if __name__ == "__main__":
                                  host_profile=options.host_profile, async_staging=options.async_staging,
                                  allow_testing=options.allow_testing, output_dir=options.output_dir,
                                  cpp=options.benchmark_locked_cpp, case_filter=options.benchmark_case,
-                                 tile_m=options.benchmark_tile_m, tile_n=options.benchmark_tile_n)
+                                 tile_m=options.benchmark_tile_m, tile_n=options.benchmark_tile_n,
+                                 expert_activation=options.benchmark_activation,
+                                 numerical_mode=options.benchmark_numerical_mode,
+                                 precision=options.benchmark_precision)
         elif options.benchmark_cpp:
             run_cpp_benchmark(ops_library=options.ops_library, iterations=options.iterations,
                               sizes=tuple(options.benchmark_cpp_sizes), wait_seconds=options.wait_seconds,
                               async_staging=options.async_staging, host_profile=options.host_profile,
-                              allow_testing=options.allow_testing, output_dir=options.output_dir)
+                              allow_testing=options.allow_testing, output_dir=options.output_dir,
+                              expert_activation=options.benchmark_activation,
+                              numerical_mode=options.benchmark_numerical_mode,
+                              precision=options.benchmark_precision)
         elif options.benchmark:
             run_benchmark(ops_library=options.ops_library, iterations=options.iterations,
                           wait_seconds=options.wait_seconds, benchmark_profile=options.benchmark_profile,
@@ -3562,7 +4181,10 @@ if __name__ == "__main__":
                           max_route_tile_rows=options.benchmark_route_tile_rows,
                           nvtx=options.nvtx, host_profile=options.host_profile,
                           async_staging=options.async_staging, allow_testing=options.allow_testing,
-                          output_dir=options.output_dir)
+                          output_dir=options.output_dir,
+                          expert_activation=options.benchmark_activation,
+                          numerical_mode=options.benchmark_numerical_mode,
+                          precision=options.benchmark_precision)
         else:
             run_acceptance(ops_library=options.ops_library, sizes=tuple(options.sizes),
                            wait_seconds=options.wait_seconds, wide_bf16=options.wide_bf16,

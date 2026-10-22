@@ -1024,6 +1024,46 @@ assert 'torch.utils.cpp_extension' not in sys.modules
         self.assertTrue(facade.allow_jit)
         self.assertEqual(facade._groups, {})
 
+    def test_fuse_moe_schema_declares_geglu_trailing_codes(self):
+        create_schema = FuseMoeOps.op_schemas["fuse_moe_offload_create"]
+        parsed = torch._C.parse_schema("recsys_ops::" + create_schema)
+        self.assertEqual(len(parsed.arguments), 20)
+        self.assertEqual([argument.name for argument in parsed.arguments[-3:]],
+                         ["expert_activation", "numerical_mode", "expert_type"])
+        self.assertEqual([argument.default_value for argument in parsed.arguments[-3:]],
+                         [0, 0, 0])
+        self.assertTrue(all(str(argument.type) == "int"
+                            for argument in parsed.arguments[-3:]))
+        moe = torch._C.parse_schema("recsys_ops::" + FuseMoeOps.op_schemas["fuse_moe"])
+        self.assertEqual(len(moe.arguments), 8)
+        self.assertEqual([argument.name for argument in moe.arguments[-3:]],
+                         ["expert_activation", "numerical_mode", "expert_type"])
+        self.assertEqual([argument.default_value for argument in moe.arguments[-3:]],
+                         [0, 0, 0])
+
+    def test_cached_legacy_fuse_moe_schema_is_rejected_before_dlopen(self):
+        cls = self.ops_class(fake=False)
+        name = "fuse_moe_offload_create"
+        cls.required_ops = [name]
+        cls.op_schemas = {name: FuseMoeOps.op_schemas[name]}
+        library, metadata = self.artifact(cls)
+        instance = cls()
+        instance._validate_metadata(library, Path(str(library) + ".json"))
+        legacy = cls.op_schemas[name].replace(
+            ", int expert_activation=0, int numerical_mode=0, int expert_type=0", "")
+        self.assertNotEqual(legacy, cls.op_schemas[name])
+        self.assertEqual(len(torch._C.parse_schema("recsys_ops::" + legacy).arguments), 17)
+        # Simulate a cached artifact built before the two trailing mode args.
+        legacy_metadata = copy.deepcopy(metadata)
+        legacy_metadata["schemas"][name] = legacy
+        self.save_metadata(library, legacy_metadata)
+        self.assert_pre_dlopen_rejected(cls, library, "schema contract")
+        # The schema fingerprint alone is sufficient to reject a stale cache.
+        stale = copy.deepcopy(metadata)
+        stale["schema_fingerprint"] = "0" * 64
+        self.save_metadata(library, stale)
+        self.assert_pre_dlopen_rejected(cls, library, "schema fingerprint")
+
     def test_required_offload_ops_and_schema_contracts_are_complete(self):
         new_ops = {
             "fuse_moe_offload_resident_bind", "fuse_moe_offload_validate",

@@ -110,7 +110,10 @@ def run_calls(runtime, store, artifact_config, loader, device, sizes):
             inputs = graph_inputs(tokens, store, device)
             expected = inputs[0]
             for w1, w2 in store.layers.values():
-                expected = rounded_reference(expected, w1, w2, inputs[-3], inputs[-2])
+                expected = rounded_reference(
+                    expected, w1, w2, inputs[-3], inputs[-2],
+                    expert_activation=artifact_config.expert_activation,
+                    numerical_mode=artifact_config.numerical_mode, expert_type=artifact_config.expert_type)
             outputs = runtime.invoke(call_package, inputs,
                                      artifact_config=artifact_config, bindings=bindings)
             if len(outputs) != 1:
@@ -118,7 +121,9 @@ def run_calls(runtime, store, artifact_config, loader, device, sizes):
             torch.cuda.synchronize(device)
             if outputs[0].device != device:
                 raise AssertionError("output device mismatch")
-            print(f"AOTi layers={len(store.layers)}, S={tokens}")
+            print(f"AOTi layers={len(store.layers)}, S={tokens}, "
+                  f"expert_type={artifact_config.expert_type}, expert_activation={artifact_config.expert_activation}, "
+                  f"numerical_mode={artifact_config.numerical_mode}")
             check_output(outputs[0], expected)
             print_stats(runtime)
             print("status:", runtime.status())
@@ -129,8 +134,9 @@ def export_package(args, device):
     setup_compiler()  # Offline only: never probe or configure compilers in run.
     load_native(args.ops_library)
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
-    store = make_store(layers=args.layers, dtype=dtype, layout=args.layout)
-    config = make_config(store, device, cache=args.cache, async_staging=args.async_staging)
+    store = make_store(layers=args.layers, dtype=dtype, layout=args.layout, expert_type=args.expert_type)
+    config = make_config(store, device, cache=args.cache, async_staging=args.async_staging,
+                         expert_activation=args.expert_activation, numerical_mode=args.numerical_mode, expert_type=args.expert_type)
     directory = args.output_dir.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     archive_path, package_path = directory / "weights.pt", directory / "model.pt2"
@@ -200,6 +206,9 @@ def main():
     export.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     export.add_argument("--layout", choices=("fused", "separate"), default="fused")
     export.add_argument("--cache", choices=("none", "static", "reuse", "lru"), default="reuse")
+    export.add_argument("--expert-type", choices=("glu", "mlp"), default="glu")
+    export.add_argument("--expert-activation", choices=("silu", "gelu"), default="silu")
+    export.add_argument("--numerical-mode", choices=("fused", "staged"), default="fused")
     export.add_argument("--async-staging", action="store_true", help="opt-in frozen config; default sync")
     run = commands.add_parser("run", help="only load and execute; no compiler needed")
     run.add_argument("--package", type=Path, required=True)

@@ -120,6 +120,44 @@ std::unique_ptr<T> load_package(const std::string& path, c10::DeviceIndex device
   }
 }
 
+// CPU FP32 reference using the frozen artifact's modes, not runtime CLI flags.
+// Fused retains Act/Down dtype boundaries; staged rounds each intermediate
+// and the scaled product before adding routes in FP32. GELU is exact erf form.
+at::Tensor rounded_reference(const at::Tensor& x, const at::Tensor& w1,
+                             const at::Tensor& w2, const at::Tensor& ids,
+                             const at::Tensor& scale, int64_t expert_activation,
+                             int64_t numerical_mode, int64_t expert_type = 0) {
+  require(expert_type == 0 || expert_type == 1, "Invalid expert_type");
+  require(expert_activation == 0 || expert_activation == 1, "Invalid expert_activation");
+  require(numerical_mode == 0 || numerical_mode == 1, "Invalid numerical_mode");
+  require(w1.size(1) == (expert_type == 0 ? 2 : 1) * w2.size(2), "expert_type weight mismatch");
+  const auto dtype = x.scalar_type();
+  const auto value = x.to(at::kCPU).to(at::kFloat);
+  const auto host_ids = ids.to(at::kCPU);
+  const auto host_scale = scale.to(at::kCPU).to(at::kFloat);
+  auto result = at::zeros_like(value);
+  const bool staged = numerical_mode == 1;
+  auto rounded = [dtype](const at::Tensor& t) { return t.to(dtype).to(at::kFloat); };
+  for (int64_t expert = 0; expert < w1.size(0); ++expert) {
+    const auto routes = at::nonzero(host_ids == expert);
+    if (routes.size(0) == 0) continue;
+    const auto rows = routes.select(1, 0), slots = routes.select(1, 1);
+    auto gate_up = at::matmul(value.index_select(0, rows), w1[expert].to(at::kFloat).t());
+    if (staged) gate_up = rounded(gate_up);
+    const auto project = expert_type == 0 ? gate_up.chunk(2, 1)[0] : gate_up;
+    auto act = expert_activation == 1 ? at::gelu(project, "none") : at::silu(project);
+    if (staged && expert_type == 0) act = rounded(act);
+    const auto product = rounded(expert_type == 0 ? act * gate_up.chunk(2, 1)[1] : act);
+    const auto down = rounded(at::matmul(product, w2[expert].to(at::kFloat).t()));
+    const auto route_scale = host_scale.reshape({-1}).index_select(
+        0, rows * host_scale.size(1) + slots).unsqueeze(1);
+    auto weighted = down * route_scale;
+    if (staged) weighted = rounded(weighted);
+    result.index_add_(0, rows, weighted);
+  }
+  return result.to(dtype);
+}
+
 void synchronize() {
   const auto result = cudaDeviceSynchronize();
   require(result == cudaSuccess, std::string("CUDA synchronization failed: ") +
@@ -162,7 +200,8 @@ int run(int argc, char** argv) {
   for (const auto& layer : archive.weights) {
     const auto& w1 = layer.second.first;
     const auto& w2 = layer.second.second;
-    require(w1.size(0) == 8 && w1.size(2) == 128 &&
+    require(w1.size(1) == (runtime.expert_type() == 0 ? 2 : 1) * w2.size(2) &&
+                w1.size(0) == 8 && w1.size(2) == 128 &&
                 w2.size(2) == (layer.first == 0 ? 128 : 192) &&
                 w1.scalar_type() == dtype,
             "Companion graph requires E8/H128/I128(layer0),I192(layer5), shared dtype");
@@ -200,13 +239,25 @@ int run(int argc, char** argv) {
           "Output shape/device/dtype mismatch");
   const auto host = y.to(at::kCPU).to(at::kFloat);
   require(at::isfinite(host).all().item<bool>(), "Output contains non-finite values");
+  auto expected = x;
+  for (const auto& layer : archive.weights)
+    expected = rounded_reference(expected, layer.second.first, layer.second.second,
+                                 ids, scale, runtime.expert_activation(), runtime.numerical_mode(), runtime.expert_type());
+  const auto reference = expected.to(at::kFloat);
+  const auto relative_l2 = ((host - reference).norm() /
+                            reference.norm().clamp_min(1e-12)).item<double>();
+  require(relative_l2 <= 0.05, "Numerical mismatch: relative L2=" + std::to_string(relative_l2));
   runtime.close();  // Explicit close exposes failures; destructor is the fallback.
   std::cout << "OK layers=" << archive.weights.size() << " device=" << device
             << " tokens=" << tokens << " output=[" << tokens << ",128] dtype="
             << c10::toString(dtype) << " weight_version=" << archive.weight_version
+            << " expert_type=" << (runtime.expert_type() == 0 ? "glu" : "mlp")
+            << " expert_activation=" << (runtime.expert_activation() == 0 ? "silu" : "gelu")
+            << " numerical_mode=" << (runtime.numerical_mode() == 0 ? "fused" : "staged")
+            << " relative_l2=" << relative_l2
             << " mean=" << host.mean().item<float>()
             << " max_abs=" << host.abs().max().item<float>() << '\n';
-  return 0;  // Functional smoke only, not a numerical-reference or performance test.
+  return 0;  // Numerical example, not a performance benchmark.
 }
 }  // namespace
 

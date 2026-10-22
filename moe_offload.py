@@ -9,25 +9,41 @@ from contextlib import contextmanager
 import threading
 import torch
 
+from custom_ops.recsys import EXPERT_ACTIVATION_TO_ID as _EXPERT_ACTIVATIONS
+from custom_ops.recsys import NUMERICAL_MODE_TO_ID as _NUMERICAL_MODES
+from custom_ops.recsys import EXPERT_TYPE_TO_ID as _EXPERT_TYPES
+from custom_ops.recsys import _resolve_fuse_moe_expert_type, _check_fuse_moe_shapes
+
+# Reverse maps are stable because the forward maps are literal, insertion-ordered.
+_EXPERT_ACTIVATION_NAMES = {code: name for name, code in _EXPERT_ACTIVATIONS.items()}
+_NUMERICAL_MODE_NAMES = {code: name for name, code in _NUMERICAL_MODES.items()}
+
 
 def _fake_offload(x, w1, w2, ids, scale, token, layer_id, deployment_config=(), deployment_manifest=()):
-    torch._check(x.dim() == 2 and w1.dim() == 3 and w2.dim() == 3)
-    torch._check(x.device.type == "cuda" and w1.device.type == "cpu" and w2.device.type == "cpu")
-    torch._check(x.dtype in (torch.float16, torch.bfloat16) and w1.dtype == x.dtype and w2.dtype == x.dtype)
-    torch._check(x.shape[1] == w1.shape[2])
-    torch._check(w1.shape[0] == w2.shape[0])
-    torch._check(w1.shape[1] == 2 * w2.shape[2] and w2.shape[1] == x.shape[1])
-    torch._check(ids.dim() == 2 and scale.shape == ids.shape and ids.shape[0] == x.shape[0])
-    torch._check(ids.dtype == torch.int32 and scale.dtype == torch.float32)
-    torch._check(ids.device == x.device and scale.device == x.device)
-    torch._check(token.device.type == "cpu" and token.dtype == torch.int64 and token.shape == (2,))
-    torch._check(w1.shape[0] > 0 and w1.shape[0] <= 512)
-    torch._check(x.shape[1] > 0 and x.shape[1] % 64 == 0)
-    torch._check(w2.shape[2] > 0 and w2.shape[2] % 64 == 0)
-    torch._check(ids.shape[1] > 0 and ids.shape[1] <= 128)
+    # Without an artifact contract the opaque token does not expose its type.
+    # Accept either canonical shape symbolically; native checks the bound context.
+    _check_fuse_moe_shapes(x, w1, w2, ids, scale, allow_empty_s=True)
+    torch._check(x.device.type == "cuda")
+    torch._check(w1.device.type == "cpu")
+    torch._check(w2.device.type == "cpu")
+    torch._check(token.device.type == "cpu")
+    torch._check(token.dtype == torch.int64)
+    torch._check(token.dim() == 1)
+    torch._check(token.shape[0] == 2)
     if deployment_config:
-        torch._check(len(deployment_config) >= 23 and deployment_config[0] == 1)
-        torch._check(len(deployment_config) == 23 + deployment_config[21])
+        # v1/v2 imply GLU; v3 adds explicit MLP at 25, IDs begin at 26.
+        torch._check(len(deployment_config) >= 23)
+        version = deployment_config[0]
+        torch._check(version in (1, 2, 3))
+        header = {1: 23, 2: 25, 3: 26}[version]
+        torch._check(len(deployment_config) >= header)
+        torch._check(len(deployment_config) == header + deployment_config[21])
+        if version >= 2:
+            torch._check(deployment_config[23] in (0, 1))
+            torch._check(deployment_config[24] in (0, 1))
+        if version == 3:
+            torch._check(deployment_config[25] == 1)
+        torch._check(w1.shape[1] == (1 if version == 3 else 2) * w2.shape[2])
         torch._check(w1.shape[0] == deployment_config[17])
         torch._check(x.shape[1] == deployment_config[18])
         torch._check(w2.shape[2] == deployment_config[19])
@@ -120,7 +136,11 @@ class _ExpertArchive(torch.nn.Module):
 
 
 class ExpertStore:
-    """Canonical CPU weights. Training updates require a new store/context."""
+    """Canonical CPU w1/w2: GLU (E,2I,H)/(E,H,I), MLP (E,I,H)/(E,H,I).
+
+    Storage accepts either layout without inferring activation or runtime type.
+    An explicit context/config must match every layer; updates require a new store.
+    """
 
     def __init__(self, layers, *, ram_budget_bytes=0):
         if not isinstance(layers, Mapping):
@@ -145,7 +165,7 @@ class ExpertStore:
                     w1.is_inference() or w2.is_inference()):
                 raise ValueError("canonical weights must be contiguous pageable CPU fp16/bf16 tensors with version counters")
             e, n, h = w1.shape
-            if (e <= 0 or e > 512 or w2.shape[:2] != (e, h) or n != 2 * w2.shape[2] or
+            if (e <= 0 or e > 512 or w2.shape[:2] != (e, h) or n not in (w2.shape[2], 2 * w2.shape[2]) or
                     h <= 0 or h > _INT_MAX or w2.shape[2] <= 0 or
                     w2.shape[2] > _INT_MAX // 2 or h % 64 or w2.shape[2] % 64):
                 raise ValueError("invalid canonical E/H/I or unsupported kernel alignment")
@@ -158,7 +178,10 @@ class ExpertStore:
 
     @classmethod
     @torch.inference_mode(False)
-    def from_state_dict(cls, state_dict, layer_keys, *, dtype=None, ram_budget_bytes=0):
+    def from_state_dict(cls, state_dict, layer_keys, *, dtype=None, ram_budget_bytes=0,
+                        expert_type="glu"):
+        """Pack split gate/up only for explicit GLU; MLP uses canonical gate_up key."""
+        _resolve_fuse_moe_expert_type(expert_type)
         if not isinstance(state_dict, Mapping):
             raise TypeError("state_dict must be a mapping")
         if dtype is not None and dtype not in (torch.float16, torch.bfloat16):
@@ -166,6 +189,8 @@ class ExpertStore:
         layers = {}
         for layer_id, keys in layer_keys.items():
             fused = keys.gate_up is not None
+            if expert_type == "mlp" and not fused:
+                raise ValueError("MLP requires a canonical single projection in gate_up; split gate/up is GLU-only")
             if (fused and (keys.gate is not None or keys.up is not None)) or (
                     not fused and (keys.gate is None or keys.up is None)):
                 raise ValueError("specify either fused gate_up or separate gate and up")
@@ -191,22 +216,26 @@ class ExpertStore:
                     raise ValueError("gate/up shape and dtype must match")
                 gate_up = torch.cat((gate, up), dim=1)
             layers[layer_id] = (gate_up, down)
-        return cls(layers, ram_budget_bytes=ram_budget_bytes)
+        store = cls(layers, ram_budget_bytes=ram_budget_bytes)
+        _validate_store_expert_type(store, expert_type)
+        return store
 
     @classmethod
     @torch.inference_mode(False)
     def load(cls, path: str | Path, layer_keys, *, dtype=None, ram_budget_bytes=0,
-             state_dict_field=None, mmap=False):
+             state_dict_field=None, mmap=False, expert_type="glu"):
         """Trusted torch.save(state_dict) input, always CPU and weights_only=True.
 
         The RAM budget validates retained storages, not torch.load/packing peak RSS.
         Callers must reserve checkpoint/conversion peak before loading large files.
         mmap is optional serialization mapping, not an SSD execution backend.
         """
+        _resolve_fuse_moe_expert_type(expert_type)
         state = torch.load(path, map_location="cpu", weights_only=True, mmap=mmap)
         if state_dict_field is not None:
             state = state[state_dict_field]
-        return cls.from_state_dict(state, layer_keys, dtype=dtype, ram_budget_bytes=ram_budget_bytes)
+        return cls.from_state_dict(state, layer_keys, dtype=dtype,
+                                   ram_budget_bytes=ram_budget_bytes, expert_type=expert_type)
 
 
     @torch.inference_mode(False)
@@ -288,6 +317,17 @@ _CACHE_POLICIES = {"reuse": 0, "lru": 1}
 _INT_MAX = (1 << 31) - 1
 
 
+def _validate_store_expert_type(store, expert_type):
+    """All layers must match one explicit context architecture before creation."""
+    code = _resolve_fuse_moe_expert_type(expert_type)
+    factor = 2 if code == 0 else 1
+    for layer, (w1, w2) in store.layers.items():
+        if w1.shape[1] != factor * w2.shape[2]:
+            raise ValueError(
+                f"expert_type/store mismatch at layer {layer}: expert_type={expert_type!r} "
+                f"requires w1.shape[1] == {factor} * I; mixed expert types are not supported")
+
+
 @dataclass(frozen=True)
 class OffloadConfig:
     """Versioned offline deployment contract; all budgets are explicit bytes.
@@ -295,6 +335,12 @@ class OffloadConfig:
     layer_specs contains immutable (layer_id, E, H, I, dtype_code, resident_ids)
     tuples. tile_m=0 fixes the deterministic shape-based policy, not an env override.
     CPU archives carry the same contract used as constant arguments in the AOTI graph.
+
+    expert_activation ('silu'|'gelu') and numerical_mode ('fused'|'staged') are
+    independent of activation_mode, which only selects route buffering/accumulation.
+    expert_type ('glu'|'mlp') independently selects paired or single projection.
+    The three explicit strings default to silu/fused/glu; none is inferred from
+    activation_mode or checkpoint shapes.
     """
     gpu_budget_bytes: int
     ram_budget_bytes: int
@@ -314,6 +360,9 @@ class OffloadConfig:
     host_profile: bool = False
     tile_m: int = 0
     tile_n: int = 128
+    expert_activation: str = "silu"
+    numerical_mode: str = "fused"
+    expert_type: str = "glu"
 
     def __post_init__(self):
         def integer(name, value, minimum=0, maximum=(1 << 63) - 1):
@@ -329,6 +378,13 @@ class OffloadConfig:
             integer(name, getattr(self, name), 2, _INT_MAX)
         if not isinstance(self.activation_mode, str) or self.activation_mode not in _ACTIVATION_MODES:
             raise ValueError("invalid activation_mode")
+        if (not isinstance(self.expert_activation, str)
+                or self.expert_activation not in _EXPERT_ACTIVATIONS):
+            raise ValueError("invalid expert_activation")
+        if (not isinstance(self.numerical_mode, str)
+                or self.numerical_mode not in _NUMERICAL_MODES):
+            raise ValueError("invalid numerical_mode")
+        _resolve_fuse_moe_expert_type(self.expert_type)
         if not isinstance(self.cache_policy, str) or self.cache_policy not in _CACHE_POLICIES:
             raise ValueError("invalid cache_policy")
         if not (isinstance(self.max_route_tile_rows, str) and self.max_route_tile_rows == "auto"):
@@ -365,7 +421,8 @@ class OffloadConfig:
                 integer("resident expert", expert, 0, e - 1)
             if len(set(ids)) != len(ids) or (ids and not self.resident_cache_bytes):
                 raise ValueError("invalid resident expert IDs or cache cap")
-            resident_charge += ((6 * h * i + 511) // 512) * 512 * len(ids)
+            expert_bytes = (6 if self.expert_type == "glu" else 4) * h * i
+            resident_charge += ((expert_bytes + 511) // 512) * 512 * len(ids)
             specs.append((layer, e, h, i, dtype, tuple(sorted(ids))))
         if resident_charge > self.resident_cache_bytes:
             raise ValueError("static resident experts exceed resident_cache_bytes")
@@ -398,6 +455,7 @@ class OffloadConfig:
             raise TypeError("store must be an ExpertStore")
         # Public layers and cached accounting may have changed since construction.
         validated = ExpertStore(store.layers)
+        _validate_store_expert_type(validated, self.expert_type)
         actual = tuple(sorted((layer, w1.shape[0], w1.shape[2], w2.shape[2],
                                int(w1.dtype == torch.bfloat16))
                               for layer, (w1, w2) in validated.layers.items()))
@@ -410,21 +468,38 @@ class OffloadConfig:
         names = ("gpu_budget_bytes", "ram_budget_bytes", "pinned_budget_bytes", "num_banks",
                  "activation_mode", "max_route_tile_rows", "resident_cache_bytes",
                  "dynamic_cache_bytes", "cache_policy", "cache_decay_interval", "cache_min_reuse",
-                 "cache_update_bytes", "async_staging", "host_profile", "tile_m", "tile_n")
+                 "cache_update_bytes", "async_staging", "host_profile", "tile_m", "tile_n",
+                 "expert_activation", "numerical_mode", "expert_type")
         return {**{name: getattr(self, name) for name in names},
                 "resident_experts": {spec[0]: spec[5] for spec in self.layer_specs if spec[5]}}
 
     def layer_config(self, layer_id):
+        """Canonical deployment vector for one layer.
+
+        v1 stays byte-identical to the legacy 23-field contract (plus expert IDs)
+        while both new modes are defaults; it implicitly means silu/fused. Any
+        non-default mode emits v2: config[0]=2, the same fields at 0:23, then the
+        activation code at 23 and numerical-mode code at 24, with IDs from 25.
+        MLP always emits v3 (26 fixed fields): expert_type=1 at 25, IDs from 26.
+        """
         for layer, e, h, i, dtype, ids in self.layer_specs:
             if layer == layer_id:
-                return (1, self.gpu_budget_bytes, self.ram_budget_bytes, self.pinned_budget_bytes,
-                        self.num_banks, _ACTIVATION_MODES[self.activation_mode],
-                        0 if self.max_route_tile_rows == "auto" else self.max_route_tile_rows,
-                        self.resident_cache_bytes, self.dynamic_cache_bytes,
-                        _CACHE_POLICIES[self.cache_policy], self.cache_decay_interval,
-                        self.cache_min_reuse, self.cache_update_bytes, int(self.async_staging),
-                        int(self.host_profile), self.tile_m, self.tile_n,
-                        e, h, i, dtype, len(ids), self.target_sm, *ids)
+                common = (
+                    self.gpu_budget_bytes, self.ram_budget_bytes, self.pinned_budget_bytes,
+                    self.num_banks, _ACTIVATION_MODES[self.activation_mode],
+                    0 if self.max_route_tile_rows == "auto" else self.max_route_tile_rows,
+                    self.resident_cache_bytes, self.dynamic_cache_bytes,
+                    _CACHE_POLICIES[self.cache_policy], self.cache_decay_interval,
+                    self.cache_min_reuse, self.cache_update_bytes, int(self.async_staging),
+                    int(self.host_profile), self.tile_m, self.tile_n,
+                    e, h, i, dtype, len(ids), self.target_sm)
+                if self.expert_type == "mlp":
+                    return (3, *common, _EXPERT_ACTIVATIONS[self.expert_activation],
+                            _NUMERICAL_MODES[self.numerical_mode], _EXPERT_TYPES[self.expert_type], *ids)
+                if (self.expert_activation == "silu" and self.numerical_mode == "fused"):
+                    return (1, *common, *ids)
+                return (2, *common, _EXPERT_ACTIVATIONS[self.expert_activation],
+                        _NUMERICAL_MODES[self.numerical_mode], *ids)
         raise ValueError(f"layer {layer_id} is not in the deployment configuration")
 
     def manifest(self):
@@ -437,6 +512,15 @@ class OffloadConfig:
 
     @classmethod
     def from_layer_configs(cls, configs):
+        """Rebuild the contract from canonical v1/v2 GLU or v3 MLP layer vectors.
+
+        v1 always means silu/fused; v2 carries explicit codes at 23/24 and IDs
+        from 25, with the same canonical prefix at 0:23. A v2 vector whose two
+        codes are the defaults (0/0) is *noncanonical*: it is rejected by the
+        final round-trip check below, because canonical output for defaults is
+        v1. v3 requires expert_type=1 at 25 and IDs from 26; v3 GLU is rejected.
+        Mixing versions, mode codes or expert types across layers is inconsistent.
+        """
         if not isinstance(configs, Mapping) or not configs:
             raise ValueError("invalid deployment configuration format: expected nonempty mapping")
         normalized = {}
@@ -448,27 +532,39 @@ class OffloadConfig:
             if (len(config) < 23 or any(type(field) is not int or
                     not -(1 << 63) <= field < (1 << 63) for field in config)):
                 raise ValueError("invalid deployment configuration format: expected int64 fields")
-            if (config[0] != 1 or config[5] not in (0, 1, 2) or config[9] not in (0, 1) or
+            header = {1: 23, 2: 25, 3: 26}.get(config[0])
+            if (header is None or config[5] not in (0, 1, 2) or config[9] not in (0, 1) or
                     config[13] not in (0, 1) or config[14] not in (0, 1) or
                     config[6] < 0 or not 0 <= config[21] <= 512 or
-                    len(config) != 23 + config[21]):
+                    len(config) != header + config[21] or
+                    (config[0] >= 2 and (config[23] not in (0, 1) or config[24] not in (0, 1))) or
+                    (config[0] == 3 and config[25] != 1)):
                 raise ValueError("invalid deployment configuration format")
             normalized[layer] = config
         configs = normalized
         first = next(iter(configs.values()))
+        version = first[0]
+        header = {1: 23, 2: 25, 3: 26}[version]
+        activation = first[23] if version >= 2 else _EXPERT_ACTIVATIONS["silu"]
+        numerical = first[24] if version >= 2 else _NUMERICAL_MODES["fused"]
+        expert_type = "mlp" if version == 3 else "glu"
         specs = []
         for layer, config in configs.items():
-            if (len(config) < 23 or config[:17] != first[:17] or config[22] != first[22]
-                    or config[21] < 0 or len(config) != 23 + config[21]):
+            if (config[0] != version or config[:17] != first[:17] or config[22] != first[22]
+                    or config[21] < 0 or len(config) != header + config[21]
+                    or (version >= 2 and (config[23] != activation or config[24] != numerical))
+                    or (version == 3 and config[25] != first[25])):
                 raise ValueError("inconsistent deployment configuration format")
-            specs.append((layer, *config[17:21], tuple(config[23:])))
+            specs.append((layer, *config[17:21], tuple(config[header:])))
         result = cls(first[1], first[2], first[3], first[22], tuple(specs),
                      num_banks=first[4], activation_mode=tuple(_ACTIVATION_MODES)[first[5]],
                      max_route_tile_rows=first[6] or "auto", resident_cache_bytes=first[7],
                      dynamic_cache_bytes=first[8], cache_policy=tuple(_CACHE_POLICIES)[first[9]],
                      cache_decay_interval=first[10], cache_min_reuse=first[11],
                      cache_update_bytes=first[12], async_staging=bool(first[13]),
-                     host_profile=bool(first[14]), tile_m=first[15], tile_n=first[16])
+                     host_profile=bool(first[14]), tile_m=first[15], tile_n=first[16],
+                     expert_activation=_EXPERT_ACTIVATION_NAMES[activation],
+                     numerical_mode=_NUMERICAL_MODE_NAMES[numerical], expert_type=expert_type)
         if any(result.layer_config(layer) != tuple(value) for layer, value in configs.items()):
             raise ValueError("noncanonical deployment configuration format")
         return result
@@ -494,6 +590,12 @@ class PrefillMoERuntime:
     the budget-feasible tile count. It opportunistically leaves one eligible miss
     expert of cache headroom, without sacrificing banks/group capacity or evicting
     existing cache entries just to enlarge tiles. The default remains 4096.
+    expert_activation selects the expert nonlinearity (silu/gelu) and
+    numerical_mode selects fused numerics or staged rounding to Tout followed by
+    FP32 reduction.
+    expert_type explicitly selects GLU or MLP for every bound layer. All three
+    dimensions are independent of activation_mode, validated before create,
+    stored separately, and sent to native as trailing int codes.
     route_buffer does not tile; activation_mode='auto' still minimizes GPU charge.
     resident_experts selects a static deployment cache, loaded synchronously after
     all CPU weights are bound and before any forward. It is never changed by routing.
@@ -525,7 +627,8 @@ class PrefillMoERuntime:
                  resident_cache_bytes=0, resident_experts=None, dynamic_cache_bytes=0,
                  cache_policy="reuse", cache_decay_interval=32, cache_min_reuse=2,
                  cache_update_bytes=0, async_staging=False, host_profile=False,
-                 tile_m=0, tile_n=128):
+                 tile_m=0, tile_n=128, expert_activation="silu", numerical_mode="fused",
+                 expert_type="glu"):
         self._lock = threading.Lock()
         self._closed = True
         if not isinstance(store, ExpertStore):
@@ -533,6 +636,7 @@ class PrefillMoERuntime:
         # Own immutable binding inventory and identity snapshots even if callers
         # later replace the public store mapping or mutate aliases.
         validated = ExpertStore(store.layers, ram_budget_bytes=store.ram_budget_bytes)
+        _validate_store_expert_type(validated, expert_type)
         self._bound_layers = MappingProxyType(dict(validated.layers))
         self._weight_identities = {
             layer: tuple(_TensorIdentity.capture(w) for w in pair)
@@ -546,6 +650,12 @@ class PrefillMoERuntime:
                 raise ValueError(f"{name} must be one of {allowed}")
         if not isinstance(activation_mode, str) or activation_mode not in _ACTIVATION_MODES:
             raise ValueError("activation_mode must be route_buffer, fp32_accumulate, or auto")
+        if (not isinstance(expert_activation, str)
+                or expert_activation not in _EXPERT_ACTIVATIONS):
+            raise ValueError("expert_activation must be silu or gelu")
+        if (not isinstance(numerical_mode, str)
+                or numerical_mode not in _NUMERICAL_MODES):
+            raise ValueError("numerical_mode must be fused or staged")
         if not (isinstance(max_route_tile_rows, str) and max_route_tile_rows == "auto"):
             if (isinstance(max_route_tile_rows, bool) or not isinstance(max_route_tile_rows, int)
                     or not 1 <= max_route_tile_rows <= _INT_MAX):
@@ -586,6 +696,9 @@ class PrefillMoERuntime:
                 raise ValueError("nonempty resident_experts requires positive resident_cache_bytes")
             resident[layer_id] = ids
         self.activation_mode = activation_mode
+        self.expert_activation = expert_activation
+        self.numerical_mode = numerical_mode
+        self.expert_type = expert_type
         self.max_route_tile_rows = max_route_tile_rows
         self.resident_cache_bytes = resident_cache_bytes
         self.resident_experts = MappingProxyType(resident)
@@ -615,7 +728,9 @@ class PrefillMoERuntime:
             0 if max_route_tile_rows == "auto" else max_route_tile_rows,
             resident_cache_bytes, dynamic_cache_bytes, _CACHE_POLICIES[cache_policy],
             cache_decay_interval, cache_min_reuse, cache_update_bytes,
-            async_staging, host_profile, tile_m, tile_n)
+            async_staging, host_profile, tile_m, tile_n,
+            _EXPERT_ACTIVATIONS[expert_activation], _NUMERICAL_MODES[numerical_mode],
+            _EXPERT_TYPES[expert_type])
         self._closed = False
         try:
             self._token_identity = _TensorIdentity.capture(self.token)
@@ -691,6 +806,8 @@ class PrefillMoERuntime:
             raise TypeError("artifact_config must be an OffloadConfig")
         # Preserve canonical/store-shape diagnostics before identity checks.
         config.validate_store(self.store)
+        if config.expert_type != self.expert_type:
+            raise ValueError("deployment configuration mismatch: runtime expert_type")
         self._token_identity.validate(self.token, weight=False)
         torch.ops.recsys_ops.fuse_moe_offload_validate(self.token, config.manifest())
         # Preserve native all-layer version diagnostics; detect public mapping

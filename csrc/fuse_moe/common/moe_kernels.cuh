@@ -7,7 +7,7 @@
 //      移植自 hpc-ops src/fuse_moe/sm90/cp_async/count.cu，裁剪 task map
 //      与 EP 多卡。
 //   2. gather_sorted：x → expert 有序 compact 布局（sm120 TMA gemm1 前置）
-//   3. act_mul：silu(gate) * up，gate_up (T, 2I) → down 输入 (T, I)
+//   3. act_mul：act(gate) * up（SiLU 或 GELU-erf），gate_up (T, 2I) → down 输入 (T, I)
 //   4. reduce：按 topk_scale 加权求和 topk 个 expert 输出 → (S, H)
 //
 // PDL：所有 kernel 体内统一 pdl_acquire()/pdl_release()（低架构编译为空），
@@ -17,6 +17,9 @@
 #define FUSE_MOE_SRC_COMMON_MOE_KERNELS_CUH_
 
 #include <cuda.h>
+
+#include <cassert>
+#include <type_traits>
 
 #include <cub/cub.cuh>
 
@@ -265,31 +268,83 @@ __global__ void count_and_build_kernel(const int *topk_ids_ptr, int *row_indices
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 2. act_mul：silu(gate) * up（bf16/fp16 in/out，fp32 计算，无量化）
+// 2. act_mul：act(gate) * up（bf16/fp16 或 FP32 输入，bf16/fp16 输出）
+//    kActivation：0 = SiLU（默认），1 = GELU-erf
+//    fused TMA：gate/up 保持 FP32，act·up 后才 round 到 T。
+//    staged：gemm1 已把 gate/up round 到 T，此处 act 再 round 到 T，
+//    乘积以 FP32 计算并 round 到 T（与配对融合 epilogue 同舍入规则）。
 // ══════════════════════════════════════════════════════════════════════════
-template <typename T, int kThreadPerBlock>
-__global__ void act_mul_kernel(T *__restrict__ out_ptr, const T *__restrict__ gate_up_ptr,
+template <typename T, int kThreadPerBlock, int kActivation = 0, bool kRoundIntermediate = false,
+          typename TGateUp = T, bool kGated = true>
+__global__ void act_mul_kernel(T *__restrict__ out_ptr, const TGateUp *__restrict__ gate_up_ptr,
                                int num_row, int num_col, cutlass::FastDivmod block1D22D) {
   int iblockx;
   int iblocky;
   block1D22D(iblocky, iblockx, blockIdx.x);
   uint64_t irow = iblocky;
-  int icol = (threadIdx.x + iblockx * kThreadPerBlock) * 8;  // 8 elems = 16B
+  int icol = (threadIdx.x + iblockx * kThreadPerBlock) * 8;  // 输出 8 elems = 16B
 
   pdl_acquire();
 
   if (icol < num_col) {
-    const T *gate_row_ptr = gate_up_ptr + irow * num_col * 2;
-    const T *up_row_ptr = gate_row_ptr + num_col;
+    const TGateUp *gate_row_ptr = gate_up_ptr + irow * num_col * (kGated ? 2 : 1);
     T *out_row_ptr = out_ptr + irow * num_col;
 
-    auto gate = to<float>(load<T, 8>(gate_row_ptr + icol));
-    auto up = to<float>(load<T, 8>(up_row_ptr + icol));
+    static_assert(std::is_same_v<TGateUp, T> || std::is_same_v<TGateUp, float>,
+                  "act_mul input must be output dtype or FP32");
+    vec_t<float, 8> gate;
+    vec_t<float, 8> up;
+    if constexpr (std::is_same_v<TGateUp, float>) {
+      // num_col%64==0、icol%8==0：FP32 行/半行及两组 4 元素均 16B 对齐。
+      // load 只支持 <=16B，禁止将 8 个 float 合成一次 32B load。
+#pragma unroll
+      for (int part = 0; part < 2; ++part) {
+        auto gate_part = load<TGateUp, 4>(gate_row_ptr + icol + part * 4);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          gate[part * 4 + i] = gate_part[i];
+        }
+        if constexpr (kGated) {
+          auto up_part = load<TGateUp, 4>(gate_row_ptr + num_col + icol + part * 4);
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            up[part * 4 + i] = up_part[i];
+          }
+        }
+      }
+    } else {
+      // 低精度保持每半区单次 16B load 和原有 float 转换。
+      gate = to<float>(load<TGateUp, 8>(gate_row_ptr + icol));
+      if constexpr (kGated) {
+        up = to<float>(load<TGateUp, 8>(gate_row_ptr + num_col + icol));
+      }
+    }
 
     vec_t<T, 8> out;
+    if constexpr (!kGated) {
+      // MLP: no up load or multiplication; staged rounds projection before act.
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      out[i] = static_cast<T>(silu(gate[i]) * up[i]);
+      for (int i = 0; i < 8; ++i) {
+        float projection = gate[i];
+        if constexpr (kRoundIntermediate) {
+          projection = static_cast<float>(static_cast<T>(projection));
+        }
+        out[i] = static_cast<T>(expert_act<kActivation>(projection));
+      }
+    } else if constexpr (kRoundIntermediate) {
+      // staged：gate/up 已是 Tout（gemm1 物化时 round），act 结果再 round
+      // 到 Tout，随后乘积以 FP32 计算并 round 到 Tout 写回。
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const T act_r = static_cast<T>(expert_act<kActivation>(gate[i]));
+        out[i] = static_cast<T>(static_cast<float>(act_r) * up[i]);
+      }
+    } else {
+      // fused：act 和乘积保持 FP32，最终写回时 round 到 T。
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        out[i] = static_cast<T>(expert_act<kActivation>(gate[i]) * up[i]);
+      }
     }
     store(out_row_ptr + icol, out);
   }
@@ -300,8 +355,12 @@ __global__ void act_mul_kernel(T *__restrict__ out_ptr, const T *__restrict__ ga
 // ══════════════════════════════════════════════════════════════════════════
 // 3. reduce：out[s] = Σ_j topk_scale[s,j] * x[topk_pos[s,j]]（移植自
 //    hpc-ops reduce.cu，去掉 shared_output；pos==-1（无效槽位）跳过）
+//    kRoundProduct（numerical_mode=1）：每个 weighted product 先 round 到
+//    Tout，再以 FP32 累加，最后 round 到 Tout 写回（stage-wise rounding；
+//    不承诺与 torch 逐 bit 一致）。
 // ══════════════════════════════════════════════════════════════════════════
-template <typename T, int kThreadPerBlock, int kNumItemPer16B, int kNumTopkMax>
+template <typename T, int kThreadPerBlock, int kNumItemPer16B, int kNumTopkMax,
+          bool kRoundProduct = false>
 __global__ void reduce_kernel(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
                               const float *topk_scale_ptr, int num_seq, int hidden_size,
                               int num_topk, cutlass::FastDivmod block_divider) {
@@ -342,7 +401,12 @@ __global__ void reduce_kernel(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
         auto x_fp32 = to<float>(load<T, kNumItemPer16B>(x_irow_ptr + icol));
 #pragma unroll
         for (int j = 0; j < kNumItemPer16B; j++) {
-          y_fp32[j] += x_fp32[j] * iscale;
+          if constexpr (kRoundProduct) {
+            // staged：FP32 加权积先 round 到 Tout，再 FP32 累加
+            y_fp32[j] += static_cast<float>(static_cast<T>(x_fp32[j] * iscale));
+          } else {
+            y_fp32[j] += x_fp32[j] * iscale;
+          }
         }
       }
     }
@@ -468,9 +532,15 @@ inline void count_and_build_indices_async(const int *topk_ids_ptr, int *row_indi
   }
 }
 
-template <typename T>
-inline void act_mul_async(T *out_ptr, const T *gate_up_ptr, int num_row, int num_col,
-                          bool use_pdl, cudaStream_t stream) {
+// expert_activation / numerical_mode 在 host 侧一次分发到模板（无每元素动态分支）：
+// TGateUp 由输入指针推导；输出始终为 T，默认同类型调用保持兼容。
+template <typename T, typename TGateUp = T>
+inline void act_mul_async(T *out_ptr, const TGateUp *gate_up_ptr, int num_row, int num_col,
+                          bool use_pdl, cudaStream_t stream, int expert_activation = 0,
+                          int numerical_mode = 0, int expert_type = 0) {
+  assert(expert_activation == 0 || expert_activation == 1);
+  assert(numerical_mode == 0 || numerical_mode == 1);
+  assert(expert_type == 0 || expert_type == 1);
   constexpr int kThreadPerBlock = 256;
   int num_block_col = (num_col / 8 + kThreadPerBlock - 1) / kThreadPerBlock;
   int num_block_total = num_row * num_block_col;
@@ -478,7 +548,23 @@ inline void act_mul_async(T *out_ptr, const T *gate_up_ptr, int num_row, int num
   cutlass::FastDivmod block1D22D(num_block_col);
   dim3 grid(num_block_total);
   dim3 block(kThreadPerBlock);
-  launch_kernel_pdl(kernels::act_mul_kernel<T, kThreadPerBlock>, grid, block, 0, stream, use_pdl,
+  auto kernel = numerical_mode
+                    ? (expert_activation
+                           ? kernels::act_mul_kernel<T, kThreadPerBlock, /*kActivation=*/1, true, TGateUp>
+                           : kernels::act_mul_kernel<T, kThreadPerBlock, /*kActivation=*/0, true, TGateUp>)
+                    : (expert_activation
+                           ? kernels::act_mul_kernel<T, kThreadPerBlock, /*kActivation=*/1, false, TGateUp>
+                           : kernels::act_mul_kernel<T, kThreadPerBlock, /*kActivation=*/0, false, TGateUp>);
+  if (expert_type == 1) {
+    kernel = numerical_mode
+                 ? (expert_activation
+                        ? kernels::act_mul_kernel<T, kThreadPerBlock, 1, true, TGateUp, false>
+                        : kernels::act_mul_kernel<T, kThreadPerBlock, 0, true, TGateUp, false>)
+                 : (expert_activation
+                        ? kernels::act_mul_kernel<T, kThreadPerBlock, 1, false, TGateUp, false>
+                        : kernels::act_mul_kernel<T, kThreadPerBlock, 0, false, TGateUp, false>);
+  }
+  launch_kernel_pdl(kernel, grid, block, 0, stream, use_pdl,
                     out_ptr, gate_up_ptr, num_row, num_col, block1D22D);
 }
 
@@ -496,10 +582,12 @@ inline void gather_sorted_async(T *dst_ptr, const T *x_ptr, const int *row_indic
                     dst_ptr, x_ptr, row_indices_ptr, cu_seqlens_ptr, k, num_expert);
 }
 
+// numerical_mode=1：weighted product 逐个 round 到 Tout 后再 FP32 累加。
 template <typename T>
 inline void reduce_async(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
                          const float *topk_scale_ptr, int num_seq, int hidden_size, int num_topk,
-                         bool use_pdl, cudaStream_t stream, bool explicit_config = false) {
+                         bool use_pdl, cudaStream_t stream, bool explicit_config = false,
+                         int numerical_mode = 0) {
   constexpr int kThreadPerBlock = 256;
   constexpr int kNumTopkMax = 128;
   constexpr int kNumItemPer16B = 16 / sizeof(T);  // 8
@@ -509,8 +597,10 @@ inline void reduce_async(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
   cutlass::FastDivmod block_divider(num_block_col);
   dim3 grid(num_block_total);
   dim3 block(kThreadPerBlock);
-  launch_kernel_pdl_config(kernels::reduce_kernel<T, kThreadPerBlock, kNumItemPer16B, kNumTopkMax>,
-                           grid, block, 0, stream, use_pdl, !explicit_config,
+  auto kernel = numerical_mode
+                    ? kernels::reduce_kernel<T, kThreadPerBlock, kNumItemPer16B, kNumTopkMax, true>
+                    : kernels::reduce_kernel<T, kThreadPerBlock, kNumItemPer16B, kNumTopkMax, false>;
+  launch_kernel_pdl_config(kernel, grid, block, 0, stream, use_pdl, !explicit_config,
                            y_ptr, x_ptr, topk_pos_ptr, topk_scale_ptr, num_seq,
                            hidden_size, num_topk, block_divider);
 }

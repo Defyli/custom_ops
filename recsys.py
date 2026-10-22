@@ -4,7 +4,7 @@ custom_ops/recsys.py — RecsysOps：推荐系统核心 CUDA 算子库（分组�
 算子分组（每组独立 .so、独立 JIT 编译/缓存，首次访问时才编译）：
 - fa         mha_fwd_with_mask      Flash Attention 2 前向，任意 fp16/bf16 加法 mask
 - mixed_gemm mixed_gemm (+fp8 查询)  混合精度 GEMM：bf16 主项 + fp8/int8 residual
-- fuse_moe   fuse_moe                MoE 前向融合（group GEMM + silu*mul + reduce）
+- fuse_moe   fuse_moe                MoE 前向融合（group GEMM + act*mul + reduce）
 - swiglu     swiglu                  SwiGLU 融合（配对 GEMM + silu*mul epilogue）
 
 
@@ -48,6 +48,95 @@ DEFAULT_RESIDUAL_SCALE = 1.0 / 256.0
 
 # 激活函数名 → kernel 枚举
 _ACTIVATION_TO_ID = {"identity": 0, "silu": 1, "gelu": 2}
+
+# fuse_moe 专家激活 / 数值模式：公开字符串 → native int 线格式编码。
+# 两者是独立维度：expert_activation 选择专家非线性，numerical_mode 选择
+# 数值契约（fused / staged），与 offload 的 activation_mode（route_buffer
+# 等缓冲/累加策略）无关。编码 0 是各自的默认值，因此新增 schema 尾参可安全
+# 缺省为 0，保持旧默认语义（silu / fused / glu）。新增参数改变 native
+# 签名及 schema；旧二进制必须重编，C++ 默认参数只提供源码调用兼容。
+EXPERT_ACTIVATION_TO_ID = {"silu": 0, "gelu": 1}
+NUMERICAL_MODE_TO_ID = {"fused": 0, "staged": 1}
+EXPERT_TYPE_TO_ID = {"glu": 0, "mlp": 1}
+
+
+def _resolve_fuse_moe_expert_type(expert_type):
+    """Resolve the explicit expert architecture, never infer it from activation."""
+    if not isinstance(expert_type, str) or expert_type not in EXPERT_TYPE_TO_ID:
+        raise ValueError(
+            f"expert_type must be one of {list(EXPERT_TYPE_TO_ID)}, got {expert_type!r}")
+    return EXPERT_TYPE_TO_ID[expert_type]
+
+
+def _resolve_fuse_moe_modes(expert_activation, numerical_mode):
+    """严格校验并解析 fuse_moe 的两个公开字符串为 native int 编码。
+
+    只接受精确的字符串枚举（bool/int/None/其它大小写均拒绝），且在触发
+    分组加载/编译之前完成校验。
+    """
+    if (not isinstance(expert_activation, str)
+            or expert_activation not in EXPERT_ACTIVATION_TO_ID):
+        raise ValueError(
+            f"expert_activation must be one of {list(EXPERT_ACTIVATION_TO_ID)}, "
+            f"got {expert_activation!r}")
+    if (not isinstance(numerical_mode, str)
+            or numerical_mode not in NUMERICAL_MODE_TO_ID):
+        raise ValueError(
+            f"numerical_mode must be one of {list(NUMERICAL_MODE_TO_ID)}, "
+            f"got {numerical_mode!r}")
+    return (EXPERT_ACTIVATION_TO_ID[expert_activation],
+            NUMERICAL_MODE_TO_ID[numerical_mode])
+
+
+def _check_fuse_moe_shapes(x, w1, w2, ids, scale, factor=None, *, allow_empty_s=False):
+    """Symbolic-safe canonical metadata checks; no routing-value inspection."""
+    for tensor, rank in ((x, 2), (w1, 3), (w2, 3), (ids, 2), (scale, 2)):
+        torch._check(tensor.dim() == rank)
+        torch._check(tensor.is_contiguous())
+    s, h = x.shape
+    e, _, i = w2.shape
+    torch._check(s >= 0 if allow_empty_s else s > 0)
+    torch._check(h > 0)
+    torch._check(h <= (1 << 31) - 1)
+    torch._check(h % 64 == 0)
+    torch._check(e > 0)
+    torch._check(e <= 512)
+    torch._check(i > 0)
+    torch._check(i <= ((1 << 31) - 1) // 2)
+    torch._check(i % 64 == 0)
+    torch._check(w1.shape[0] == e)
+    torch._check(w1.shape[2] == h)
+    torch._check(w2.shape[1] == h)
+    if factor is None:
+        torch._check((w1.shape[1] == i) | (w1.shape[1] == 2 * i))
+    else:
+        torch._check(w1.shape[1] == factor * i)
+    torch._check(ids.shape[0] == s)
+    torch._check(ids.shape[1] > 0)
+    torch._check(ids.shape[1] <= 128)
+    torch._check(scale.shape[0] == s)
+    torch._check(scale.shape[1] == ids.shape[1])
+    torch._check(x.dtype in (torch.float16, torch.bfloat16))
+    torch._check(w1.dtype == x.dtype)
+    torch._check(w2.dtype == x.dtype)
+    torch._check(ids.dtype == torch.int32)
+    torch._check(scale.dtype == torch.float32)
+    torch._check(ids.device == x.device)
+    torch._check(scale.device == x.device)
+
+
+def _fake_fuse_moe(x, gate_up_weight, down_weight, topk_ids, topk_scale,
+                   expert_activation=0, numerical_mode=0, expert_type=0):
+    """Meta/fake implementation synchronized with native trailing defaults."""
+    torch._check(expert_activation in (0, 1))
+    torch._check(numerical_mode in (0, 1))
+    torch._check(expert_type in (0, 1))
+    _check_fuse_moe_shapes(x, gate_up_weight, down_weight, topk_ids, topk_scale,
+                          2 if expert_type == 0 else 1)
+    torch._check(x.device.type == "cuda")
+    torch._check(gate_up_weight.device == x.device)
+    torch._check(down_weight.device == x.device)
+    return torch.empty_like(x)
 
 
 def _resolve_backend(backend):
@@ -166,7 +255,7 @@ class MixedGemmOps(CustomOps):
 
 
 class FuseMoeOps(CustomOps):
-    """fuse_moe 分组：MoE 前向融合算子（group GEMM + silu*mul + reduce）。"""
+    """fuse_moe 分组：MoE 前向融合算子（group GEMM + act*mul + reduce）。"""
 
     namespace    = "recsys_ops"
     requires_cuda = True
@@ -181,7 +270,8 @@ class FuseMoeOps(CustomOps):
     op_schemas = {
         "fuse_moe": (
             "fuse_moe(Tensor x, Tensor gate_up_weight, Tensor down_weight, "
-            "Tensor topk_ids, Tensor topk_scale) -> Tensor"
+            "Tensor topk_ids, Tensor topk_scale, int expert_activation=0, "
+            "int numerical_mode=0, int expert_type=0) -> Tensor"
         ),
         "fuse_moe_offload": (
             "fuse_moe_offload(Tensor x, Tensor gate_up_weight_cpu, Tensor down_weight_cpu, "
@@ -194,7 +284,8 @@ class FuseMoeOps(CustomOps):
             "int max_route_tile_rows=4096, int resident_cache_bytes=0, int dynamic_cache_bytes=0, "
             "int cache_policy=0, int cache_decay_interval=32, int cache_min_reuse=2, "
             "int cache_update_bytes=0, bool async_staging=False, bool host_profile=False, "
-            "int tile_m=0, int tile_n=128) -> Tensor"
+            "int tile_m=0, int tile_n=128, int expert_activation=0, "
+            "int numerical_mode=0, int expert_type=0) -> Tensor"
         ),
         "fuse_moe_offload_bind": (
             "fuse_moe_offload_bind(Tensor runtime_token, int layer_id, Tensor w1, Tensor w2) -> ()"
@@ -261,11 +352,7 @@ class FuseMoeOps(CustomOps):
         ]
 
     def register_fake_impls(self) -> None:
-        self.register_fake_for(
-            "fuse_moe",
-            lambda x, gate_up_weight, down_weight, topk_ids, topk_scale:
-                torch.empty_like(x),
-        )
+        self.register_fake_for("fuse_moe", _fake_fuse_moe)
         from custom_ops.moe_offload import _fake_offload
         self.register_fake_for("fuse_moe_offload", _fake_offload)
 
@@ -614,28 +701,46 @@ class RecsysOps:
     def fuse_moe(
         self,
         x:              torch.Tensor,                      # (S, H) bf16/fp16
-        gate_up_weight: torch.Tensor,                      # (E, 2I, H) 同 dtype
+        gate_up_weight: torch.Tensor,                      # (E, 2I or I, H) 同 dtype
         down_weight:    torch.Tensor,                      # (E, H, I) 同 dtype
         topk_ids:       torch.Tensor,                      # (S, K) int32
         topk_scale:     torch.Tensor,                      # (S, K) fp32
         backend:        str | None = None,   # "auto" | "cuda" | "tilelang"
+        *,
+        expert_activation: str = "silu",   # "silu" | "gelu"
+        numerical_mode:    str = "fused",  # "fused" | "staged"
+        expert_type:       str = "glu",    # "glu" | "mlp"
     ) -> torch.Tensor:
         """
         MoE 前向融合算子（单 GPU，bf16/fp16 输入，fp32 累加）：
 
-            y[s] = Σ_j topk_scale[s,j] * (Down_ej @ silu(GateUp_ej @ x[s]))
+            y[s] = Σ_j topk_scale[s,j] * (Down_ej @ (act(Gate_ej @ x[s]) * (Up_ej @ x[s])))
 
         限制：H % 64 == 0 且 I % 64 == 0；num_topk <= 128；num_expert <= 512；
         SM80+（sm89 / sm120）。
 
+        expert_type='glu' 使用 act(gate) * up；'mlp' 只有一个 projection + act，
+        w1 分别为 (E, 2I, H) / (E, I, H)，w2 均为 (E, H, I)。
+        expert_activation 选择专家非线性（silu / gelu）；numerical_mode 选择
+        数值契约（fused / staged）。两者均为关键字参数并严格校验，默认
+        保持 silu / fused（native int 编码 0/0）。staged 将 gate/up、激活结果、
+        激活乘积、down 结果、加权积依次 round 到 Tout（与 x 同 dtype），
+        再以 FP32 归约并 round 到 Tout 输出；不承诺跨后端逐 bit 一致。
+
         backend="tilelang" 时走 Tile-lang 后端；"auto" 时 CUDA 不可用自动回退。
         """
+        expert_activation_id, numerical_mode_id = _resolve_fuse_moe_modes(
+            expert_activation, numerical_mode)
+        expert_type_id = _resolve_fuse_moe_expert_type(expert_type)
         tl, facade = self._dispatch(backend, "fuse_moe")
         if tl:
-            return facade.fuse_moe(x, gate_up_weight, down_weight,
-                                   topk_ids, topk_scale)
+            return facade.fuse_moe(
+                x, gate_up_weight, down_weight, topk_ids, topk_scale,
+                expert_activation=expert_activation,
+                numerical_mode=numerical_mode, expert_type=expert_type)
         return self._group("fuse_moe").fuse_moe(
-            x, gate_up_weight, down_weight, topk_ids, topk_scale)
+            x, gate_up_weight, down_weight, topk_ids, topk_scale,
+            expert_activation_id, numerical_mode_id, expert_type_id)
 
     def swiglu(
         self,

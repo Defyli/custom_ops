@@ -5,6 +5,7 @@ import faulthandler
 import functools
 import gc
 import json
+import math
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -27,15 +28,44 @@ from custom_ops.moe_offload import (
 )
 
 
-def reference(x, w1, w2, ids, scale):
+def reference(x, w1, w2, ids, scale, expert_activation="silu", numerical_mode="fused", expert_type="glu"):
+    """CPU FP32 per-expert reference for GEGLU/SwiGLU and both numeric modes.
+
+    The CPU matmul is a genuine FP32 accumulation reference (never TF32/tensor
+    cores). GELU is the exact erf form; staged simulates the kernel's cast
+    chain (gate/up, activation, product, down, weighted product) with dtype
+    rounding before the final FP32 reduction.
+    """
+    if expert_type not in ("glu", "mlp") or w1.shape[1] != (2 if expert_type == "glu" else 1) * w2.shape[2]:
+        raise ValueError("expert_type projection shapes")
     xf, ids, scale = x.float().cpu(), ids.cpu(), scale.cpu()
+    dtype = x.dtype
+
+    def rounded(value):
+        return value.to(dtype).float()
+
     out = torch.zeros_like(xf)
     for e in range(w1.shape[0]):
         rows, slots = torch.where(ids == e)
-        gate, up = (xf[rows] @ w1[e].float().T).chunk(2, -1)
-        values = (torch.nn.functional.silu(gate) * up) @ w2[e].float().T
-        out.index_add_(0, rows, values * scale[rows, slots, None])
-    return out
+        if rows.numel() == 0:
+            continue
+        gu = xf[rows] @ w1[e].float().T
+        if numerical_mode == "staged":
+            gu = rounded(gu)
+        gate = gu.chunk(2, -1)[0] if expert_type == "glu" else gu
+        if expert_activation == "gelu":
+            act = 0.5 * gate * (1.0 + torch.erf(gate * math.sqrt(0.5)))
+        else:
+            act = gate * torch.sigmoid(gate)
+        if numerical_mode == "staged" and expert_type == "glu":
+            act = rounded(act)
+        hidden = rounded(act * gu.chunk(2, -1)[1] if expert_type == "glu" else act)
+        values = rounded(hidden @ w2[e].float().T)
+        weighted = values * scale[rows, slots, None]
+        if numerical_mode == "staged":
+            weighted = rounded(weighted)
+        out.index_add_(0, rows, weighted)
+    return out.to(dtype).float()
 
 
 class StoreTests(unittest.TestCase):
@@ -279,7 +309,7 @@ class StoreTests(unittest.TestCase):
             with PrefillMoERuntime.from_config(store, config, device="cuda:3") as runtime:
                 native.fuse_moe_offload_create.assert_called_once_with(
                     3, 200000, 300000, 50000, 1, 1, 0, 50000, 60000, 1, 7, 3, 25000,
-                    True, True, 32, 64)
+                    True, True, 32, 64, 0, 0, 0)
                 self.assertIs(runtime.deployment_config, config)
                 self.assertEqual(native.mock_calls[1:3], [
                     mock.call.fuse_moe_offload_bind(token, 5, *store.layers[5]),
@@ -499,10 +529,10 @@ class StoreTests(unittest.TestCase):
                                     host_profile=host_profile, tile_m=tile_m, tile_n=tile_n):
                                 native.fuse_moe_offload_create.assert_called_once_with(
                                     3, 0, 0, 0, 2, 0, 4096, 0, 0, 0, 32, 2, 0,
-                                    async_staging, host_profile, tile_m, tile_n)
-                                for argument in native.fuse_moe_offload_create.call_args.args[-4:-2]:
+                                    async_staging, host_profile, tile_m, tile_n, 0, 0, 0)
+                                for argument in native.fuse_moe_offload_create.call_args.args[13:15]:
                                     self.assertIs(type(argument), bool)
-                                for argument in native.fuse_moe_offload_create.call_args.args[-2:]:
+                                for argument in native.fuse_moe_offload_create.call_args.args[15:20]:
                                     self.assertIs(type(argument), int)
                             native.fuse_moe_offload_close.assert_called_once_with(token)
             native.reset_mock()
@@ -511,7 +541,7 @@ class StoreTests(unittest.TestCase):
                                "FUSE_MOE_TILE_M": "32", "FUSE_MOE_TILE_N": "64"})
             with PrefillMoERuntime(store, device="cuda:3"):
                 native.fuse_moe_offload_create.assert_called_once_with(
-                    3, 0, 0, 0, 2, 0, 4096, 0, 0, 0, 32, 2, 0, False, False, 0, 128)
+                    3, 0, 0, 0, 2, 0, 4096, 0, 0, 0, 32, 2, 0, False, False, 0, 128, 0, 0, 0)
             current_device.assert_not_called()
 
     def test_runtime_configuration_schema(self):
@@ -530,7 +560,7 @@ class StoreTests(unittest.TestCase):
                                        activation_mode=mode, max_route_tile_rows=17) as runtime:
                     native.fuse_moe_offload_create.assert_called_with(
                         3, 200000, 100000, 50000, 1, value, 17, 0, 0, 0, 32, 2, 0,
-                        False, False, 0, 128)
+                        False, False, 0, 128, 0, 0, 0)
                     self.assertEqual(runtime.activation_mode, mode)
                     self.assertEqual(runtime.max_route_tile_rows, 17)
                     stats = runtime.stats()
@@ -548,7 +578,7 @@ class StoreTests(unittest.TestCase):
             with PrefillMoERuntime(store, device="cuda:3") as runtime:
                 native.fuse_moe_offload_create.assert_called_with(
                     3, 0, 100000, 0, 2, 0, 4096, 0, 0, 0, 32, 2, 0,
-                    False, False, 0, 128)
+                    False, False, 0, 128, 0, 0, 0)
                 self.assertEqual(runtime.dynamic_cache_bytes, 0)
                 self.assertEqual(runtime.cache_policy, "reuse")
                 self.assertEqual(runtime.cache_decay_interval, 32)
@@ -600,7 +630,7 @@ class StoreTests(unittest.TestCase):
                             cache_update_bytes=25000) as runtime:
                         native.fuse_moe_offload_create.assert_called_once_with(
                             3, 200000, 100000, 50000, 1, mode_id, native_rows,
-                            30000, 40000, 1, 7, 3, 25000, False, False, 0, 128)
+                            30000, 40000, 1, 7, 3, 25000, False, False, 0, 128, 0, 0, 0)
                         self.assertIs(type(native.fuse_moe_offload_create.call_args.args[6]), int)
                         self.assertEqual(runtime.max_route_tile_rows, rows)
                         self.assertEqual(runtime.activation_mode, mode)
@@ -611,7 +641,7 @@ class StoreTests(unittest.TestCase):
             with PrefillMoERuntime(store, device="cuda:3") as runtime:
                 native.fuse_moe_offload_create.assert_called_once_with(
                     3, 0, 100000, 0, 2, 0, 4096, 0, 0, 0, 32, 2, 0,
-                    False, False, 0, 128)
+                    False, False, 0, 128, 0, 0, 0)
                 self.assertEqual(runtime.max_route_tile_rows, 4096)
                 self.assertEqual(runtime.activation_mode, "route_buffer")
             current_device.assert_not_called()
@@ -647,7 +677,7 @@ class StoreTests(unittest.TestCase):
                                    resident_experts=config) as runtime:
                 native.fuse_moe_offload_create.assert_called_once_with(
                     3, 0, 0, 0, 2, 0, 4096, 100000, 0, 0, 32, 2, 0,
-                    False, False, 0, 128)
+                    False, False, 0, 128, 0, 0, 0)
                 self.assertEqual(native.mock_calls[1:5], [
                     mock.call.fuse_moe_offload_bind(token, 0, *store.layers[0]),
                     mock.call.fuse_moe_offload_bind(token, 5, *store.layers[5]),
@@ -733,7 +763,7 @@ class StoreTests(unittest.TestCase):
                                 cache_update_bytes=update) as runtime:
                             native.fuse_moe_offload_create.assert_called_once_with(
                                 3, 100000, 0, 0, 2, 0, 4096, resident,
-                                dynamic, value, decay, minimum, update, False, False, 0, 128)
+                                dynamic, value, decay, minimum, update, False, False, 0, 128, 0, 0, 0)
                             self.assertEqual(runtime.dynamic_cache_bytes, dynamic)
                             self.assertEqual(runtime.cache_policy, policy)
                             self.assertEqual(runtime.cache_decay_interval, decay)
@@ -781,7 +811,7 @@ class StoreTests(unittest.TestCase):
                         gc.collect()
                         native.fuse_moe_offload_create.assert_called_once_with(
                             3, 0, 0, 0, 2, 0, 4096, 100000, 200000, 1, 7, 3, 50000,
-                            False, False, 0, 128)
+                            False, False, 0, 128, 0, 0, 0)
                         if operation == "fuse_moe_offload_create":
                             native.fuse_moe_offload_bind.assert_not_called()
                             native.fuse_moe_offload_close.assert_not_called()
@@ -1040,6 +1070,214 @@ class StoreTests(unittest.TestCase):
                     ExpertStore.load_cpp(path)
             with self.assertRaisesRegex(ValueError, "at least one layer"):
                 ExpertStore({}).save_cpp(path)
+
+    def test_default_modes_emit_v1_and_nondefault_modes_emit_v2(self):
+        pair = (torch.zeros(3, 128, 64, dtype=torch.float16),
+                torch.zeros(3, 64, 64, dtype=torch.float16))
+        store = ExpertStore({0: pair})
+        options = dict(gpu_budget_bytes=200000, ram_budget_bytes=300000,
+                       pinned_budget_bytes=50000, target_sm=89)
+        config = OffloadConfig.from_store(store, **options)
+        v1 = config.layer_config(0)
+        self.assertEqual(v1[0], 1)
+        self.assertEqual(len(v1), 23)
+        self.assertEqual(v1[17:23], (3, 64, 64, 0, 0, 89))
+        self.assertEqual(config.manifest(), (1, 1, 0, len(v1), *v1))
+        self.assertEqual((config.expert_activation, config.numerical_mode),
+                         ("silu", "fused"))
+        # Explicit defaults are byte-identical to omission: v1 stays canonical.
+        explicit = OffloadConfig.from_store(
+            store, **options, expert_activation="silu", numerical_mode="fused")
+        self.assertEqual(explicit, config)
+        self.assertEqual(explicit.layer_config(0), v1)
+
+        resident = dict(resident_cache_bytes=100000, resident_experts={0: [2, 0]})
+        baseline = OffloadConfig.from_store(store, **options, **resident)
+        baseline_v1 = baseline.layer_config(0)
+        self.assertEqual(len(baseline_v1), 25)
+        self.assertEqual(baseline_v1[21], 2)
+        self.assertEqual(baseline_v1[23:], (0, 2))
+        for expert_activation, numerical_mode, activation_code, numerical_code in (
+                ("silu", "staged", 0, 1),
+                ("gelu", "fused", 1, 0),
+                ("gelu", "staged", 1, 1)):
+            with self.subTest(expert_activation=expert_activation,
+                              numerical_mode=numerical_mode):
+                selected = OffloadConfig.from_store(
+                    store, **options, **resident,
+                    expert_activation=expert_activation, numerical_mode=numerical_mode)
+                v2 = selected.layer_config(0)
+                self.assertEqual(v2[0], 2)
+                self.assertEqual(len(v2), 27)
+                self.assertEqual(v2[1:23], baseline_v1[1:23])
+                self.assertEqual(v2[23:25], (activation_code, numerical_code))
+                self.assertEqual(v2[25:], (0, 2))
+                self.assertEqual(selected.manifest(), (1, 1, 0, len(v2), *v2))
+                # The outer manifest framing is always version 1.
+                self.assertEqual(selected.manifest()[0], 1)
+                self.assertEqual(selected.expert_activation, expert_activation)
+                self.assertEqual(selected.numerical_mode, numerical_mode)
+                options_dict = selected.runtime_options()
+                self.assertEqual(options_dict["expert_activation"], expert_activation)
+                self.assertEqual(options_dict["numerical_mode"], numerical_mode)
+                self.assertEqual(OffloadConfig.from_layer_configs({0: v2}), selected)
+
+    def test_v2_archive_roundtrip_and_manifest_framing(self):
+        pair = (torch.zeros(3, 128, 64, dtype=torch.bfloat16),
+                torch.zeros(3, 64, 64, dtype=torch.bfloat16))
+        store = ExpertStore({0: pair, 5: tuple(w.clone() for w in pair)})
+        config = OffloadConfig.from_store(
+            store, gpu_budget_bytes=200000, ram_budget_bytes=300000,
+            pinned_budget_bytes=50000, target_sm=89,
+            resident_cache_bytes=200000, resident_experts={5: [2, 0]},
+            expert_activation="gelu", numerical_mode="staged")
+        vector = config.layer_config(5)
+        self.assertEqual(vector[0], 2)
+        self.assertEqual((len(vector), vector[23:25], vector[25:]), (27, (1, 1), (0, 2)))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "geglu.pt"
+            store.save_cpp(path, weight_version=7, config=config)
+            archive = torch.jit.load(str(path), map_location="cpu")
+            buffers = dict(archive.named_buffers())
+            self.assertEqual(buffers["format_version"].tolist(), [2])
+            self.assertEqual(buffers["weight_version"].tolist(), [7])
+            self.assertEqual(tuple(buffers["offload_config_5"].tolist()), vector)
+            loaded = ExpertStore.load_cpp(path)
+            self.assertEqual(loaded.weight_version, 7)
+            self.assertIsInstance(loaded.deployment_config, OffloadConfig)
+            self.assertEqual(loaded.deployment_config, config)
+            self.assertEqual(loaded.deployment_config.layer_config(5), vector)
+            self.assertEqual(loaded.deployment_config.manifest()[0], 1)
+            self.assertEqual(loaded.deployment_config.manifest(),
+                             (1, 2, 0, len(config.layer_config(0)), *config.layer_config(0),
+                              5, len(vector), *vector))
+            for expert_activation in ("silu", "gelu"):
+                for numerical_mode in ("fused", "staged"):
+                    other = OffloadConfig.from_store(
+                        store, gpu_budget_bytes=200000, ram_budget_bytes=300000,
+                        pinned_budget_bytes=50000, target_sm=89,
+                        expert_activation=expert_activation,
+                        numerical_mode=numerical_mode)
+                    store.save_cpp(path, config=other)
+                    self.assertEqual(ExpertStore.load_cpp(path).deployment_config, other)
+
+    def test_v2_default_codes_are_noncanonical_in_python(self):
+        pair = (torch.zeros(3, 128, 64, dtype=torch.float16),
+                torch.zeros(3, 64, 64, dtype=torch.float16))
+        store = ExpertStore({0: pair})
+        config = OffloadConfig.from_store(
+            store, gpu_budget_bytes=200000, ram_budget_bytes=300000,
+            pinned_budget_bytes=50000, target_sm=89,
+            resident_cache_bytes=100000, resident_experts={0: [1]})
+        v1 = list(config.layer_config(0))
+        v2_defaults = (2, *v1[1:23], 0, 0, *v1[23:])
+        self.assertEqual(len(v2_defaults), 26)
+        # Python canonical form for defaults is v1, so a v2(0,0) record must be
+        # rejected even though native validation accepts it.
+        with self.assertRaisesRegex(ValueError, "noncanonical"):
+            OffloadConfig.from_layer_configs({0: v2_defaults})
+        self.assertEqual(OffloadConfig.from_layer_configs({0: tuple(v1)}), config)
+
+    def test_illegal_and_mixed_mode_schema_rejected_before_load(self):
+        pair = (torch.zeros(3, 128, 64, dtype=torch.float16),
+                torch.zeros(3, 64, 64, dtype=torch.float16))
+        store = ExpertStore({0: pair, 5: tuple(w.clone() for w in pair)})
+        options = dict(gpu_budget_bytes=200000, ram_budget_bytes=300000,
+                       pinned_budget_bytes=50000, target_sm=89)
+        invalid_modes = {
+            "expert_activation": ("", "GELU", "gelu ", "none", "silu/gelu",
+                                  0, 1, True, False, None, [], {}),
+            "numerical_mode": ("", "Staged", "fused ", "legacy", "staged/fused",
+                               0, 1, True, False, None, [], {}),
+        }
+        native = mock.Mock()
+        with (mock.patch.object(ops, "ensure_loaded") as load,
+              mock.patch.object(torch.ops, "recsys_ops", native)):
+            config = OffloadConfig.from_store(store, **options)
+            for field, values in invalid_modes.items():
+                for value in values:
+                    with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                            ValueError, field):
+                        OffloadConfig.from_store(store, **{**options, field: value})
+                    with self.subTest(replace=field, value=value), self.assertRaisesRegex(
+                            ValueError, field):
+                        replace(config, **{field: value})
+                    with self.subTest(runtime=field, value=value), self.assertRaisesRegex(
+                            ValueError, field):
+                        PrefillMoERuntime(store, **{field: value})
+            load.assert_not_called()
+            native.fuse_moe_offload_create.assert_not_called()
+            native.fuse_moe_offload_validate.assert_not_called()
+
+            base = OffloadConfig.from_store(
+                store, **options, resident_cache_bytes=100000,
+                resident_experts={0: [0], 5: [1]})
+            gelu = OffloadConfig.from_store(
+                store, **options, resident_cache_bytes=100000,
+                resident_experts={0: [0], 5: [1]},
+                expert_activation="gelu", numerical_mode="fused")
+            staged = OffloadConfig.from_store(
+                store, **options, resident_cache_bytes=100000,
+                resident_experts={0: [0], 5: [1]},
+                expert_activation="silu", numerical_mode="staged")
+            v1, v2_gelu = base.layer_config(0), gelu.layer_config(0)
+            v2_staged = staged.layer_config(0)
+            invalid = {
+                "mixed versions": {0: tuple(v1), 5: tuple(v2_gelu)},
+                "mixed activations": {0: tuple(v2_gelu),
+                                      5: tuple((2, *v2_gelu[1:23], 0, 0, *v2_gelu[25:]))},
+                "mixed numerical": {0: tuple(v2_staged),
+                                    5: tuple((2, *v2_staged[1:23], 0, 0, *v2_staged[25:]))},
+                "activation code 2": {0: tuple((2, *v2_gelu[1:23], 2, 0, *v2_gelu[25:]))},
+                "numerical code 2": {0: tuple((2, *v2_gelu[1:23], 0, 2, *v2_gelu[25:]))},
+                "negative code": {0: tuple((2, *v2_gelu[1:23], -1, 0, *v2_gelu[25:]))},
+                "bool code": {0: tuple((2, *v2_gelu[1:23], True, 0, *v2_gelu[25:]))},
+                "truncated v2": {0: tuple(v2_gelu[:-1])},
+                "trailing v2": {0: tuple((*v2_gelu, 0))},
+                "unsorted ids": {0: tuple((2, *v2_gelu[1:23], 1, 0, 1, 0))},
+            }
+            for label, configs in invalid.items():
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    OffloadConfig.from_layer_configs(configs)
+            load.assert_not_called()
+            native.fuse_moe_offload_create.assert_not_called()
+
+    def test_mode_schema_before_native_load_and_v2_forward_contract(self):
+        store = ExpertStore({0: (torch.zeros(3, 128, 64, dtype=torch.float16),
+                                 torch.zeros(3, 64, 64, dtype=torch.float16))})
+        config = OffloadConfig.from_store(
+            store, gpu_budget_bytes=200000, ram_budget_bytes=300000,
+            pinned_budget_bytes=50000, target_sm=89,
+            expert_activation="gelu", numerical_mode="staged")
+        self.assertEqual(config.layer_config(0)[-2:], (1, 1))
+        native = mock.Mock()
+        token = torch.zeros(2, dtype=torch.int64)
+        native.fuse_moe_offload_create.return_value = token
+        x = torch.zeros(2, 128, dtype=torch.float16)
+        ids = torch.zeros(2, 1, dtype=torch.int32)
+        scale = torch.ones(2, 1)
+        with (mock.patch.object(ops, "ensure_loaded"),
+              mock.patch.object(ops, "is_available", return_value=True),
+              mock.patch.object(torch.ops, "recsys_ops", native),
+              mock.patch.object(torch.cuda, "get_device_capability", return_value=(8, 9))):
+            with PrefillMoERuntime.from_config(store, config, device="cuda:3") as runtime:
+                native.fuse_moe_offload_create.assert_called_once_with(
+                    3, 200000, 300000, 50000, 2, 0, 4096, 0, 0, 0, 32, 2, 0,
+                    False, False, 0, 128, 1, 1, 0)
+                native.fuse_moe_offload_validate.assert_called_once_with(
+                    token, config.manifest())
+                self.assertEqual(runtime._deployment_contracts[0],
+                                 tuple(config.layer_config(0)))
+                out = runtime.forward(x, ids, scale, layer_id=0)
+                native.fuse_moe_offload.assert_called_once_with(
+                    x, *store.layers[0], ids, scale, token, 0,
+                    tuple(config.layer_config(0)), config.manifest())
+                self.assertIs(out, native.fuse_moe_offload.return_value)
+                adapter = OffloadedMoELayer(0, config=config)
+                self.assertEqual(adapter.deployment_config,
+                                 tuple(config.layer_config(0)))
+                self.assertEqual(adapter.deployment_manifest, config.manifest())
+            native.fuse_moe_offload_close.assert_called_once_with(token)
 
     def test_checkpoint(self):
         gate = torch.randn(4, 64, 64).half()
@@ -4480,6 +4718,493 @@ class OffloadTests(unittest.TestCase):
                                     del out, legacy
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class GEGLUTests(unittest.TestCase):
+    """GPU GEGLU/SwiGLU × fused/staged coverage (single class CLI selectable).
+
+    Run one class::
+
+        python tests/test_fuse_moe_offload.py GEGLUTests
+
+    The staged reference is a per-expert CPU FP32 accumulation with the exact
+    erf GELU and explicit dtype rounding at every materialization point. It is
+    intentionally not bitwise: fp32_accumulate reduces in a nondeterministic
+    order and router scales are caller float32.
+    """
+
+    default_async_staging = False
+
+    @classmethod
+    def setUpClass(cls):
+        ops.ensure_loaded("fuse_moe")
+        if not ops.is_available("fuse_moe"):
+            raise unittest.SkipTest(ops.load_error("fuse_moe"))
+        torch.manual_seed(19)
+
+    def tensors(self, s=129, h=64, i=64, e=8, k=4, dtype=torch.float16, masked=False):
+        x = (torch.randn(s, h, device="cuda") * .3).to(dtype)
+        w1 = (torch.randn(e, 2 * i, h) * .05).to(dtype)
+        w2 = (torch.randn(e, h, i) * .05).to(dtype)
+        ids = torch.randint(e, (s, k), device="cuda", dtype=torch.int32)
+        scale = torch.rand(s, k, device="cuda", dtype=torch.float32)
+        if masked and s:
+            ids[::3] = -1
+            ids[0] = -1
+            scale = scale.masked_fill(ids < 0, float("nan"))
+        return x, w1, w2, ids, scale
+
+    def runtime(self, w1, w2, **kwargs):
+        async_staging = kwargs.setdefault("async_staging", self.default_async_staging)
+        runtime = PrefillMoERuntime(
+            ExpertStore({0: (w1, w2)}),
+            gpu_budget_bytes=kwargs.pop("gpu_budget_bytes", 16 << 20),
+            ram_budget_bytes=kwargs.pop("ram_budget_bytes", 64 << 20),
+            pinned_budget_bytes=kwargs.pop("pinned_budget_bytes", 16 << 20),
+            **kwargs)
+        self.assertEqual(runtime.async_staging, async_staging)
+        return runtime
+
+    @staticmethod
+    def modes():
+        return (("silu", "fused"), ("gelu", "fused"),
+                ("silu", "staged"), ("gelu", "staged"))
+
+    def assert_modes_close(self, out, ref, label):
+        torch.testing.assert_close(out.float().cpu(), ref, atol=.004, rtol=.06,
+                                   msg=label)
+
+    def test_full_gpu_four_mode_dtype_matrix(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            x, w1, w2, ids, scale = self.tensors(
+                s=129, h=128, i=128, e=8, k=4, dtype=dtype)
+            for expert_activation, numerical_mode in self.modes():
+                with self.subTest(dtype=dtype, expert_activation=expert_activation,
+                                  numerical_mode=numerical_mode):
+                    out = ops.fuse_moe(
+                        x, w1.cuda(), w2.cuda(), ids, scale, backend="cuda",
+                        expert_activation=expert_activation,
+                        numerical_mode=numerical_mode)
+                    ref = reference(x, w1, w2, ids, scale,
+                                    expert_activation, numerical_mode)
+                    self.assertEqual(out.dtype, dtype)
+                    self.assertEqual(tuple(out.shape), (129, 128))
+                    self.assertTrue(torch.isfinite(out).all().item())
+                    self.assert_modes_close(
+                        out, ref,
+                        f"{dtype} {expert_activation}/{numerical_mode}")
+
+    def test_isolated_scalar_semantics_wide_n_atomic(self):
+        # Share the CPU witness builder with the all-GPU test without duplicating
+        # its cast oracle. Native GEMMs each have only one nonzero product.
+        from test_fuse_moe import numerical_semantics_fixture
+
+        for dtype in (torch.float16, torch.bfloat16):
+            for numerical_mode in ("fused", "staged"):
+                x, w1, w2, ids, scale, expected, alternatives = numerical_semantics_fixture(
+                    dtype, numerical_mode, h=128, i=256)
+                torch.testing.assert_close(
+                    reference(x, w1, w2, ids, scale, "gelu", numerical_mode),
+                    expected, atol=0, rtol=0)
+                for activation_mode in ("route_buffer", "fp32_accumulate"):
+                    with self.subTest(dtype=dtype, numerical_mode=numerical_mode,
+                                      activation_mode=activation_mode), self.runtime(
+                            w1, w2, activation_mode=activation_mode, tile_m=32,
+                            tile_n=128, max_route_tile_rows=7,
+                            expert_activation="gelu", numerical_mode=numerical_mode) as runtime:
+                        self.assertEqual(runtime.tile_n, 128)
+                        actual = runtime.forward(x.cuda(), ids.cuda(), scale.cuda()).float().cpu()
+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                        for name, wrong in alternatives.items():
+                            self.assertFalse(torch.equal(actual, wrong),
+                                             f"failed to discriminate {name}")
+                        if activation_mode == "fp32_accumulate":
+                            self.assertGreater(runtime.stats()["route_tiles"], 1)
+                            self.assertEqual(runtime.stats()["activation_mode"], 1)
+
+    def test_offload_route_fp32_cache_and_partial_tiles(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            x, w1, w2, ids, scale = self.tensors(
+                s=129, h=64, i=64, e=8, k=4, dtype=dtype)
+            expert_bytes = 6 * 64 * 64
+            for expert_activation, numerical_mode in self.modes():
+                ref = reference(x, w1, w2, ids, scale,
+                                expert_activation, numerical_mode)
+                tag = f"{dtype} {expert_activation}/{numerical_mode}"
+                # route_buffer never tiles.
+                with self.subTest(tag=tag, mode="route_buffer"), self.runtime(
+                        w1, w2, activation_mode="route_buffer", tile_m=32,
+                        expert_activation=expert_activation,
+                        numerical_mode=numerical_mode) as runtime:
+                    out = runtime.forward(x, ids, scale)
+                    self.assert_modes_close(out, ref, tag + " route_buffer")
+                    self.assertEqual(runtime.stats()["activation_mode"], 0)
+                    self.assertEqual(runtime.expert_activation, expert_activation)
+                    self.assertEqual(runtime.numerical_mode, numerical_mode)
+                # FP32 route accumulation with a tiny row cap forces many
+                # partial tiles; repeat to cover pool reuse and warm metadata.
+                with self.subTest(tag=tag, mode="fp32_partial"), self.runtime(
+                        w1, w2, num_banks=2, activation_mode="fp32_accumulate",
+                        max_route_tile_rows=7, tile_m=32,
+                        expert_activation=expert_activation,
+                        numerical_mode=numerical_mode) as runtime:
+                    for call in range(2):
+                        out = runtime.forward(x, ids, scale)
+                        self.assert_modes_close(out, ref, tag + " fp32 partial")
+                        stats = runtime.stats()
+                        self.assertEqual(stats["activation_mode"], 1)
+                        self.assertLessEqual(stats["route_tile_rows"], 7)
+                        if call == 0:
+                            self.assertGreater(stats["route_tiles"],
+                                               (ids.numel() + 6) // 7 - 1)
+                            self.assertGreater(stats["route_tiles"], 1)
+                # Cache-warm invocation: the second call must hit promoted
+                # experts without changing the numerical contract.
+                with self.subTest(tag=tag, mode="cache_warm"), self.runtime(
+                        w1, w2, num_banks=2, activation_mode="fp32_accumulate",
+                        tile_m=32, dynamic_cache_bytes=4 * expert_bytes,
+                        cache_policy="lru",
+                        expert_activation=expert_activation,
+                        numerical_mode=numerical_mode) as runtime:
+                    first = runtime.forward(x, ids, scale)
+                    self.assert_modes_close(first, ref, tag + " cache first")
+                    second = runtime.forward(x, ids, scale)
+                    self.assert_modes_close(second, ref, tag + " cache warm")
+                    stats = runtime.stats()
+                    self.assertGreater(stats["dynamic_cache_hits"], 0)
+                    self.assertEqual(stats["cache_budget_evictions"], 0)
+                    del first, second
+
+    def test_multi_context_modes_do_not_leak(self):
+        x, w1, w2, ids, scale = self.tensors(
+            s=65, h=64, i=64, e=8, k=3, dtype=torch.bfloat16)
+        refs = {(a, n): reference(x, w1, w2, ids, scale, a, n)
+                for a, n in self.modes()}
+        with self.runtime(w1, w2, activation_mode="route_buffer",
+                          expert_activation="silu", numerical_mode="fused") as plain, \
+                self.runtime(w1, w2, activation_mode="fp32_accumulate",
+                             max_route_tile_rows=7, expert_activation="gelu",
+                             numerical_mode="staged") as staged:
+            for call in range(2):
+                out_plain = plain.forward(x, ids, scale)
+                out_staged = staged.forward(x, ids, scale)
+                self.assert_modes_close(out_plain, refs[("silu", "fused")],
+                                        "plain context")
+                self.assert_modes_close(out_staged, refs[("gelu", "staged")],
+                                        "staged context")
+                self.assertEqual(plain.stats()["activation_mode"], 0)
+                self.assertEqual(staged.stats()["activation_mode"], 1)
+                self.assertEqual(plain.expert_activation, "silu")
+                self.assertEqual(plain.numerical_mode, "fused")
+                self.assertEqual(staged.expert_activation, "gelu")
+                self.assertEqual(staged.numerical_mode, "staged")
+                del out_plain, out_staged
+
+    def test_native_v1_v2_contract_and_failure_before_token_mutation(self):
+        x, w1, w2, ids, scale = self.tensors(
+            s=65, h=64, i=64, e=8, k=2, dtype=torch.float16)
+        gpu_weights = (w1.cuda(), w2.cuda())
+        # Native calls bypass strict Python string validation; invalid integer
+        # codes must still be rejected at op/create entry, before side effects.
+        for field in ("expert_activation", "numerical_mode"):
+            for code in (-1, 2):
+                with self.subTest(field=field, code=code):
+                    with self.assertRaisesRegex(RuntimeError, field):
+                        torch.ops.recsys_ops.fuse_moe(
+                            x, *gpu_weights, ids, scale, **{field: code})
+                    with self.assertRaisesRegex(RuntimeError, field):
+                        torch.ops.recsys_ops.fuse_moe_offload_create(
+                            torch.cuda.current_device(), **{field: code})
+        legacy = torch.ops.recsys_ops.fuse_moe(x, *gpu_weights, ids, scale)
+        explicit = ops.fuse_moe(x, *gpu_weights, ids, scale,
+                                expert_activation="silu", numerical_mode="fused")
+        torch.testing.assert_close(legacy, explicit, atol=0, rtol=0)
+        del gpu_weights, legacy, explicit
+        store = ExpertStore({0: (w1, w2)})
+        major, minor = torch.cuda.get_device_capability(x.device)
+        defaults = OffloadConfig.from_store(
+            store, gpu_budget_bytes=16 << 20, ram_budget_bytes=64 << 20,
+            pinned_budget_bytes=100000, target_sm=major * 10 + minor,
+            async_staging=self.default_async_staging)
+        staged_config = OffloadConfig.from_store(
+            store, gpu_budget_bytes=16 << 20, ram_budget_bytes=64 << 20,
+            pinned_budget_bytes=100000, target_sm=major * 10 + minor,
+            activation_mode="fp32_accumulate", async_staging=self.default_async_staging,
+            expert_activation="gelu", numerical_mode="staged")
+        with self.runtime(w1, w2, activation_mode="fp32_accumulate",
+                          pinned_budget_bytes=100000,
+                          expert_activation="gelu", numerical_mode="staged") as runtime:
+            out = runtime.forward(x, ids, scale)
+            self.assert_modes_close(out, reference(x, w1, w2, ids, scale,
+                                                   "gelu", "staged"),
+                                    "v2 valid forward")
+            v1_vector = defaults.layer_config(0)
+            v1_manifest = defaults.manifest()
+            valid_vector = staged_config.layer_config(0)
+            valid_manifest = staged_config.manifest()
+            self.assertEqual((v1_vector[0], len(v1_vector)), (1, 23))
+            self.assertEqual((valid_vector[0], len(valid_vector)), (2, 25))
+            self.assertEqual(valid_manifest[0], 1)
+
+            def assert_rejected(vector, manifest, message):
+                before, version = runtime.token.clone(), runtime.token._version
+                with self.assertRaisesRegex(RuntimeError, message):
+                    torch.ops.recsys_ops.fuse_moe_offload(
+                        x, w1, w2, ids, scale, runtime.token, 0, vector, manifest)
+                self.assertEqual(runtime.token._version, version)
+                torch.testing.assert_close(runtime.token, before, atol=0, rtol=0)
+
+            # v1 records never imply GEGLU/staged.
+            assert_rejected(v1_vector, v1_manifest, "version 1 configuration")
+            # Config-only malformed v2: width and out-of-range mode codes.
+            assert_rejected(valid_vector[:-1], (), "config length")
+            assert_rejected((*valid_vector, 0), (), "config length")
+            assert_rejected((2, *valid_vector[1:23], 2, 0, *valid_vector[25:]),
+                            (), "expert_activation")
+            assert_rejected((2, *valid_vector[1:23], 0, 2, *valid_vector[25:]),
+                            (), "numerical_mode")
+            # Config that disagrees with an otherwise valid manifest.
+            assert_rejected(valid_vector[:-1], valid_manifest,
+                            "differs from manifest|config length")
+            assert_rejected((*valid_vector, 0), valid_manifest,
+                            "differs from manifest|config length")
+            # Manifest framing, inventory and truncation.
+            assert_rejected(valid_vector, (2, *valid_manifest[1:]),
+                            "manifest")
+            assert_rejected(valid_vector, (1, 1, 1,
+                                           len(valid_vector), *valid_vector),
+                            "not bound|missing")
+            assert_rejected(valid_vector, valid_manifest[:-1], "manifest")
+            # A failed preflight must not consume the healthy context.
+            recovered = runtime.forward(x, ids, scale)
+            self.assert_modes_close(recovered, reference(x, w1, w2, ids, scale,
+                                                         "gelu", "staged"),
+                                    "recovery after rejected config")
+
+        # Native accepts a v2 record whose codes are the defaults, even though
+        # Python's canonical form for defaults is v1.
+        with self.runtime(w1, w2, activation_mode="route_buffer",
+                          pinned_budget_bytes=100000,
+                          expert_activation="silu", numerical_mode="fused") as base:
+            v1_vector = defaults.layer_config(0)
+            v2_defaults = (2, *v1_vector[1:23], 0, 0, *v1_vector[23:])
+            v2_manifest = (1, 1, 0, len(v2_defaults), *v2_defaults)
+            with self.assertRaisesRegex(ValueError, "noncanonical"):
+                OffloadConfig.from_layer_configs({0: v2_defaults})
+            out = torch.ops.recsys_ops.fuse_moe_offload(
+                x, w1, w2, ids, scale, base.token, 0, v2_defaults, v2_manifest)
+            self.assert_modes_close(out, reference(x, w1, w2, ids, scale),
+                                    "native v2 defaults")
+            self.assertEqual(tuple(out.shape), (65, 64))
+
+    def test_masked_topk_and_zero_sequence(self):
+        x, w1, w2, ids, scale = self.tensors(
+            s=129, h=64, i=64, e=8, k=4, dtype=torch.float16, masked=True)
+        self.assertTrue((ids < 0).any().item())
+        self.assertTrue(torch.isnan(scale).any().item())
+        ref = reference(x, w1, w2, ids, scale, "gelu", "staged")
+        with self.runtime(w1, w2, activation_mode="fp32_accumulate",
+                          max_route_tile_rows=7, tile_m=32,
+                          expert_activation="gelu",
+                          numerical_mode="staged") as runtime:
+            out = runtime.forward(x, ids, scale)
+            self.assertTrue(torch.isfinite(out).all().item())
+            self.assert_modes_close(out, ref, "masked -1")
+            all_masked = (ids < 0).all(dim=1)
+            if all_masked.any():
+                torch.testing.assert_close(out[all_masked],
+                                           torch.zeros_like(out[all_masked]),
+                                           atol=0, rtol=0)
+            stats = runtime.stats()
+            self.assertEqual(stats["active_experts"],
+                             len(set(ids.cpu().flatten().tolist()) - {-1}))
+            del out
+
+            # S=0 is a supported offload shape: no routes, no output, no error.
+            empty_x = torch.empty(0, 64, device="cuda", dtype=torch.float16)
+            empty_ids = torch.empty(0, 4, device="cuda", dtype=torch.int32)
+            empty_scale = torch.empty(0, 4, device="cuda", dtype=torch.float32)
+            empty = runtime.forward(empty_x, empty_ids, empty_scale)
+            self.assertEqual(tuple(empty.shape), (0, 64))
+            self.assertEqual(empty.dtype, torch.float16)
+            self.assertEqual(runtime.stats()["active_experts"], 0)
+            del empty
+            # The same context still serves a nonempty invocation after S=0.
+            again = runtime.forward(x, ids, scale)
+            self.assert_modes_close(again, ref, "recovery after S=0")
+
+
+class MLPStoreTests(unittest.TestCase):
+    def store(self, expert_type="mlp"):
+        return ExpertStore({layer: (torch.zeros(3, (1 if expert_type == "mlp" else 2) * i, 64, dtype=torch.float16),
+                                    torch.zeros(3, 64, i, dtype=torch.float16))
+                            for layer, i in ((0, 64), (5, 128))})
+
+    def config(self, store, **kwargs):
+        return OffloadConfig.from_store(store, target_sm=89, gpu_budget_bytes=2 << 20,
+            ram_budget_bytes=4 << 20, pinned_budget_bytes=200000,
+            resident_cache_bytes=200000, resident_experts={0: (0, 2), 5: (1,)}, **kwargs)
+
+    def test_v3_all_modes_roundtrip_archive_and_runtime_options(self):
+        store = self.store()
+        with mock.patch.object(ops, "ensure_loaded") as load:
+            for activation in ("silu", "gelu"):
+                for numerical in ("fused", "staged"):
+                    config = self.config(store, expert_type="mlp", expert_activation=activation, numerical_mode=numerical)
+                    vectors = {layer: config.layer_config(layer) for layer in store.layers}
+                    for layer, vector in vectors.items():
+                        self.assertEqual((vector[0], len(vector)), (3, 26 + vector[21]))
+                        self.assertEqual(vector[23:26], (int(activation == "gelu"), int(numerical == "staged"), 1))
+                        self.assertEqual(vector[26:], (0, 2) if layer == 0 else (1,))
+                    self.assertEqual(config.manifest()[0], 1)
+                    self.assertEqual(config.runtime_options()["expert_type"], "mlp")
+                    self.assertEqual(OffloadConfig.from_layer_configs(vectors), config)
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = Path(directory) / "weights.pt"
+                        store.save_cpp(path, weight_version=9, config=config)
+                        module = torch.jit.load(str(path), map_location="cpu")
+                        self.assertEqual(module.format_version.tolist(), [2])
+                        restored = ExpertStore.load_cpp(path)
+                        self.assertEqual(restored.deployment_config, config)
+                        self.assertEqual(restored.weight_version, 9)
+                        for layer in store.layers:
+                            for actual, expected in zip(restored.layers[layer], store.layers[layer]):
+                                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            load.assert_not_called()
+
+    def test_type_and_mixed_shapes_reject_before_native_create(self):
+        native = mock.Mock()
+        with mock.patch.object(ops, "ensure_loaded") as load, mock.patch.object(torch.ops, "recsys_ops", native):
+            for value in ("MLP", "mlp ", "", -1, 0, 1, 2, True, None, [], {}):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "expert_type"):
+                    self.config(self.store(), expert_type=value)
+            for architecture in ("glu", "mlp"):
+                wrong = self.store("glu" if architecture == "mlp" else "mlp")
+                with self.assertRaisesRegex(ValueError, "expert_type"):
+                    self.config(wrong, expert_type=architecture)
+                with self.assertRaisesRegex(ValueError, "expert_type"):
+                    PrefillMoERuntime(wrong, device="cuda:0", expert_type=architecture)
+            mixed = ExpertStore({0: self.store().layers[0], 5: self.store("glu").layers[5]})
+            with self.assertRaisesRegex(ValueError, "expert_type"):
+                self.config(mixed, expert_type="mlp")
+            load.assert_not_called()
+            native.fuse_moe_offload_create.assert_not_called()
+
+    def test_v3_invalid_codes_crosslayer_and_manifest_rejection(self):
+        config = self.config(self.store(), expert_type="mlp")
+        vectors = {layer: config.layer_config(layer) for layer in (0, 5)}
+        for position, value in ((0, 4), (23, -1), (23, 2), (24, 2), (25, -1), (25, 0), (25, 2), (25, True)):
+            wrong = list(vectors[0])
+            wrong[position] = value
+            with self.subTest(position=position, value=value), self.assertRaises((ValueError, TypeError)):
+                OffloadConfig.from_layer_configs({**vectors, 0: tuple(wrong)})
+        other = self.config(self.store(), expert_type="mlp", expert_activation="gelu")
+        with self.assertRaises(ValueError):
+            OffloadConfig.from_layer_configs({0: vectors[0], 5: other.layer_config(5)})
+        glu = self.config(self.store("glu"), expert_type="glu")
+        with self.assertRaises(ValueError):
+            OffloadConfig.from_layer_configs({0: vectors[0], 5: glu.layer_config(5)})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "weights.pt"
+            self.store().save_cpp(path, weight_version=1, config=config)
+            module = torch.jit.load(str(path))
+            module.offload_config_5[25] = 0
+            torch.jit.save(module, str(path))
+            with self.assertRaises(ValueError):
+                ExpertStore.load_cpp(path)
+
+    def test_create_twenty_args_explicit_codes(self):
+        native = mock.Mock()
+        native.fuse_moe_offload_create.return_value = torch.zeros(2, dtype=torch.int64)
+        with (mock.patch.object(ops, "ensure_loaded"), mock.patch.object(ops, "is_available", return_value=True),
+              mock.patch.object(torch.ops, "recsys_ops", native)):
+            for architecture in ("glu", "mlp"):
+                for activation in ("silu", "gelu"):
+                    for numerical in ("fused", "staged"):
+                        with PrefillMoERuntime(self.store(architecture), device="cuda:0", expert_type=architecture,
+                                              expert_activation=activation, numerical_mode=numerical):
+                            args = native.fuse_moe_offload_create.call_args.args
+                            self.assertEqual(len(args), 20)
+                            self.assertEqual(args[17:20], (int(activation == "gelu"), int(numerical == "staged"), int(architecture == "mlp")))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class MLPTests(unittest.TestCase):
+    """Independent MLP suite; never inherits/relabels the six GEGLU methods."""
+    default_async_staging = False
+    setUpClass = classmethod(GEGLUTests.setUpClass.__func__)
+    assert_modes_close = GEGLUTests.assert_modes_close
+
+    def test_dual_dtype_four_modes_sync_async_cache_mask_signed_duplicate_edges(self):
+        cases = ((7, 64, 64, 8, 4), (129, 128, 192, 8, 4), (65, 192, 128, 8, 4),
+                 (3, 64, 64, 8, 128), (3, 64, 64, 512, 2), (1, 64, 64, 1, 1))
+        for dtype in (torch.float16, torch.bfloat16):
+            for activation, numerical in GEGLUTests.modes():
+                for s, h, i, e, k in cases:
+                    x = (torch.randn(s, h, device="cuda") * .3).to(dtype)
+                    w1 = (torch.randn(e, i, h) * .05).to(dtype)
+                    w2 = (torch.randn(e, h, i) * .05).to(dtype)
+                    ids = torch.arange(s, device="cuda", dtype=torch.int32).remainder(e)[:, None].expand(s, k).contiguous()
+                    if s > 1:
+                        ids[0] = -1
+                    scale = torch.linspace(-.75, .9, s * k, device="cuda").reshape(s, k) / k
+                    scale[ids < 0] = float("nan")
+                    expected = reference(x, w1, w2, ids, scale, activation, numerical, "mlp")
+                    for asynchronous in (False, True):
+                        for cache in ("none", "static", "lru", "reuse"):
+                            expert_bytes = 4 * h * i
+                            with self.subTest(dtype=dtype, activation=activation, numerical=numerical,
+                                              shape=(s,h,i,e,k), asynchronous=asynchronous, cache=cache):
+                                config = OffloadConfig.from_store(ExpertStore({0: (w1, w2)}),
+                                    target_sm=sum(v * f for v, f in zip(torch.cuda.get_device_capability(), (10, 1))),
+                                    expert_type="mlp", expert_activation=activation, numerical_mode=numerical,
+                                    gpu_budget_bytes=16 << 20, ram_budget_bytes=64 << 20, pinned_budget_bytes=2 << 20,
+                                    async_staging=asynchronous, activation_mode="fp32_accumulate", max_route_tile_rows=7,
+                                    resident_cache_bytes=expert_bytes if cache == "static" else 0,
+                                    resident_experts={0: (0,)} if cache == "static" else {},
+                                    dynamic_cache_bytes=2 * expert_bytes if cache in ("lru", "reuse") else 0,
+                                    cache_policy="lru" if cache == "lru" else "reuse")
+                                with PrefillMoERuntime.from_config(ExpertStore({0: (w1,w2)}), config) as runtime:
+                                    for _ in range(2):
+                                        out = runtime.forward(x, ids, scale)
+                                        self.assert_modes_close(out, expected, "MLP")
+                                        self.assertTrue(torch.isfinite(out).all())
+                                        del out
+                                    self.assertLessEqual(runtime.stats()["gpu_charged_bytes"], config.gpu_budget_bytes)
+                                    self.assertLessEqual(runtime.stats()["pinned_bytes"], config.pinned_budget_bytes)
+
+    def test_scalar_activation_and_stage_witnesses(self):
+        from test_fuse_moe import mlp_numerical_semantics_fixture
+        for dtype in (torch.float16, torch.bfloat16):
+            for activation, numerical in GEGLUTests.modes():
+                x, w1, w2, ids, scale, expected, alternatives = mlp_numerical_semantics_fixture(dtype, numerical, activation)
+                with PrefillMoERuntime(ExpertStore({0: (w1,w2)}), expert_type="mlp",
+                        expert_activation=activation, numerical_mode=numerical, async_staging=self.default_async_staging,
+                        gpu_budget_bytes=16 << 20, pinned_budget_bytes=2 << 20) as runtime:
+                    actual = runtime.forward(x.cuda(), ids.cuda(), scale.cuda()).float().cpu()
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    for wrong in alternatives.values():
+                        self.assertFalse(torch.equal(actual, wrong))
+
+    def test_v3_context_mismatch_before_token_mutation(self):
+        store = MLPStoreTests().store()
+        major, minor = torch.cuda.get_device_capability()
+        config = OffloadConfig.from_store(store, expert_type="mlp", target_sm=major * 10 + minor,
+            gpu_budget_bytes=16 << 20, ram_budget_bytes=64 << 20, pinned_budget_bytes=2 << 20)
+        with PrefillMoERuntime.from_config(store, config) as runtime:
+            x = torch.zeros(7,64,device="cuda",dtype=torch.float16)
+            ids = torch.zeros(7,2,device="cuda",dtype=torch.int32)
+            scale = torch.ones(7,2,device="cuda")
+            before, version, stats = runtime.token.clone(), runtime.token._version, runtime.stats()
+            for position, code in ((23, 1), (24, 1), (25, 0), (25, -1), (25, 2)):
+                vector = list(config.layer_config(0)); vector[position] = code
+                manifest = (1, 2, 0, len(vector), *vector, 5, len(config.layer_config(5)), *config.layer_config(5))
+                with self.assertRaises(RuntimeError):
+                    torch.ops.recsys_ops.fuse_moe_offload(x, *store.layers[0], ids, scale, runtime.token, 0, vector, manifest)
+                torch.testing.assert_close(runtime.token, before, atol=0, rtol=0)
+                self.assertEqual(runtime.token._version, version)
+                self.assertEqual(runtime.stats(), stats)
+
+
 class InputBindingTests(unittest.TestCase):
     """CPU-only adapter contracts; never load native code or discover CUDA."""
 
@@ -5214,6 +5939,8 @@ if __name__ == "__main__":
     if "--async-staging" in sys.argv:
         sys.argv.remove("--async-staging")
         OffloadTests.default_async_staging = True
+        GEGLUTests.default_async_staging = True
+        MLPTests.default_async_staging = True
     program = None
     try:
         program = unittest.main(exit=False)

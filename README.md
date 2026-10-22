@@ -11,9 +11,10 @@
   tf32 性能不足**的问题——bf16 tensor core 算主项 + 低精度 tensor core 算
   residual 补偿项，以接近 bf16 的开销恢复接近 fp32 的精度，且在 epilogue
   融合执行 bias 相加与 silu/gelu 激活
-- **`fuse_moe`**：MoE FFN 前向融合（单 GPU），计数 / 路由重排 / gate_up
-  group GEMM / silu·mul / down group GEMM / topk 加权归约全部融合为 4 个
-  kernel，bf16/fp16 输入、fp32 累加
+- **`fuse_moe`**：MoE FFN 前向融合（单 GPU），默认 cp.async 路径将计数 / 路由
+  重排 / 上投影 group GEMM + 激活 / down group GEMM / topk 加权归约融合为
+  4 个 kernel；显式支持三矩阵 **GLU**（SwiGLU/GEGLU）与两矩阵 **普通 MLP**
+  （SiLU/GELU），bf16/fp16 输入、fp32 累加；offload 可在显存预算内流式加载 CPU 专家权重
 
 **亮点**
 
@@ -65,6 +66,8 @@
 - **gemm1 gate/up 配对融合**：同一 CTA 同时计算 W1 的 gate 与 up 两个 N
   面板（共享 X tile，装载量减半），epilogue 直接 `silu(gate)·up` 写
   act_out——免 `gate_up_out (T, 2I)` 物化与独立激活 kernel
+- **普通 MLP 单投影**：`expert_type="mlp"` 只计算 `act(W1·x)`，没有 up
+  投影和门控乘法；与 GLU 共用路由、down 和归约，默认路径同为 4 个 kernel
 - **跨 tile 连续流水**：slab 发射流全局计数，task（tile）边界不排空；
   scatter 行索引驻留寄存器滚动预取；激活全程 expert 有序 compact 布局
   （无 padded 空洞与预物化）
@@ -338,6 +341,9 @@ mixed **8.0e-3** vs bf16 1.2e-2；RMS 误差 **1.7e-3** vs 4.0e-3（低 2.3x）�
 
 ### fuse_moe（MoE FFN 前向融合，单 GPU）
 
+本节原有表格为 **GLU / SiLU / fused** 历史测量；普通 MLP 和 offload 的
+新测量采用独立环境与数值契约，见下方小节，不将两矩阵与三矩阵 FLOPS 混算。
+
 测试环境：RTX 5090D / PyTorch 2.6 / CUDA 12.8，bf16，均匀路由。sm120 上
 默认引擎为 cp.async 连续流水 kernel（各 shape 实测均优于 TMA 引擎
 3–15%）；`FUSE_MOE_TMA=1` 可选切换 TMA + mbarrier 引擎（16384 case
@@ -399,6 +405,110 @@ mixed **8.0e-3** vs bf16 1.2e-2；RMS 误差 **1.7e-3** vs 4.0e-3（低 2.3x）�
 - **PDL 串联**：count → gemm1 → gemm2 → reduce 四个 kernel 以
   Programmatic Dependent Launch 串联（sm89 自动退化为 stream 顺序）
 
+### 普通 MLP 与 GLU MoE（常驻 GPU，新基准）
+
+2026-10-21 实测：PyTorch **2.11.0+cu128 / CUDA 12.8**，bf16，exact-erf GELU，
+`numerical_mode="staged"`，默认 cp.async 引擎。4090D 平台为 Xeon Platinum
+8576C / PCIe 4.0 x16；5090D **v2** 平台为 EPYC 9K65 / PCIe 5.0 x16。
+主机及链路不同，offload 的跨机差异不能只归因于 GPU。下表固定
+`H=2048, I=1024, E=64, K=2`，只列变化的 S；均匀随机路由，每 token 选择
+两个不同专家，seed=42（后续 shape 顺次 +1）。
+
+两种结构都只有 2 次 group GEMM launch，但 **GLU 的 gemm1 计算 gate/up 两个
+投影，普通 MLP 只计算一个**。按 GEMM 乘加各计一次：GLU 为 `6*S*K*H*I`，
+MLP 为 `4*S*K*H*I`；bf16 全部专家权重分别为 **768 MiB / 512 MiB**。
+
+| GPU | S | 专家结构 | custom µs | eager µs | vs eager | custom TFLOPS |
+|---|---:|---|---:|---:|---:|---:|
+| 4090D | 128 | GLU（GEGLU） | 883.8 | 10719.6 | 12.13x | 3.6 |
+| 4090D | 128 | 普通 MLP | 601.7 | 9512.8 | 15.81x | 3.6 |
+| 4090D | 1024 | GLU（GEGLU） | 1008.2 | 11331.6 | 11.24x | 25.6 |
+| 4090D | 1024 | 普通 MLP | 676.5 | 10261.5 | 15.17x | 25.4 |
+| 4090D | 4096 | GLU（GEGLU） | 1227.0 | 11558.9 | 9.42x | 84.0 |
+| 4090D | 4096 | 普通 MLP | 855.5 | 10498.0 | 12.27x | 80.3 |
+| 5090D v2 | 128 | GLU（GEGLU） | 635.8 | 6934.6 | 10.91x | 5.1 |
+| 5090D v2 | 128 | 普通 MLP | 430.8 | 6833.9 | 15.86x | 5.0 |
+| 5090D v2 | 1024 | GLU（GEGLU） | 692.2 | 8215.3 | 11.87x | 37.2 |
+| 5090D v2 | 1024 | 普通 MLP | 470.4 | 7431.2 | 15.80x | 36.5 |
+| 5090D v2 | 4096 | GLU（GEGLU） | 768.5 | 8305.4 | 10.81x | 134.1 |
+| 5090D v2 | 4096 | 普通 MLP | 539.1 | 7553.1 | 14.01x | 127.5 |
+
+计时为预热后的 **CUDA event 批次平均**，取 5 轮的中位数，每轮 20 次预热、
+50 次计时；custom/eager 顺序轮转。eager 使用真实 `nn.Module` 逐专家
+`nonzero` 路由 + 低精度 `Linear` + 标准 dtype GELU/乘法 + FP32 `index_add`，
+包含全 E 扫描和数据依赖同步，不插入冗余激活类型转换；不等同于优化后的
+grouped-GEMM 或 compile 基线。TF32、reduced-precision reduction 和梯度均关闭。
+生成数据、CPU 参考、加载、编译及校验不计时。大 shape 性能运行对前 16 token
+做独立 CPU FP32 分阶段参考校验，并检查完整输出 shape/dtype/finite；完整
+GPU 数值矩阵、标量舍入见证和 masked/重复路由由测试套件另行验证。
+
+### MoE offload（CPU 权重，显式显存预算）
+
+使用同一数据与 GELU/staged 契约，`PrefillMoERuntime.forward`；不是 AOTI 计时。
+MoE context 预算 **GPU 128 MiB / RAM 2048 MiB / pinned 64 MiB**，
+`activation_mode="auto"`、route tile 自动选择，动态缓存关闭。
+进入 offload 测量前释放常驻 GPU 基线的权重；GPU 计费包含 context 的
+workspace/cache 与 live output，不包含 x、其它模型张量、allocator reserve 或驱动。
+**512/768 MiB 的专家权重均大于 128 MiB context 预算**，不是把全部权重常驻
+GPU 后仅更换 API 名称，也不是整卡 OOM 测试。
+
+下面全部是 **host wall-clock：forward + CUDA synchronize**，包含主机打包、
+路由、H2D、计算和返回前 drain；stats/校验在时钟外。冷调用为 5 个新 runtime
+各自第一次 forward 的中位数，初始化单列记录，不计入冷调用；稳态为同一
+runtime 20 次预热后 50 次调用的均值，取 5 轮中位数；P95 汇总 250 次调用。
+sync/async 顺序轮转，不并发占用同一 GPU。**不要直接用上表 GPU-event µs
+与下面 wall-clock ms 计算加速比**；这里额外给出同场景 resident wall-clock。
+
+**无缓存 / 均匀路由**（每次都重新搬运活跃专家权重）：
+
+| GPU | S | 结构 | H2D MiB/调用 | resident wall ms | 冷调用 async ms | 稳态 sync ms | 稳态 async ms | async P95 ms |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| 4090D | 128 | GLU | 744 | 0.919 | 63.824 | 58.434 | 62.031 | 63.175 |
+| 4090D | 128 | MLP | 496 | 0.632 | 39.101 | 38.371 | 38.350 | 38.821 |
+| 4090D | 1024 | GLU | 768 | 1.038 | 60.901 | 59.105 | 60.834 | 75.004 |
+| 4090D | 1024 | MLP | 512 | 0.712 | 40.157 | 40.102 | 39.647 | 41.186 |
+| 4090D | 4096 | GLU | 768 | 1.256 | 61.022 | 60.684 | 59.972 | 61.641 |
+| 4090D | 4096 | MLP | 512 | 0.890 | 40.687 | 39.871 | 40.298 | 42.512 |
+| 5090D v2 | 128 | GLU | 744 | 0.653 | 41.443 | 39.344 | 40.057 | 40.447 |
+| 5090D v2 | 128 | MLP | 496 | 0.448 | 27.915 | 26.105 | 25.846 | 26.593 |
+| 5090D v2 | 1024 | GLU | 768 | 0.712 | 42.477 | 40.055 | 40.527 | 41.441 |
+| 5090D v2 | 1024 | MLP | 512 | 0.491 | 28.774 | 26.996 | 27.036 | 27.948 |
+| 5090D v2 | 4096 | GLU | 768 | 0.794 | 42.166 | 40.816 | 40.658 | 41.396 |
+| 5090D v2 | 4096 | MLP | 512 | 0.568 | 28.444 | 27.135 | 26.240 | 27.924 |
+
+- S=128 实际活跃 62 个专家，故不是全 64 专家的 H2D；S=1024/4096 均活跃 64 个。
+- 实际均用 2 banks，GLU 每 wave 容量 2、MLP 容量 3；wave 数分别为
+  31/32/32 与 21/22/22。context GPU 峰值 **49.53–96.93 MiB**；初始化
+  **1.17–1.47 ms**（sync/async 均在原始 JSON 中记录）。
+- 该组主要受 CPU 打包与权重传输限制；MLP 搬运字节为 GLU 的 2/3。
+  **异步 staging 不保证加速**，此处部分形状更慢，P95 也可能更高，未择优隐藏。
+
+**静态热集命中**：仅路由到 experts 0/1，两者预先常驻，其余 62 个专家仍在 CPU。
+静态缓存 GLU **24 MiB**、MLP **16 MiB**，每次 forward 的权重 H2D **0 B**，
+实际 transfer banks=0，resident wave=1；它是缓存命中场景，**不能代表均匀路由**。
+
+| GPU | S | 结构 | resident wall ms | 冷调用 async ms | 稳态 sync ms | 稳态 async ms | async P95 ms |
+|---|---:|---|---:|---:|---:|---:|---:|
+| 4090D | 128 | GLU | 0.134 | 0.424 | 0.153 | 0.154 | 0.164 |
+| 4090D | 128 | MLP | 0.106 | 0.423 | 0.126 | 0.126 | 0.139 |
+| 4090D | 1024 | GLU | 0.427 | 0.724 | 0.448 | 0.450 | 0.462 |
+| 4090D | 1024 | MLP | 0.315 | 0.618 | 0.337 | 0.337 | 0.347 |
+| 4090D | 4096 | GLU | 0.884 | 1.297 | 0.907 | 0.907 | 0.914 |
+| 4090D | 4096 | MLP | 0.634 | 1.058 | 0.649 | 0.650 | 0.661 |
+| 5090D v2 | 128 | GLU | 0.069 | 0.436 | 0.081 | 0.081 | 0.093 |
+| 5090D v2 | 128 | MLP | 0.057 | 0.493 | 0.072 | 0.072 | 0.082 |
+| 5090D v2 | 1024 | GLU | 0.320 | 0.778 | 0.336 | 0.336 | 0.340 |
+| 5090D v2 | 1024 | MLP | 0.234 | 0.646 | 0.250 | 0.251 | 0.256 |
+| 5090D v2 | 4096 | GLU | 0.606 | 1.257 | 0.629 | 0.628 | 0.635 |
+| 5090D v2 | 4096 | MLP | 0.431 | 1.008 | 0.452 | 0.452 | 0.461 |
+
+context GPU 峰值 **18.01–88.07 MiB**；初始化（含静态权重上传）**2.31–3.51 ms**，
+未混入稳态时间。原始证据已保留在本地
+`artifacts/moe_structures_sm89_20261021/` 与 `artifacts/moe_structures_sm120_20261021/`
+的 `storage_{uniform,hotset}_bf16_gelu_staged_review1.json`，含库/脚本 SHA256、
+5 轮 raw samples、冷调用/初始化、参考校验及逐次 H2D/预算统计（artifacts 不随源码提交）。
+复现入口见 [Benchmark](#benchmark)。
+
 ## 环境要求
 
 - NVIDIA GPU：sm120（RTX 5090D，FA TMA 主路径与 mixed_gemm sm120a TMA 路径
@@ -444,7 +554,7 @@ w_high, w_low, w_scale = split_mixed_precision_weight(w)  # 模型加载时一�
 y = ops.mixed_gemm(x, w_high, w_low, w_scale, bias=b,
                    activation="silu")                   # fp32 输出，精度 ≈ fp32
 
-# ── MoE FFN：y[s] = Σ_j scale[s,j]·(Down_ej @ silu(GateUp_ej @ x[s])) ─
+# ── 默认 SwiGLU MoE：down(silu(gate(x)) * up(x))，再 topk 加权 ───────
 S, H, I, E, K = 4096, 2048, 1024, 8, 2
 x  = torch.randn(S, H, device="cuda", dtype=torch.bfloat16)
 w1 = torch.randn(E, 2 * I, H, device="cuda", dtype=torch.bfloat16) * 0.05
@@ -453,6 +563,12 @@ topk_ids   = torch.randint(0, E, (S, K), device="cuda", dtype=torch.int32)
 topk_scale = torch.rand(S, K, device="cuda")            # fp32 加权
 
 y = ops.fuse_moe(x, w1, w2, topk_ids, topk_scale)       # (S, H) bf16
+
+# 普通两矩阵 GELU MLP MoE：down(gelu(w1(x)))，没有 up 投影
+w1_mlp = torch.randn(E, I, H, device="cuda", dtype=x.dtype) * 0.05
+y_mlp = ops.fuse_moe(x, w1_mlp, w2, topk_ids, topk_scale,
+                     expert_type="mlp", expert_activation="gelu",
+                     numerical_mode="staged")
 ```
 
 > dtype 约定：fp16 全架构可用（sm70 / sm89 / sm120）；bf16 仅 SM80+（V100 无
@@ -509,23 +625,52 @@ FP8 后端可用性（编译期 CUDA >= 12.4 且 GPU 为 SM89+）。
 - `K % 8 == 0`
 - FP8 后端需 SM89+；INT8 后端需 SM80+
 
-### `ops.fuse_moe(x, gate_up_weight, down_weight, topk_ids, topk_scale) -> Tensor`
+### `ops.fuse_moe(x, gate_up_weight, down_weight, topk_ids, topk_scale, backend=None, *, expert_activation="silu", numerical_mode="fused", expert_type="glu") -> Tensor`
 
-MoE FFN 前向融合：
-`y[s] = Σ_j topk_scale[s,j] · (Down_{e_j} @ silu(GateUp_{e_j} @ x[s]))`。
-count / 路由重排 / 两个 group GEMM / 激活 / topk 加权归约全部融合为
-4 个 kernel，bf16/fp16 输入、fp32 累加。
+`expert_type` 显式选择专家拓扑，不按激活函数或权重形状静默推断：
+
+- `"glu"`（默认）：`y[s] = Σ_j scale[s,j] · Down_e(act(Gate_e·x[s]) · (Up_e·x[s]))`，
+  三矩阵门控 FFN；gemm1 同时计算 gate/up 两路投影。
+- `"mlp"`：`y[s] = Σ_j scale[s,j] · Down_e(act(W1_e·x[s]))`，
+  普通两矩阵 FFN；gemm1 只计算一路投影，不做门控乘法。
+
+`expert_activation="silu"|"gelu"` 对两种拓扑均适用；GLU 对应 SwiGLU/GEGLU，
+MLP 对应 SiLU/GELU MLP。GELU 为 exact erf（`F.gelu(approximate="none")`），
+不回退 tanh 近似。默认 cp.async 路径两种拓扑均融合为 4 个 kernel，
+只有 2 次 group GEMM launch；可选 TMA 路径包含 gather 和独立激活，共 6 个 kernel。
 
 | 参数 | shape | 说明 |
 |---|---|---|
 | `x` | (S, H) | bf16 / fp16，token 序 |
-| `gate_up_weight` | (E, 2I, H) | 与 x 同 dtype（gate 在前 up 在后） |
+| `gate_up_weight` | GLU (E, 2I, H) / MLP (E, I, H) | 与 x 同 dtype；GLU gate 在前 up 在后，MLP 单投影 |
 | `down_weight` | (E, H, I) | 与 x 同 dtype |
-| `topk_ids` | (S, K) | int32，取值 ∈ [0, E) |
-| `topk_scale` | (S, K) | fp32，topk 加权系数 |
+| `topk_ids` | (S, K) | 连续 int32，非负值 ∈ [0, E)；-1 masked 槽位整条忽略 |
+| `topk_scale` | (S, K) | 连续 fp32，topk 加权系数，调用前不要降精度 |
 | 返回 | (S, H) | 与 x 同 dtype |
 
-限制：`H % 64 == 0`、`I % 64 == 0`、`K <= 128`、`E <= 512`、SM80+。
+限制：输入均为连续 CUDA Tensor，`S/H/I > 0`、`H % 64 == 0`、`I % 64 == 0`、
+`1 <= K <= 128`、`1 <= E <= 512`、SM80+；x/gate_up/down dtype 相同。
+
+- `numerical_mode="fused"` 在 FP32 投影后融合激活（GLU 还融合乘积），再 round；
+  `"staged"` 对投影、激活、GLU 乘积、down、加权积逐级 round 到输出 dtype，再
+  FP32 累加。MLP 没有 up 或乘积阶段。它只定义前向舍入，**不提供反向传播，
+  也不承诺 bitwise 一致**。
+- 三个选择参数仅接受精确字符串，不能用整数、布尔值或大小写变体。
+- GLU 的 gate/up 各为 `(E,I,H)`，沿 dim=1 按 gate 在前、up 在后拼成
+  `(E,2I,H)`；MLP 使用单个 `(E,I,H)` 的 W1，并传 `expert_type="mlp"`。
+  两种拓扑的 down 均为 `(E,H,I)`；展平或转置源布局由调用方显式转换。
+- offload 在 `OffloadConfig` 中冻结 `expert_type`、`expert_activation` 和
+  `numerical_mode`；`activation_mode` 只选择缓冲/累加策略。GLU 默认 silu/fused
+  为 v1（23 固定字段），非默认为 v2（25 固定字段，模式码在 23/24）；MLP
+  始终为 v3（26 固定字段，类型码 1 在 25，resident IDs 从 26 起）。外层 manifest
+  framing=1、权重 archive format=2 不变。新 native schema 需成套重建
+  `.so/.so.json/.pt2/weights.pt`，旧二进制不能直接混用。
+- TileLang 支持 GLU/MLP 与 masked 路由防护，exact erf 不可用时显式失败。
+  旧 GLU/fused 保留 TileLang FP32 down/加权行为；新 MLP 两种模式均保留 native
+  down 舍入边界。staged 的逐级契约跨后端一致，仍按容差对拍。
+
+[GEGLU 开发记录](docs/MOE_GEGLU_EXTENSION.md) 保留此前 GLU 扩展的数值契约与
+验收记录；其中旧的“普通 MLP 不在契约内”范围说明已被本节 `expert_type="mlp"` 取代。
 
 ### `split_mixed_precision_weight(w, scale=1/256, backend="auto") -> (w_high, w_low, w_scale)`
 
@@ -554,9 +699,11 @@ python examples/basic_usage.py        # 最小示例：调用 + 与 SDPA 校验
 python examples/custom_mask_demo.py   # 4 种典型 mask：causal / 滑窗 / padding / 随机稀疏
 python examples/gqa_example.py        # GQA：无需扩展 K/V 头
 python examples/mixed_gemm_demo.py    # 混合精度 GEMM：权重拆分 + epilogue 融合 + 精度对比
-python examples/fuse_moe_demo.py      # 融合 MoE：Mixtral 风格前向 + 数值校验 + vs eager 性能对比
-python examples/swiglu_demo.py      # SwiGLU：Llama 风格 FFN 激活 + vs eager 性能对比
-python tests/test_fuse_moe.py         # fuse_moe：21 用例正确性（含单专家/稀疏/重复路由）
+python examples/fuse_moe_demo.py      # GLU MoE：前向 + 数值校验 + vs eager
+python examples/fuse_moe_demo.py --expert-type mlp --expert-activation gelu --numerical-mode staged
+python examples/fuse_moe_offload_demo.py --jit --expert-type mlp   # 开发示例；部署改为 --ops-library
+python examples/swiglu_demo.py        # SwiGLU：FFN 激活 + vs eager
+python tests/test_fuse_moe.py         # GLU/MLP × 两激活 × 两舍入模式，含 masked/重复路由
 ```
 
 ## Benchmark
@@ -590,9 +737,41 @@ python benchmark/benchmark_mixed_gemm.py                       # 后端 auto（F
 python benchmark/benchmark_mixed_gemm.py --backend int8        # 指定 residual 后端
 python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
 
-# fuse_moe：对比 PyTorch eager / torch.compile / compile+reduce-overhead（CUDA graph）
+# fuse_moe：历史 GLU 基准，eager / torch.compile / compile+reduce-overhead
 python benchmark/benchmark_fuse_moe.py
 ```
+
+**普通 MLP / GLU 与 offload 的统一基准**（独立于上面的 legacy suite）：
+先离线构建当前 schema 的生产库，`8.9` 对应 SM89，SM120 改为 `12.0a`：
+
+```bash
+python examples/fuse_moe_offload_aoti.py build-native --arch 8.9 --output-dir artifacts/moe_native
+export MOE_SO="$PWD/artifacts/moe_native/recsys_fuse_moe_kernel.so"
+mkdir -p artifacts/moe_benchmark
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
+
+# 常驻 GPU + 无缓存 offload：实际权重在 CPU，每次搬运活跃专家
+python benchmark/benchmark_fuse_moe.py --suite storage --ops-library "$MOE_SO" \
+  --expert-types glu mlp --expert-activation gelu --numerical-mode staged --dtype bf16 \
+  --shapes 128,2048,1024,64,2 1024,2048,1024,64,2 4096,2048,1024,64,2 \
+  --offload --gpu-budget-mib 128 --ram-budget-mib 2048 --pinned-budget-mib 64 \
+  --offload-cache disabled --routing uniform --offload-staging sync async \
+  --seed 42 --repeats 5 --warmup 20 --iters 50 --json artifacts/moe_benchmark/uniform.json
+
+# 静态热集缓存：仅 experts 0/1 常驻；其余 62 个专家权重仍留在 CPU
+python benchmark/benchmark_fuse_moe.py --suite storage --ops-library "$MOE_SO" \
+  --expert-types glu mlp --expert-activation gelu --numerical-mode staged --dtype bf16 \
+  --shapes 128,2048,1024,64,2 1024,2048,1024,64,2 4096,2048,1024,64,2 \
+  --offload --gpu-budget-mib 128 --ram-budget-mib 2048 --pinned-budget-mib 64 \
+  --offload-cache static_hot --routing hotset --offload-staging sync async \
+  --seed 42 --repeats 5 --warmup 20 --iters 50 --json artifacts/moe_benchmark/hotset.json
+```
+
+省略 `--offload`（同时省略预算/cache/staging 参数）可只测常驻 GPU。
+`--expert-types mlp` 可只测普通 MLP，SiLU 或 fused 通过显式参数选择；eager
+基线始终采用标准分阶段舍入，因此本页公平对照使用 staged。JSON 排他创建，
+重复运行请使用新输出路径；保存库/脚本哈希、原始计时、参考校验和逐调用 offload
+统计。计时前清除 `FUSE_MOE_*` 等诊断/调优环境变量；诊断结果不能当性能数据。
 
 ## 仓库结构
 

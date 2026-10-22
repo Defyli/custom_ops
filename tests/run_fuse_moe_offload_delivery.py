@@ -51,6 +51,33 @@ MEMCHECK = ("FaultInjectionTests", "ManagedRuntimeTests",
 SYNCCHECK = ("OffloadTests.test_activation_modes_tiled_signed_routes",
              "OffloadTests.test_adaptive_signed_masked_dtypes_and_activation_selection",
              "OffloadTests.test_inference_mode_and_nondefault_stream")
+GEGLU_SANITIZER_TARGETS = (
+    "GEGLUTests.test_full_gpu_four_mode_dtype_matrix",
+    "GEGLUTests.test_isolated_scalar_semantics_wide_n_atomic",
+    "GEGLUTests.test_offload_route_fp32_cache_and_partial_tiles",
+    "GEGLUTests.test_multi_context_modes_do_not_leak",
+    "GEGLUTests.test_native_v1_v2_contract_and_failure_before_token_mutation",
+    "GEGLUTests.test_masked_topk_and_zero_sequence",
+)
+MLP_SANITIZER_TARGETS = (
+    "MLPTests.test_dual_dtype_four_modes_sync_async_cache_mask_signed_duplicate_edges",
+    "MLPTests.test_scalar_activation_and_stage_witnesses",
+    "MLPTests.test_v3_context_mismatch_before_token_mutation",
+)
+AOTI_CPU_CONTRACTS = (
+    "test_mlp_v3_reference_archive_create_cpu_contract",
+    "test_explicit_expert_modes_v2_config_cpu_contract",
+    "test_geglu_staged_reference_cpu_contract",
+    "test_prefill_create_explicit_mode_arguments_cpu_contract",
+    "test_geglu_metrics_cpu_contract",
+)
+GEGLU_PRECISIONS = ("fp16", "bf16")
+GEGLU_PERFORMANCE_PROFILE = "small"
+GEGLU_PERFORMANCE_SCENARIO = "uniform"
+GEGLU_PERFORMANCE_CASE = "fp32_accumulate/bank2/disabled"
+GEGLU_PERFORMANCE_PRECISION = "bf16"
+GEGLU_PERFORMANCE_MODES = (("silu", "fused"), ("gelu", "fused"),
+                           ("silu", "staged"), ("gelu", "staged"))
 BUILD_CODE = (
     "import sys; from custom_ops.recsys import FuseMoeOps; "
     "print(FuseMoeOps(allow_jit=False).build(sys.argv[1], "
@@ -242,10 +269,18 @@ def parser_for_cli():
     parser.add_argument("--performance-cases", nargs="+", choices=ALL_PERFORMANCE_CASES,
                         default=list(PERFORMANCE_CASES),
                         help="Locked subsets (default: four fp32/bank2 caches plus route_buffer/bank1/disabled)")
+    parser.add_argument("--geglu-performance-matrix", action=argparse.BooleanOptionalAction, default=True,
+                        help="Additional representative BF16 locked four-mode ABBA matrix (default on)")
     parser.add_argument("--performance-cpp", action="store_true",
                         help="Also run locked C++ for one cache case each, sync/async, weight_transfer/hotset_transition")
     parser.add_argument("--performance-trace", action=argparse.BooleanOptionalAction, default=True,
                         help="Independent mandatory Nsight CUDA/NVTX trace (default on); omission is recorded")
+    parser.add_argument("--benchmark-activation", choices=("silu", "gelu"), default="silu",
+                        help="Explicit expert nonlinearity passed to locked benchmark wrapper (default silu)")
+    parser.add_argument("--benchmark-numerical-mode", choices=("fused", "staged"), default="fused",
+                        help="Explicit numerical contract passed to locked benchmark wrapper (default fused)")
+    parser.add_argument("--benchmark-precision", choices=("fp16", "bf16"), default="fp16",
+                        help="Explicit weight/input storage dtype passed to locked benchmark wrapper (default fp16)")
     parser.add_argument("--omp-num-threads", type=int,
                         help="Explicit child OMP_NUM_THREADS; otherwise preserve the caller setting")
     for stage in STAGES:
@@ -295,6 +330,10 @@ class Delivery:
                            run_dir=str(self.run_dir), argv=sys.argv[1:],
                            settings=dict(target_arch=args.target_arch, jobs=args.jobs,
                                          wide_bf16=not args.no_wide_bf16,
+                                         benchmark_activation=getattr(args, "benchmark_activation", "silu"),
+                                         benchmark_numerical_mode=getattr(args, "benchmark_numerical_mode", "fused"),
+                                         benchmark_precision=getattr(args, "benchmark_precision", "fp16"),
+                                         geglu_performance_matrix=getattr(args, "geglu_performance_matrix", True),
                                          timeouts={s: getattr(args, s + "_timeout") for s in STAGES},
                                          environment={k: self.env.get(k) for k in (
                                              "MAX_JOBS", "OMP_NUM_THREADS", "CUDA_VISIBLE_DEVICES",
@@ -492,6 +531,10 @@ class Delivery:
                     ["-v"], unittest=True)
         self.python("unit", "delivery_cpu", ROOT / "tests/test_fuse_moe_offload_delivery.py",
                     ["-v"], unittest=True)
+        self.python("unit", "geglu_aoti_contracts_cpu", AOTI,
+                    ["--cpu-contracts", *AOTI_CPU_CONTRACTS])
+        self.python("unit", "tilelang_host_contracts_cpu", ROOT / "tests/test_tilelang_ops.py",
+                    ["--cpu-only"], unittest=True)
         library = self.library("unit", "testing")
         if library:
             for mode in ("sync", "async"):
@@ -510,11 +553,94 @@ class Delivery:
             self.unmet("unit", "Legacy test_fuse_moe.py needs a public --ops-library CLI; "
                        "baseline not run (no JIT or monkeypatch fallback)")
         elif production:
-            entry = self.python("unit", "legacy_baseline", BASELINE, ["--ops-library", production])
-            text = Path(entry["stdout"]).read_text(encoding="utf-8", errors="replace")
-            if entry["state"] == "passed" and ("skipping" in text.lower() or "[SKIP]" in text):
-                entry.update(state="unmet", error="Legacy baseline reported a skip, not acceptance")
-                self.save()
+            baseline_report = self.run_dir / "full_gpu_accuracy.json"
+            entry = self.python("unit", "legacy_baseline", BASELINE,
+                                ["--ops-library", production, "--accuracy-report", "--json", baseline_report])
+            self.baseline_evidence(entry, baseline_report)
+
+    def baseline_evidence(self, entry, report_path):
+        if entry["state"] != "passed":
+            return
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            summary = report["summary"]
+            if (report["gpu"]["state"] != "passed" or summary["state"] != "passed"
+                    or summary["matrix_cases"] <= 0 or summary["matrix_failed"] != 0
+                    or summary["matrix_passed"] != summary["matrix_cases"]
+                    or summary["cpu_and_gpu_checks"]["FAIL"] != 0):
+                raise ValueError("GPU matrix missing, skipped or failed")
+            entry.update(accuracy_report=str(report_path), accuracy_report_sha256=sha256(report_path),
+                         matrix_cases=summary["matrix_cases"])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            entry.update(state="unmet", error="Invalid full-GPU baseline evidence: " + str(error))
+            self.unmet("unit", entry["error"])
+        self.save()
+
+    def geglu_evidence(self, entry, directory, precision, expert_type="glu"):
+        suite = "mlp" if expert_type == "mlp" else "geglu"
+        if entry["state"] != "passed":
+            return None
+        try:
+            report_path = directory / f"{suite}_report.json"
+            exit_path = directory / "acceptance.exit.json"
+            package_path = directory / f"{suite}_chain_{precision}.pt2"
+            archive_path = directory / f"{suite}_weights_{precision}.pt"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            exit_report = json.loads(exit_path.read_text(encoding="utf-8"))
+            if exit_report.get("state") != "passed" or exit_report.get("returncode") != 0:
+                raise ValueError("GEGLU acceptance exit report did not pass")
+            expected = dict(schema_version=1, state="passed", archive_format_version=2,
+                            manifest_framing=1, precision=precision,
+                            expert_activation="gelu", numerical_mode="staged",
+                            package=str(package_path.resolve()), archive=str(archive_path.resolve()))
+            if any(report.get(key) != value for key, value in expected.items()):
+                raise ValueError("GEGLU report metadata or mode contract mismatch")
+            if not package_path.is_file() or not archive_path.is_file():
+                raise ValueError("GEGLU package or archive artifact missing")
+            if report.get("expert_type", "glu") != expert_type:
+                raise ValueError("Expert type report mismatch")
+            config = report["config"]
+            if config.get("expert_type", "glu") != expert_type:
+                raise ValueError("Frozen expert_type mismatch")
+            if (config.get("async_staging") is not True or config.get("host_profile") is not True
+                    or config.get("expert_activation") != "gelu" or config.get("numerical_mode") != "staged"):
+                raise ValueError("GEGLU frozen config flags/modes mismatch")
+            layer_configs = report.get("layer_configs", {})
+            if set(layer_configs) != {"0", "5"}:
+                raise ValueError("GEGLU layer_configs must contain layers 0 and 5")
+            for vector in layer_configs.values():
+                fixed = 26 if expert_type == "mlp" else 25
+                if (not isinstance(vector, list) or len(vector) < fixed or
+                        len(vector) != fixed + vector[21] or vector[0] != (3 if expert_type == "mlp" else 2) or
+                        vector[23:25] != [1, 1] or (expert_type == "mlp" and vector[25] != 1)):
+                    raise ValueError("GEGLU layer_config v2 header/mode codes mismatch")
+            python_cases = report.get("python_cases", [])
+            cpp_cases = report.get("cpp_cases", [])
+            if len(python_cases) != 10 or len(cpp_cases) != 4:
+                raise ValueError("GEGLU Python/C++ sample counts mismatch")
+            if [case.get("S") for case in cpp_cases] != [2, 7, 64, 2]:
+                raise ValueError("GEGLU C++ dynamic S sequence mismatch")
+            for case in cpp_cases:
+                if (case.get("expert_type", "glu") != expert_type or case.get("precision") != precision
+                        or case.get("expert_activation") != "gelu"
+                        or case.get("numerical_mode") != "staged"
+                        or case.get("python_uninitialized") is not True
+                        or case.get("strict_no_jit") is not True
+                        or case.get("token_checked") is not True
+                        or case.get("status_checked") is not True
+                        or case.get("reference_checked") is not True
+                        or case.get("async_staging_enabled") is not True
+                        or case.get("host_profile_enabled") is not True):
+                    raise ValueError("GEGLU C++ child contract flags mismatch")
+            entry.update(geglu_report=str(report_path), geglu_report_sha256=sha256(report_path),
+                         package=str(package_path), package_sha256=sha256(package_path),
+                         archive=str(archive_path), archive_sha256=sha256(archive_path))
+            self.save()
+            return report
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            entry.update(state="unmet", error="Invalid GEGLU AOTI evidence: " + str(error))
+            self.unmet("aoti", "Invalid GEGLU AOTI evidence for " + entry["label"] + ": " + str(error))
+            return None
 
     def aoti(self):
         production = self.library("aoti", "prod")
@@ -527,6 +653,30 @@ class Delivery:
             else:
                 self.report["stages"]["aoti"]["wide_bf16"] = dict(state="required")
             self.python("aoti", "aoti_full_prod", AOTI, options)
+            geglu_records = {}
+            for precision in GEGLU_PRECISIONS:
+                geglu_dir = self.run_dir / f"aoti/geglu_{precision}_prod"
+                geglu_options = ["--ops-library", production, "--geglu-only",
+                                 "--geglu-precision", precision, "--output-dir", geglu_dir,
+                                 "--sizes", 2, 7, 64, "--async-staging", "--host-profile"]
+                entry = self.python("aoti", f"aoti_geglu_{precision}_prod", AOTI, geglu_options)
+                report = self.geglu_evidence(entry, geglu_dir, precision)
+                geglu_records[precision] = dict(
+                    state=entry["state"], output_dir=str(geglu_dir),
+                    report=entry.get("geglu_report"), package=entry.get("package"),
+                    archive=entry.get("archive"), validated=report is not None)
+            mlp_records = {}
+            for precision in GEGLU_PRECISIONS:
+                directory = self.run_dir / f"aoti/mlp_{precision}_prod"
+                entry = self.python("aoti", f"aoti_mlp_{precision}_prod", AOTI,
+                    ["--ops-library", production, "--mlp-only", "--mlp-precision", precision,
+                     "--output-dir", directory, "--sizes", 2, 7, 64, "--async-staging", "--host-profile"])
+                report = self.geglu_evidence(entry, directory, precision, expert_type="mlp")
+                mlp_records[precision] = dict(state=entry["state"], output_dir=str(directory),
+                    package=entry.get("package"), archive=entry.get("archive"), validated=report is not None)
+            self.report["stages"]["aoti"]["mlp"] = mlp_records
+            self.report["stages"]["aoti"]["geglu"] = geglu_records
+            self.save()
         testing = self.library("aoti", "testing")
         if testing:
             self.python("aoti", "aoti_public_testing", AOTI,
@@ -626,6 +776,19 @@ class Delivery:
                                          [*flags, sys.executable, str(OFFLOAD), *options], unittest=True)
                     self.sanitizer_result(entry)
             self.native_fault_leaks(tool, library)
+            production = self.library("sanitizer", "prod")
+            if production:
+                for mode in ("sync", "async"):
+                    options = ["--ops-library", str(production), "-v", *GEGLU_SANITIZER_TARGETS]
+                    if mode == "async":
+                        options.append("--async-staging")
+                    entry = self.command(
+                        "sanitizer", "geglu_memcheck_" + mode,
+                        [tool, "--tool", "memcheck", "--leak-check", "no",
+                         "--error-exitcode", "99", "--target-processes", "all",
+                         sys.executable, str(OFFLOAD), *options],
+                        unittest=True)
+                    self.sanitizer_result(entry)
             if self.args.python_full_leak_check:
                 diagnostic_entries = []
                 for mode in ("sync", "async"):
@@ -651,11 +814,19 @@ class Delivery:
                         env={"PYTORCH_CUDA_ALLOC_CONF": "backend:cudaMallocAsync",
                              "PYTORCH_ALLOC_CONF": "backend:cudaMallocAsync"})
 
-    def locked_options(self, library, directory, profile, scenario, case, mode, *, diagnostic=False, cpp=False):
+    def locked_options(self, library, directory, profile, scenario, case, mode, *,
+                       diagnostic=False, cpp=False, contract=None):
+        activation, numerical, precision = contract or (
+            getattr(self.args, "benchmark_activation", "silu"),
+            getattr(self.args, "benchmark_numerical_mode", "fused"),
+            getattr(self.args, "benchmark_precision", "fp16"))
         options = ["--benchmark-locked", "--ops-library", library, "--output-dir", directory,
                    "--benchmark-profile", profile, "--benchmark-scenario", scenario,
                    "--benchmark-case", case, "--benchmark-route-tile-rows", "auto",
                    "--benchmark-tile-m", 0, "--benchmark-tile-n", 128,
+                   "--benchmark-activation", activation,
+                   "--benchmark-numerical-mode", numerical,
+                   "--benchmark-precision", precision,
                    "--iterations", 40]
         if mode == "async":
             options.append("--async-staging")
@@ -665,7 +836,8 @@ class Delivery:
             options.extend(["--host-profile", "--nvtx"])
         return options
 
-    def locked_evidence(self, entry, directory, profile, scenario, case, mode, *, diagnostic=False, cpp=False):
+    def locked_evidence(self, entry, directory, profile, scenario, case, mode, *,
+                        diagnostic=False, cpp=False, contract=None):
         if entry["state"] != "passed":
             return []
         try:
@@ -687,6 +859,24 @@ class Delivery:
                 if any(record.get(key) != value for key, value in expected.items()):
                     raise ValueError("Locked report case identity mismatch")
                 fields = record["frozen_config"]["fields"]
+                expert_activation, numerical_mode, precision = contract or (
+                    getattr(self.args, "benchmark_activation", "silu"),
+                    getattr(self.args, "benchmark_numerical_mode", "fused"),
+                    getattr(self.args, "benchmark_precision", "fp16"))
+                if (record.get("expert_activation") != expert_activation
+                        or record.get("numerical_mode") != numerical_mode
+                        or record.get("precision") != precision
+                        or fields.get("expert_activation") != expert_activation
+                        or fields.get("numerical_mode") != numerical_mode):
+                    raise ValueError("Locked expert activation/numerical/dtype contract mismatch")
+                vector = record["frozen_config"]["layer_config"]
+                fixed = 23 if vector[0] == 1 else 25 if vector[0] == 2 else 0
+                if (not fixed or len(vector) != fixed + vector[21]
+                        or vector[20] != int(precision == "bf16")):
+                    raise ValueError("Locked frozen vector version/dtype mismatch")
+                codes = (0, 0) if vector[0] == 1 else tuple(vector[23:25])
+                if codes != (int(expert_activation == "gelu"), int(numerical_mode == "staged")):
+                    raise ValueError("Locked frozen vector expert mode codes mismatch")
                 if fields["async_staging"] is not (mode == "async"):
                     raise ValueError("Frozen async configuration mismatch")
                 if not diagnostic and record["timing_kind"] != "normal_wall":
@@ -717,12 +907,17 @@ class Delivery:
         groups = {}
         for run in runs:
             record = run["report"]
-            key = (record["profile"], record["scenario"], record["case_key"], record["backend"])
+            if record.get("timing_kind") != "normal_wall":
+                self.unmet("performance", "Diagnostic or unspecified timing cannot enter ABBA summary")
+                continue
+            key = (record["profile"], record["scenario"], record["case_key"], record["backend"],
+                   record["expert_activation"], record["numerical_mode"], record["precision"], record.get("expert_type", "glu"))
             groups.setdefault(key, []).append(run)
         comparisons = []
         for key, records in sorted(groups.items()):
             modes = {mode: [r for r in records if r["mode"] == mode] for mode in ("sync", "async")}
-            item = dict(zip(("profile", "scenario", "case", "backend"), key))
+            item = dict(zip(("profile", "scenario", "case", "backend",
+                             "expert_activation", "numerical_mode", "precision", "expert_type"), key))
             item.update(state="complete" if all(len(modes[m]) == 2 for m in modes) else "incomplete",
                         runs=[dict(mode=r["mode"], order=r["order"], path=r["path"], sha256=r["sha256"],
                                    raw=r["report"]["raw"], frozen_config=r["report"]["frozen_config"])
@@ -743,8 +938,10 @@ class Delivery:
                     self.unmet("performance", "ABBA frozen fields differ for " + str(key))
                 else:
                     for phase in ("initialization", "cold", "warm"):
-                        values = {mode: [sample["host_ms"] for run in modes[mode]
-                                         for sample in run["report"]["raw"][phase]] for mode in modes}
+                        values = {mode: [sample["host_ms"] if isinstance(sample, dict) else sample
+                                         for run in modes[mode] for sample in run["report"]["raw"].get(
+                                             phase, run["report"]["raw"].get(phase + "_ms", []))]
+                                  for mode in modes}
                         medians = {mode: statistics.median(values[mode]) for mode in modes}
                         item["phases"][phase] = dict(samples_ms=values, pooled_median_ms=medians,
                                                      sync_over_async_median=medians["sync"] / medians["async"])
@@ -754,7 +951,7 @@ class Delivery:
             comparisons.append(item)
         path = self.run_dir / "bench" / "performance_summary.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_json(path, dict(schema_version=1, synthetic=True,
+        write_json(path, dict(schema_version=2, synthetic=True,
                              note="Process-level ABBA; unpaired pooled samples. Ratios are descriptive, "
                                   "not model speedup or confidence claims; no cross-profile aggregation.",
                              comparisons=comparisons))
@@ -810,6 +1007,39 @@ class Delivery:
             self.unmet("performance", "CUDA/CUPTI timeline incomplete: " + str(error))
         self.save()
 
+    def geglu_performance(self, library, runs):
+        record = self.report["stages"]["performance"]
+        if not getattr(self.args, "geglu_performance_matrix", True):
+            record["geglu_matrix"] = dict(state="skipped", reason="--no-geglu-performance-matrix")
+            self.save()
+            return
+        profile, scenario, case = (GEGLU_PERFORMANCE_PROFILE,
+                                   GEGLU_PERFORMANCE_SCENARIO, GEGLU_PERFORMANCE_CASE)
+        record["geglu_matrix"] = dict(state="running", profile=profile, scenario=scenario,
+                                      case=case, precision=GEGLU_PERFORMANCE_PRECISION,
+                                      modes=GEGLU_PERFORMANCE_MODES,
+                                      note="Representative synthetic offload case; not P01-P05 full-GPU performance")
+        entries = []
+        for activation, numerical in GEGLU_PERFORMANCE_MODES:
+            contract = (activation, numerical, GEGLU_PERFORMANCE_PRECISION)
+            for index, mode in enumerate(("sync", "async", "async", "sync")):
+                label = f"geglu_locked_{activation}_{numerical}_{index}_{mode}"
+                directory = self.run_dir / "bench" / label
+                options = self.locked_options(library, directory, profile, scenario, case, mode,
+                                              contract=contract)
+                entry = self.python("performance", label, AOTI, options)
+                entries.append(entry)
+                evidence = self.locked_evidence(entry, directory, profile, scenario, case, mode,
+                                                contract=contract)
+                if entry["state"] == "passed" and not evidence:
+                    entry.update(state="unmet", error="Missing GEGLU matrix evidence")
+                for item in evidence:
+                    item.update(mode=mode, order=index)
+                    runs.append(item)
+        record["geglu_matrix"]["state"] = (
+            "passed" if all(entry["state"] == "passed" for entry in entries) else "failed")
+        self.save()
+
     def performance(self):
         library = self.library("performance", "prod")
         if not library:
@@ -837,6 +1067,7 @@ class Delivery:
                             for evidence in self.locked_evidence(entry, directory, profile, scenario, case, mode):
                                 evidence.update(mode=mode, order=index)
                                 runs.append(evidence)
+            self.geglu_performance(library, runs)
             if self.args.performance_cpp:
                 # One representative selected configuration per cache, each in
                 # both modes; runner builds are opt-in and limited to eight.
@@ -902,7 +1133,8 @@ class Delivery:
             code = 130 if interrupted else (1 if failed else 0)
             complete = (all(r["state"] == "passed" for r in self.report["stages"].values())
                         and self.report["stages"]["performance"].get("trace", {}).get("state") != "skipped"
-                        and self.args.performance_cases == list(PERFORMANCE_CASES))
+                        and self.args.performance_cases == list(PERFORMANCE_CASES)
+                        and self.report["stages"]["performance"].get("geglu_matrix", {}).get("state") == "passed")
             bf16 = self.report["stages"]["aoti"].get("wide_bf16", {})
             self.report.update(state="interrupted" if interrupted else ("failed" if failed else (
                 "passed" if complete and bf16.get("state") != "skipped" else "partial")),

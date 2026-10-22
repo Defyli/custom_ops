@@ -5,8 +5,11 @@
 // fuse_moe_launch.h。traits 共享见 common/group_gemm_config.cuh（本文件
 // TmaGemmConfig 继承 MoEGemmConfig 扩展）。
 //
-// 与 sm89 家族（cp.async，sm80+ 通用）的关系：数值语义/输出布局完全
-// 一致（swapAB MMA、紧凑 Y、行谓词 epilogue），仅数据通路不同：
+// 与 sm89 家族（cp.async，sm80+ 通用）共享舍入契约和紧凑输出布局
+//（swapAB MMA、行谓词 epilogue），不承诺不同 tile/K 分组下逐 bit 一致：
+// fused gemm1 保留 FP32 gate/up 到 act(gate)·up 后才 round 到 Tout；
+// staged gemm1 先物化 Tout gate/up，act 和乘积再分别 round 到 Tout。
+// 数据通路区别：
 //   cp.async : 256 线程各自发射 16B 拷贝 + ZFILL 谓词 + cp_async_wait/__syncthreads
 //   TMA      : thread0 单线程发射 bulk 拷贝 + mbarrier full/empty 流水
 //              （mixed_gemm sm120 路径同款 cooperative 模式；sm120 无
@@ -32,7 +35,7 @@
 //     epilogue 行谓词丢弃）；末组尾 tile 越过 a_rows → TMA OOB 补零；
 //     每行独立计算，NaN 不跨行传播
 //   - 输出 Y 保持紧凑布局（epilogue 用 cu_seqlens[igroup] 作紧凑起点），
-//     act/reduce 数值路径与 cp.async 版完全一致
+//     act/reduce 遵循与 cp.async 相同的 numerical_mode 舍入规则
 //   - B（权重）静态 (E, n, k) 3D，单 descriptor coord mode2=igroup 切片
 //
 // 任务调度：horizon 扫描（itile_n 内层，移植自 hpc common.cuh）——
@@ -68,6 +71,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <type_traits>
 
 #include "cutlass/arch/barrier.h"
 
@@ -86,10 +90,10 @@ namespace tma {
 // 友好）；make_tma_copy 只接受 GMMA 规范 atom（字节域 Swizzle<3,4,3>，即
 // SW128 模式）——两者在 16-bit 元素下数值等价（FA sm120 路径已验证），
 // 故 ldmatrix（s2r）读取路径与 cp.async 版完全一致，仅 smem 布局表达更换。
-template <typename BaseConfig, int kStage_>
+template <typename BaseConfig, int kStage_, bool kFp32Output = false>
 struct TmaGemmConfig : public BaseConfig {
   using Tin = typename BaseConfig::Tin;
-  using Tout = typename BaseConfig::Tout;
+  using Tout = std::conditional_t<kFp32Output, float, typename BaseConfig::Tout>;
   using TiledMMA = typename BaseConfig::TiledMMA;
 
   static constexpr int kTileM = BaseConfig::kTileM;
@@ -107,6 +111,12 @@ struct TmaGemmConfig : public BaseConfig {
 
   static constexpr int shm_xw =
       static_cast<int>(sizeof(Tin) * (cosize(SmemLayoutX{}) + cosize(SmemLayoutW{})));
+  // M32 的 R2S 分区仍覆盖 64 行；C 使用原 (N,M)、stride N+8 布局，
+  // 但别名容量必须包含这些尾行。FP32 @N64/M<=64: (72*63+64)*4=18400B。
+  static constexpr int shm_c_alloc =
+      static_cast<int>(sizeof(Tout) * BaseConfig::shm_c_pad_elems);
+  static_assert(shm_c_alloc <= shm_xw,
+                "TMA output including padded R2S rows must fit in aliased operands");
 };
 
 // ─── device 调度（TaskLoopPolicy 1/2，移植自 hpc kernels.cuh）────────────────
@@ -176,9 +186,15 @@ group_gemm_tma_kernel(const __grid_constant__ TmaB tma_b, const __grid_constant_
   // PDL acquire：等上游（count/gather/desc 构建）写完调度数组与 desc
   pdl_acquire();
 
-  if (idx < kStage) {
-    full_bar[idx].init(1);           // 仅 thread0 arrive_and_expect_tx
-    empty_bar[idx].init(kNThreads);  // 全体计算线程 arrive
+  // One initializer per CTA, with one uniform barrier address per instruction.
+  // This is also compatible with tools that cannot track different mbarrier
+  // addresses across active lanes of the same warp.
+  if (idx == 0) {
+#pragma unroll
+    for (int stage = 0; stage < kStage; ++stage) {
+      full_bar[stage].init(1);           // thread0 arrive_and_expect_tx
+      empty_bar[stage].init(kNThreads);  // all compute threads arrive
+    }
   }
   cutlass::arch::fence_barrier_init();
   __syncthreads();
@@ -301,7 +317,7 @@ group_gemm_tma_kernel(const __grid_constant__ TmaB tma_b, const __grid_constant_
     }
 
     // K-loop：full/empty mbarrier 流水 + 寄存器级 s2r/mma 交错（计算路径
-    // 与 cp.async 版逐位一致——TMA 只改变数据到达机制）。
+    // 不改变 MMA 类型；不同 tile/K 分组不承诺逐 bit 一致）。
     // consumer_slab 跨任务连续（与 producer_slab 同基准，见任务循环前注释）。
     clear(tYr);
 #pragma unroll 1
@@ -386,7 +402,7 @@ void group_gemm_tma_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                           const void *seqlens_ptr, const void *cu_seqlens_ptr,
                           const void *tiles_ptr, int a_rows, int n,
                           int k, int num_group, int tile_m, bool is_half,
-                          bool use_pdl, cudaStream_t stream) {
+                          bool use_pdl, cudaStream_t stream, bool fp32_output = false) {
   using namespace cute;  // NOLINT
 
   assert(n % 64 == 0 && "group_gemm_tma: n must be a multiple of kTileN=64");
@@ -394,7 +410,7 @@ void group_gemm_tma_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
 
   cutlass::FastDivmod flat_divider(n / 64);  // num_tile_n
 
-  auto launch = [&](auto t_tag, auto m_tag, auto k_tag) {
+  auto launch = [&](auto t_tag, auto m_tag, auto k_tag, auto output_tag) {
     using T = typename decltype(t_tag)::type;
     constexpr int kTileM = decltype(m_tag)::value;
     constexpr int kTileK = decltype(k_tag)::value;
@@ -409,7 +425,7 @@ void group_gemm_tma_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
       return (s > 6) ? 6 : ((s < 2) ? 2 : s);
     }();
     using BaseConfig = config::MoEGemmConfig<T, kTileM, 64, kTileK, kStage>;
-    using GemmConfig = TmaGemmConfig<BaseConfig, kStage>;
+    using GemmConfig = TmaGemmConfig<BaseConfig, kStage, decltype(output_tag)::value>;
     constexpr int kNThreads = GemmConfig::kNThreads;
 
     // A desc：compact 布局 (a_rows, k)——host 一次性构建；坐标基在 kernel
@@ -441,9 +457,10 @@ void group_gemm_tma_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
 
     auto kernel = &group_gemm_tma_kernel<GemmConfig, TmaA, TmaB, true>;
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    configure_dynamic_shared_memory(kernel, shm_size);
     int max_blocks = 1;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks, kernel, kNThreads, shm_size);
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks, kernel, kNThreads, shm_size));
     if (max_blocks < 1) max_blocks = 1;
     dim3 grid(static_cast<unsigned>(get_sm_count() * max_blocks));
 
@@ -464,11 +481,11 @@ void group_gemm_tma_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
       cfg.stream = stream;
       cfg.attrs = attr;
       cfg.numAttrs = 1;
-      cudaLaunchKernelEx(&cfg, kernel, tma_b, tma_a, y_ptr,
+      C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, tma_b, tma_a, y_ptr,
                          reinterpret_cast<const int *>(seqlens_ptr),
                          reinterpret_cast<const int *>(cu_seqlens_ptr),
                          reinterpret_cast<const int *>(tiles_ptr), a_rows, n, k,
-                         num_group, flat_divider);
+                         num_group, flat_divider));
     } else {
       kernel<<<grid, kNThreads, shm_size, stream>>>(
           tma_b, tma_a, y_ptr, reinterpret_cast<const int *>(seqlens_ptr),
@@ -479,32 +496,40 @@ void group_gemm_tma_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
 
   };
 
-  auto dispatch_k = [&](auto t_tag, auto m_tag) {
+  auto dispatch_k = [&](auto t_tag, auto m_tag, auto output_tag) {
     // kTileK 自适应：k%128==0 用 128（group_modes 坐标收敛解锁，见文件头
     // 注释；每 slab mma 工作量翻倍、barrier/发射开销减半），否则 64。
     // 两个 GEMM 的 k 不同（H vs I），各自独立选择。
     if (k % 128 == 0) {
-      launch(t_tag, m_tag, Int<128>{});
+      launch(t_tag, m_tag, Int<128>{}, output_tag);
     } else {
-      launch(t_tag, m_tag, Int<64>{});
+      launch(t_tag, m_tag, Int<64>{}, output_tag);
     }
   };
-  auto dispatch_m = [&](auto t_tag) {
+  auto dispatch_m = [&](auto t_tag, auto output_tag) {
     // tile_m 由 launch 层传入（moe_pick_tile_m；128 仅 FUSE_MOE_TILE_M
     // 调试路径，见 fuse_moe_params.h）
     if (tile_m >= 128) {
-      dispatch_k(t_tag, Int<128>{});
+      dispatch_k(t_tag, Int<128>{}, output_tag);
     } else if (tile_m <= 32) {
-      dispatch_k(t_tag, Int<32>{});
+      dispatch_k(t_tag, Int<32>{}, output_tag);
     } else {
-      dispatch_k(t_tag, Int<64>{});
+      dispatch_k(t_tag, Int<64>{}, output_tag);
     }
   };
 
+  // 输出类型只在 host 分发；输入 TMA descriptors/MMA 始终保持 Tin16。
+  auto dispatch_output = [&](auto t_tag) {
+    if (fp32_output) {
+      dispatch_m(t_tag, std::true_type{});
+    } else {
+      dispatch_m(t_tag, std::false_type{});
+    }
+  };
   if (is_half) {
-    dispatch_m(config::TypeTag<cutlass::half_t>{});
+    dispatch_output(config::TypeTag<cutlass::half_t>{});
   } else {
-    dispatch_m(config::TypeTag<cutlass::bfloat16_t>{});
+    dispatch_output(config::TypeTag<cutlass::bfloat16_t>{});
   }
 }
 

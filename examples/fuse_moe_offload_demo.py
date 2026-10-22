@@ -48,7 +48,7 @@ def load_native(library: Path | None, *, jit: bool = False):
         raise ValueError("choose --ops-library or explicitly allow development --jit")
 
 
-def make_store(*, layers=1, dtype=torch.float16, layout="fused"):
+def make_store(*, layers=1, dtype=torch.float16, layout="fused", expert_type="glu"):
     """Explicit checkpoint mapping; adapt expert lists/transposes externally.
 
     A real checkpoint can use ExpertStore.load(path, layer_keys, dtype=dtype,
@@ -57,6 +57,8 @@ def make_store(*, layers=1, dtype=torch.float16, layout="fused"):
     """
     if layers not in (1, 2) or layout not in ("fused", "separate"):
         raise ValueError("example supports one/two layers and fused/separate layout")
+    if expert_type not in ("glu", "mlp") or (expert_type == "mlp" and layout != "fused"):
+        raise ValueError("MLP requires canonical single-projection fused layout")
     generator = torch.Generator().manual_seed(SEED)
     state, keys = {}, {}
     for layer, intermediate in ((0, 128), (5, 192))[:layers]:
@@ -66,25 +68,27 @@ def make_store(*, layers=1, dtype=torch.float16, layout="fused"):
         state[f"{prefix}.down"] = torch.randn(
             EXPERTS, HIDDEN, intermediate, generator=generator) * .08
         if layout == "fused":
-            state[f"{prefix}.gate_up"] = torch.cat((gate, up), dim=1)
+            state[f"{prefix}.gate_up"] = torch.cat((gate, up), dim=1) if expert_type == "glu" else gate
             keys[layer] = LayerKeys(down=f"{prefix}.down", gate_up=f"{prefix}.gate_up")
         else:
             state[f"{prefix}.gate"], state[f"{prefix}.up"] = gate, up
             keys[layer] = LayerKeys(
                 down=f"{prefix}.down", gate=f"{prefix}.gate", up=f"{prefix}.up")
-    return ExpertStore.from_state_dict(state, keys, dtype=dtype, ram_budget_bytes=64 * MIB)
+    return ExpertStore.from_state_dict(state, keys, dtype=dtype, ram_budget_bytes=64 * MIB, expert_type=expert_type)
 
 
 def make_config(store, device, *, cache="reuse", async_staging=False,
-                activation_mode="fp32_accumulate"):
+                activation_mode="fp32_accumulate", expert_activation="silu",
+                numerical_mode="fused", expert_type="glu"):
     # Detect target once during configuration; deployed archives keep this frozen.
     major, minor = torch.cuda.get_device_capability(device)
-    expert_bytes = max(6 * w1.shape[2] * w2.shape[2] for w1, w2 in store.layers.values())
-    resident_bytes = sum(6 * w1.shape[2] * w2.shape[2] for w1, w2 in store.layers.values())
+    expert_bytes = max((w1[0].numel() + w2[0].numel()) * w1.element_size() for w1, w2 in store.layers.values())
+    resident_bytes = sum((w1[0].numel() + w2[0].numel()) * w1.element_size() for w1, w2 in store.layers.values())
     return OffloadConfig.from_store(
         store, target_sm=major * 10 + minor,
         gpu_budget_bytes=8 * MIB, ram_budget_bytes=64 * MIB, pinned_budget_bytes=4 * MIB,
-        activation_mode=activation_mode, max_route_tile_rows="auto", num_banks=2,
+        activation_mode=activation_mode, expert_activation=expert_activation,
+        numerical_mode=numerical_mode, expert_type=expert_type, max_route_tile_rows="auto", num_banks=2,
         resident_experts={layer: (0,) for layer in store.layers} if cache == "static" else {},
         resident_cache_bytes=resident_bytes if cache == "static" else 0,
         dynamic_cache_bytes=4 * expert_bytes if cache in ("reuse", "lru") else 0,
@@ -100,18 +104,37 @@ def make_inputs(tokens, device, dtype, *, hotset=False):
     return x.to(device=device, dtype=dtype), ids.to(device=device, dtype=torch.int32), scale.to(device)
 
 
-def rounded_reference(x, w1, w2, ids, scale):
-    """Small CPU FP32 reference with native Act/Down dtype storage boundaries."""
-    value, ids, scale = x.float().cpu(), ids.cpu(), scale.cpu()
+def rounded_reference(x, w1, w2, ids, scale, *, expert_activation="silu",
+                      numerical_mode="fused", expert_type="glu"):
+    """CPU FP32 matmuls; exact GELU and explicit native dtype boundaries.
+
+    Fused preserves the historical Act/Down rounding. Staged additionally
+    rounds gate/up, the nonlinearity and the scaled product before FP32 summation.
+    """
+    if expert_activation not in ("silu", "gelu") or numerical_mode not in ("fused", "staged"):
+        raise ValueError("invalid expert_activation/numerical_mode")
+    if expert_type not in ("glu", "mlp") or w1.shape[1] != (2 if expert_type == "glu" else 1) * w2.shape[2]:
+        raise ValueError("expert_type projection shapes")
+    value, ids, scale = x.float().cpu(), ids.cpu(), scale.float().cpu()
     result = torch.zeros_like(value)
+    staged = numerical_mode == "staged"
     for expert in range(w1.shape[0]):
         rows, slots = torch.where(ids == expert)
         if rows.numel() == 0:
             continue
-        gate, up = (value[rows] @ w1[expert].float().T).chunk(2, dim=1)
-        act = (F.silu(gate) * up).to(x.dtype).float()
-        down = (act @ w2[expert].float().T).to(x.dtype).float()
-        result.index_add_(0, rows, down * scale[rows, slots, None])
+        gate_up = value[rows] @ w1[expert].float().cpu().T
+        if staged:
+            gate_up = gate_up.to(x.dtype).float()
+        gate = gate_up.chunk(2, dim=1)[0] if expert_type == "glu" else gate_up
+        act = F.gelu(gate, approximate="none") if expert_activation == "gelu" else F.silu(gate)
+        if staged and expert_type == "glu":
+            act = act.to(x.dtype).float()
+        product = (act * gate_up.chunk(2, dim=1)[1] if expert_type == "glu" else act).to(x.dtype).float()
+        down = (product @ w2[expert].float().cpu().T).to(x.dtype).float()
+        weighted = down * scale[rows, slots, None]
+        if staged:
+            weighted = weighted.to(x.dtype).float()
+        result.index_add_(0, rows, weighted)
     return result.to(x.dtype)
 
 
@@ -173,6 +196,9 @@ def main():
     parser.add_argument("--layout", choices=("fused", "separate"), default="fused")
     parser.add_argument("--cache", choices=("none", "static", "reuse", "lru"), default="reuse")
     parser.add_argument("--activation-mode", choices=("route_buffer", "fp32_accumulate", "auto"), default="fp32_accumulate")
+    parser.add_argument("--expert-type", choices=("glu", "mlp"), default="glu")
+    parser.add_argument("--expert-activation", choices=("silu", "gelu"), default="silu")
+    parser.add_argument("--numerical-mode", choices=("fused", "staged"), default="fused")
     parser.add_argument("--async-staging", action="store_true")
     parser.add_argument("--show-recovery", action="store_true")
     args = parser.parse_args()
@@ -185,11 +211,14 @@ def main():
     device = torch.device("cuda", args.device)
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
     load_native(args.ops_library, jit=args.jit)
-    store = make_store(dtype=dtype, layout=args.layout)
+    store = make_store(dtype=dtype, layout=args.layout, expert_type=args.expert_type)
     config = make_config(store, device, cache=args.cache, async_staging=args.async_staging,
-                         activation_mode=args.activation_mode)
+                         activation_mode=args.activation_mode,
+                         expert_activation=args.expert_activation, numerical_mode=args.numerical_mode, expert_type=args.expert_type)
     x, ids, scale = make_inputs(args.tokens, device, dtype, hotset=True)
-    expected = rounded_reference(x, *store.layers[0], ids, scale)
+    reference_modes = dict(expert_activation=config.expert_activation,
+                           numerical_mode=config.numerical_mode, expert_type=config.expert_type)
+    expected = rounded_reference(x, *store.layers[0], ids, scale, **reference_modes)
     print(f"CPU weights={store.weight_bytes} bytes; config={config}")
     # No inference_mode around weight creation: bound CPU weights need versions.
     with torch.no_grad(), PrefillMoERuntime.from_config(store, config, device=device) as runtime:
@@ -205,7 +234,8 @@ def main():
         output = runtime.forward(scan_x, scan_ids, scan_scale, layer_id=0)
         runtime.check()
         print("distributed expert route")
-        check_output(output, rounded_reference(scan_x, *store.layers[0], scan_ids, scan_scale))
+        check_output(output, rounded_reference(
+            scan_x, *store.layers[0], scan_ids, scan_scale, **reference_modes))
         print_stats(runtime)
         del output
         if args.show_recovery:

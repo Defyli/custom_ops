@@ -4,6 +4,8 @@
 > **日期**：设计 2026-10-09；初次待办收敛 2026-10-13；仓库定位修订 2026-10-14；最终开发、双架构验收与交付收敛 2026-10-15。
 > **场景**：通用 Prefill/批量 MoE 推理前向；生成式推荐是应用背景而非绑定的业务实现，无自回归 Decode。
 > **结论**：保留现有全 GPU `fuse_moe` 快路径，新增对外单算子的 `fuse_moe_offload`，由原生 C++ 运行时实现显存有界的专家权重流式执行。**AOTi 是首版强制能力**；参数从输入与 canonical CPU 权重元数据推导，`state_dict.pth` 是可选接入来源，RAM/pinned/GPU 额度可配置，数值验收采用合理容差而非逐位一致。首版由 GPU 完成全部专家计算，CPU 负责存储、调度与搬运；SSD、CPU 专家计算和量化属于未立项的可选方向（见第 16.4 节），不是当前交付承诺。
+>
+> **2026-10-21 GEGLU API 补充**：本页第 15/16 节的交付结论对应 2026-10-15 的旧 `silu/fused` 源码，**不能推定新增 GEGLU/staged 在 SM120 已通过**。现行全 GPU 接口新增关键字 `expert_activation="silu"|"gelu"`、`numerical_mode="fused"|"staged"`；offload 在 `OffloadConfig` 和 native create 固化同名维度，`activation_mode` 不改变含义。默认配置仍为 v1（23 字段）；非默认为 v2（25 字段，23/24 是激活/舍入 code，resident IDs 从 25 开始），Manifest 外层 framing 仍为 1，format2 CPU 归档携带各层冻结配置。`.so/.so.json/.pt2/weights.pt` 必须按新 schema 重新构建并成套部署；`staged` 仅定义前向舍入、不提供反向。当前验证与复现命令统一见 [GEGLU 扩展记录](MOE_GEGLU_EXTENSION.md)：第 10 节记录通用 `staged` 命名后的 CUDA 12.8 / PyTorch 2.11 在 SM89、SM120 默认/TMA、TileLang、双 dtype AOTI 和安全检查的独立复验；这些新结论不由下文旧交付记录外推。下文历史配置/schema/TileLang 未支持 mask 的描述保留为对应日期的事实。
 
 ## 1. 背景与范围
 

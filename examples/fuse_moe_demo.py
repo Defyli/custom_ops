@@ -1,8 +1,9 @@
 """
 examples/fuse_moe_demo.py — fused MoE 前向算子使用示例
 
-演示 Mixtral/DeepSeek 风格 MoE FFN 层的融合前向：
-    y[s] = Σ_j topk_scale[s,j] * (Down_ej @ silu(GateUp_ej @ x[s]))
+演示通用路由专家算子的融合前向：
+    y[s] = Σ_j topk_scale[s,j] * (Down_ej @ (act(Gate_ej @ x[s]) * (Up_ej @ x[s])))
+    act = SiLU（默认）或 GELU exact erf；staged 只定义前向逐级舍入。
 
 问题背景：MoE 前向 = gather → 逐 expert 小 GEMM → 激活 → down GEMM →
 scatter 加权归约，PyTorch eager 需 5+ 个 kernel 与多份中间显存；
@@ -11,18 +12,21 @@ torch.compile 无法穿透数据依赖的 expert 分发。fused_moe 用 4 个 ke
 compact 布局上一次完成，权重与激活直入 bf16 tensor core（fp32 累加）。
 
 演示：
-  1. Mixtral 风格 MoE 输入构造（E=8 experts, top-k=2 路由）
+  1. 通用 MoE 输入构造（E=8 experts, top-k=2 路由）
   2. 算子调用（ops.fuse_moe）
   3. 数值校验：vs 向量化 PyTorch 参考（fp32 金标准）
   4. 性能对比：fused vs PyTorch eager（CUDA event 计时）
 
 运行：
     python examples/fuse_moe_demo.py
+    python examples/fuse_moe_demo.py --expert-activation gelu --numerical-mode staged
+    python examples/fuse_moe_demo.py --ops-library /path/to/native.so --dtype fp16
 
 约束（op 层校验，违反会报错）：hidden/intermediate 需为 64 的倍数，
 topk_ids ∈ [0, E) int32，topk_scale 为 fp32。
 """
 
+import argparse
 import os
 import sys
 
@@ -37,28 +41,48 @@ sys.path.insert(0, os.path.dirname(_PKG_ROOT))
 from custom_ops import ops  # noqa: E402
 
 
-def moe_eager_ref(x, w1, w2, topk_ids, topk_scale):
-    # PyTorch eager 参考：per-expert 分组 GEMM + top-k 加权归约（与真实
-    # MoE 模型写法同构；dtype 跟随输入——fp32 调用即金标准，bf16 即真实路径）
+def moe_eager_ref(x, w1, w2, topk_ids, topk_scale,
+                  expert_activation="silu", numerical_mode="fused", expert_type="glu"):
+    """FP32 GEMMs with explicit storage boundaries; no TF32 or tanh GELU.
+
+    Quantized inputs are shared with native. This standalone forward reference
+    checks the numerical contract for an external caller.
+    """
+    if expert_activation not in ("silu", "gelu") or numerical_mode not in ("fused", "staged"):
+        raise ValueError("unsupported expert mode")
+    if expert_type not in ("glu", "mlp") or w1.shape[1] != (2 if expert_type == "glu" else 1) * w2.shape[2]:
+        raise ValueError("expert_type projection shapes")
+    dtype = x.dtype
+
+    def rounded(value):
+        return value.to(dtype).float()
     S, H = x.shape
     E = w1.shape[0]
     I = w2.shape[2]
     K = topk_ids.shape[1]
     T = S * K
     e_flat = topk_ids.reshape(-1)                      # (T,) 每行的目标 expert
-    s_flat = topk_scale.reshape(-1).to(x.dtype)       # (T,) top-k 权重
-    xg = x[:, None, :].expand(S, K, H).reshape(T, H)  # (T, H) gather 激活
-    out = torch.zeros(S, H, device=x.device, dtype=x.dtype)
+    s_flat = topk_scale.reshape(-1).float()          # Keep router weights FP32
+    xg = x.float()[:, None, :].expand(S, K, H).reshape(T, H)
+    out = torch.zeros(S, H, device=x.device, dtype=torch.float32)
     for e in range(E):
         idx = (e_flat == e).nonzero().squeeze(1)       # 该 expert 的 compact 行
         if idx.numel() == 0:
             continue
-        gu = xg[idx] @ w1[e].t()                       # (n_e, 2I) gate_up GEMM
-        g, u = gu[:, :I], gu[:, I:]
-        h = F.silu(g.float()).to(x.dtype) * u          # 激活（fp32 计算后回落）
-        y = h @ w2[e].t()                              # (n_e, H) down GEMM
-        out.index_add_(0, idx // K, y * s_flat[idx].unsqueeze(1))  # 加权归约
-    return out
+        gu = xg[idx] @ w1[e].float().t()             # FP32 gate/up accumulators
+        if numerical_mode == "staged":
+            gu = rounded(gu)
+        g = gu[:, :I] if expert_type == "glu" else gu
+        act = F.silu(g) if expert_activation == "silu" else F.gelu(g, approximate="none")
+        if numerical_mode == "staged" and expert_type == "glu":
+            act = rounded(act)
+        hidden = rounded(act * gu[:, I:] if expert_type == "glu" else act)
+        down = rounded(hidden @ w2[e].float().t())
+        weighted = down * s_flat[idx].unsqueeze(1)
+        if numerical_mode == "staged":
+            weighted = rounded(weighted)
+        out.index_add_(0, idx // K, weighted)
+    return out.to(dtype)
 
 
 
@@ -76,7 +100,17 @@ def bench(fn, iters=20, warmup=5):
     return sorted(times)[len(times) // 2]
 
 
+@torch.no_grad()
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--expert-type", choices=("glu", "mlp"), default="glu")
+    parser.add_argument("--expert-activation", choices=("silu", "gelu"), default="silu")
+    parser.add_argument("--numerical-mode", choices=("fused", "staged"), default="fused")
+    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument("--ops-library", help="Explicit precompiled fuse_moe library; disables JIT")
+    args = parser.parse_args()
+    if args.ops_library:
+        ops.load_precompiled("fuse_moe", args.ops_library)
     if not torch.cuda.is_available():
         print("CUDA 不可用，示例无法运行。")
         return
@@ -85,12 +119,15 @@ def main():
         return
 
     torch.manual_seed(0)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    modes = dict(expert_activation=args.expert_activation, numerical_mode=args.numerical_mode, expert_type=args.expert_type)
 
-    # ── Mixtral 风格 MoE FFN（缩小版）：S token, H=2048, I=1024, 8 专家 top-2 ──
+    # ── 通用 MoE 输入：S token, H=2048, I=1024, 8 专家 top-2 ──
     S, H, I, E, K = 1024, 2048, 1024, 8, 2
-    x = (torch.randn(S, H, device="cuda") * 0.5).to(torch.bfloat16)          # (S, H) 激活
-    w1 = (torch.randn(E, 2 * I, H, device="cuda") * 0.05).to(torch.bfloat16)  # (E, 2I, H) gate_up
-    w2 = (torch.randn(E, H, I, device="cuda") * 0.05).to(torch.bfloat16)      # (E, H, I) down
+    x = (torch.randn(S, H, device="cuda") * 0.5).to(dtype)          # (S, H) 激活
+    w1 = (torch.randn(E, (2 if args.expert_type == "glu" else 1) * I, H, device="cuda") * 0.05).to(dtype)  # (E, 2I, H) gate_up
+    w2 = (torch.randn(E, H, I, device="cuda") * 0.05).to(dtype)      # (E, H, I) down
 
     # 路由：topk_ids (S,K) int32 ∈ [0,E)；topk_scale (S,K) fp32（softmax 归一权重）
     logits = torch.randn(S, E, device="cuda")
@@ -99,28 +136,31 @@ def main():
     topk_ids = topk_idx.to(torch.int32)
 
     # ── 1. 调用融合算子 ─────────────────────────────────────────────────────
-    out = ops.fuse_moe(x, w1, w2, topk_ids, topk_scale)
+    out = ops.fuse_moe(x, w1, w2, topk_ids, topk_scale, **modes)
 
     # ── 2. 数值校验（fp32 金标准） ──────────────────────────────────────────
-    out_ref = moe_eager_ref(x.float(), w1.float(), w2.float(), topk_ids, topk_scale)
-    out_eager = moe_eager_ref(x, w1, w2, topk_ids, topk_scale)        # bf16 eager
+    out_ref = moe_eager_ref(x.float(), w1.float(), w2.float(), topk_ids, topk_scale, **modes)
+    out_eager = moe_eager_ref(x, w1, w2, topk_ids, topk_scale, **modes)
+    torch.testing.assert_close(out.float(), out_eager.float(), atol=.05,
+                               rtol=.03 if dtype == torch.bfloat16 else .02)
 
     def rel(a, ref):
         return ((a.float() - ref).abs() / ref.abs().clamp_min(1e-2)).mean().item()
 
-    hdr = "%16s%12s%14s" % ("", "fused_moe", "eager(bf16)")
-    print(f"输出: {tuple(out.shape)} {out.dtype}   （{S} tokens × {E} experts × top-{K}）")
+    hdr = "%16s%12s%14s" % ("", "fused_moe", f"reference({args.dtype})")
+    print(f"输出: {tuple(out.shape)} {out.dtype}   （{S} tokens × {E} experts × top-{K}）"
+          f" {args.expert_type}/{args.expert_activation}/{args.numerical_mode}")
     print(hdr)
     print("%16s%12.2e%14.2e" % ("mean rel-err", rel(out, out_ref), rel(out_eager, out_ref)))
     assert rel(out, out_ref) < 0.05, "fused_moe 精度异常！"
 
     # ── 3. 性能对比 ────────────────────────────────────────────────────────
-    t_fused = bench(lambda: ops.fuse_moe(x, w1, w2, topk_ids, topk_scale))
-    t_eager = bench(lambda: moe_eager_ref(x, w1, w2, topk_ids, topk_scale))
-    flops = S * K * 6 * H * I
+    t_fused = bench(lambda: ops.fuse_moe(x, w1, w2, topk_ids, topk_scale, **modes))
+    t_eager = bench(lambda: moe_eager_ref(x, w1, w2, topk_ids, topk_scale, **modes))
+    flops = S * K * (6 if args.expert_type == "glu" else 4) * H * I
     print("%16s%12.3f%14.3f   加速 %.1fx" % ("耗时(ms)", t_fused, t_eager, t_eager / t_fused))
     print("%16s%10.0f TFLOPS" % ("有效算力", flops / t_fused / 1e9))
-    print("PASS ✓")
+    print("PASS (forward reference only; use the standalone benchmark for acceptance)")
 
 
 if __name__ == "__main__":

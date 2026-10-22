@@ -13,6 +13,7 @@
 #include <sys/resource.h>
 #include <cuda_runtime_api.h>
 #include <climits>
+#include <limits>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -50,6 +51,13 @@ constexpr int64_t ram_budget = 4 * 1024 * 1024;
 // Chosen once by CLI before any Runtime is constructed; never read from env.
 bool config_async_staging = false;
 bool config_host_profile = false;
+// Wide-benchmark storage/activation; locked paths derive these from the archive.
+std::string config_precision = "fp16";
+int64_t config_expert_activation = 0;
+int64_t config_numerical_mode = 0;
+int64_t config_expert_type = 0;
+bool precision_explicit = false, expert_activation_explicit = false, numerical_mode_explicit = false;
+bool async_staging_explicit = false, host_profile_explicit = false;
 std::filesystem::path output_directory;
 
 void require(bool condition, const std::string& message) {
@@ -116,19 +124,35 @@ struct Weights {
                 "Archive weight is not canonical pageable CPU fp16/bf16");
         (void)weight._version();
       }
-      require(w1.scalar_type() == w2.scalar_type() && w1.size(0) > 0 && w1.size(0) <= 512 &&
-                  w2.size(0) == w1.size(0) && w2.size(1) == w1.size(2) &&
-                  w1.size(1) == 2 * w2.size(2) && w1.size(2) > 0 && w2.size(2) > 0 &&
-                  w1.size(2) % 64 == 0 && w2.size(2) % 64 == 0,
-              "Invalid canonical archive E/H/I");
-      layers.emplace(layer, std::make_pair(w1, w2));
+      int64_t projection_factor = 2;
       if (locked) {
         const auto name = "offload_config_" + std::to_string(layer);
         expected.insert(name);
         auto vector = metadata(name).contiguous();
         configs.emplace(layer, std::vector<int64_t>(vector.const_data_ptr<int64_t>(),
                                                     vector.const_data_ptr<int64_t>() + vector.numel()));
+        const auto& v = configs.at(layer);
+        const size_t header = !v.empty() && v[0] == 1 ? 23 :
+                              !v.empty() && v[0] == 2 ? 25 :
+                              !v.empty() && v[0] == 3 ? 26 : 0;
+        require(header > 0 && v.size() >= header && v[21] >= 0 && v[21] <= 512 &&
+                    v.size() == header + static_cast<size_t>(v[21]),
+                "LOCKED archive vector length/version");
+        if (v[0] >= 2) {
+          require((v[23] == 0 || v[23] == 1) && (v[24] == 0 || v[24] == 1),
+                  "LOCKED archive invalid expert activation/numerical mode");
+        }
+        if (v[0] == 3) {
+          require(v[25] == 1, "LOCKED archive invalid expert_type");
+          projection_factor = 1;
+        }
       }
+      require(w1.scalar_type() == w2.scalar_type() && w1.size(0) > 0 && w1.size(0) <= 512 &&
+                  w2.size(0) == w1.size(0) && w2.size(1) == w1.size(2) &&
+                  w1.size(1) == projection_factor * w2.size(2) && w1.size(2) > 0 && w2.size(2) > 0 &&
+                  w1.size(2) % 64 == 0 && w2.size(2) % 64 == 0,
+              "Invalid canonical archive E/H/I");
+      layers.emplace(layer, std::make_pair(w1, w2));
     }
     require(buffers.size() == expected.size(), "Unexpected archive buffers");
     for (const auto& buffer : buffers) {
@@ -141,9 +165,11 @@ struct Weights {
             "Acceptance requires baseline layers 0/5 or wide layer 0");
     const int64_t expected_h = wide ? 128 : H;
     for (const auto& layer : layers) {
-      require(layer.second.first.sizes() == at::IntArrayRef({E, 2 * I, expected_h}) &&
+      const int64_t projection_factor = locked && configs.at(layer.first)[0] == 3 ? 1 : 2;
+      require(layer.second.first.sizes() == at::IntArrayRef({E, projection_factor * I, expected_h}) &&
                   layer.second.second.sizes() == at::IntArrayRef({E, expected_h, I}) &&
-                  layer.second.first.scalar_type() == at::kHalf,
+                  (layer.second.first.scalar_type() == at::kHalf ||
+                   ((locked || wide) && layer.second.first.scalar_type() == at::kBFloat16)),
               "Acceptance archive shape/dtype mismatch");
     }
     }
@@ -176,7 +202,8 @@ struct Runtime {
           const at::Tensor& w15 = {}, const at::Tensor& w25 = {},
           bool wide = false, int64_t wide_tile_rows = 3, int64_t benchmark_budget = 0,
           int64_t native_tile_override = -1,
-          bool async_staging = config_async_staging, bool host_profile = config_host_profile)
+          bool async_staging = config_async_staging, bool host_profile = config_host_profile,
+          int64_t expert_activation = 0, int64_t numerical_mode = 0)
       : mode(activation_mode), resident_ids(expert_ids),
         dynamic_bytes(dynamic_cache_bytes), policy(cache_policy),
         budget(expert_ids.empty() && !dynamic_bytes ? gpu_budget : cached_gpu_budget) {
@@ -194,7 +221,8 @@ struct Runtime {
                   tile_limit,
                   int64_t(resident_ids.empty() ? 0 : resident_limit), dynamic_bytes,
                   policy, int64_t(32), int64_t(2), int64_t(0),
-                  async_staging, host_profile, int64_t(0), int64_t(128)})[0].toTensor();
+                  async_staging, host_profile, int64_t(0), int64_t(128),
+                  expert_activation, numerical_mode, int64_t(0)})[0].toTensor();
     require(token.device().is_cpu() && token.scalar_type() == at::kLong &&
                 token.sizes() == at::IntArrayRef({2}), "Invalid deployment token");
     try {
@@ -256,20 +284,30 @@ std::vector<at::Tensor> make_inputs(int64_t s, int64_t device,
                                    const at::Tensor& token) {
   auto fp32 = at::TensorOptions().dtype(at::kFloat).device(at::kCPU);
   auto cuda = c10::Device(c10::kCUDA, static_cast<c10::DeviceIndex>(device));
-  auto x = (at::arange(s * H, fp32).cos() * .25).reshape({s, H}).to(cuda, at::kHalf);
+  auto x = (at::arange(s * H, fp32).cos() * .25).reshape({s, H}).to(cuda, w1.scalar_type());
   auto ids = at::arange(s * K, at::TensorOptions().dtype(at::kLong))
                  .remainder(E).reshape({s, K}).to(cuda, at::kInt);
   auto scale = at::full({s, K}, 1.0 / K, fp32).to(cuda);
   return {x, w1, w2, ids, scale, token};
 }
 
-at::Tensor reference(const std::vector<at::Tensor>& inputs, bool rounded = false) {
+at::Tensor reference(const std::vector<at::Tensor>& inputs, bool rounded = true,
+                     int64_t expert_activation = 0, int64_t numerical_mode = 0, int64_t expert_type = 0) {
+  require(expert_type == 0 || expert_type == 1, "Invalid expert_type");
+  require(expert_activation == 0 || expert_activation == 1, "Invalid expert_activation");
+  require(numerical_mode == 0 || numerical_mode == 1, "Invalid numerical_mode");
+  require(inputs[1].size(1) == (expert_type == 0 ? 2 : 1) * inputs[2].size(2), "expert_type shape mismatch");
   auto x = inputs[0].to(at::kCPU).to(at::kFloat);
   auto w1 = inputs[1].to(at::kFloat);
   auto w2 = inputs[2].to(at::kFloat);
   auto ids = inputs[3].to(at::kCPU).to(at::kLong);
   auto scale = inputs[4].to(at::kCPU);
   auto out = at::zeros_like(x);
+  const auto dtype = inputs[0].scalar_type();
+  const auto round = [&](const at::Tensor& value) {
+    return value.to(dtype).to(at::kFloat);
+  };
+  const bool staged = numerical_mode == 1;
   // Independent expert-by-expert ATen FP32 computation, not the fused GPU op.
   for (int64_t expert = 0; expert < w1.size(0); ++expert) {
     auto positions = at::nonzero(ids.eq(expert));
@@ -278,15 +316,31 @@ at::Tensor reference(const std::vector<at::Tensor>& inputs, bool rounded = false
     auto projected = at::matmul(x.index_select(0, rows), w1[expert].transpose(0, 1));
     const int64_t intermediate = w2.size(2);
     auto gate = projected.narrow(1, 0, intermediate);
-    auto up = projected.narrow(1, intermediate, intermediate);
-    auto act = at::silu(gate) * up;
+    at::Tensor up;
+    if (expert_type == 0) up = projected.narrow(1, intermediate, intermediate);
+    if (staged) {
+      gate = round(gate);
+      if (expert_type == 0) up = round(up);
+    }
+    // Exact erf GELU (never tanh) or the historical SiLU default.
+    auto act = expert_activation == 1
+        ? 0.5 * gate * (1.0 + at::erf(gate * 0.7071067811865476))
+        : at::silu(gate);
+    if (expert_type == 0) {
+      if (staged) act = round(act);
+      act = act * up;
+      if (staged) act = round(act);
+    }
     // Native fused gate/up retains FP32 accumulators, then stores Act in the
     // input dtype. Down is stored in that dtype before scale/FP32 reduction.
-    if (rounded) act = act.to(inputs[0].scalar_type()).to(at::kFloat);
+    if (rounded) act = round(act);
     auto values = at::matmul(act, w2[expert].transpose(0, 1));
-    if (rounded) values = values.to(inputs[0].scalar_type()).to(at::kFloat);
+    if (staged) values = round(values);
+    if (rounded) values = round(values);
     auto route_scales = scale.reshape({-1}).index_select(0, rows * ids.size(1) + slots).unsqueeze(1);
-    out.index_add_(0, rows, values * route_scales);
+    auto weighted = values * route_scales;
+    if (staged) weighted = round(weighted);
+    out.index_add_(0, rows, weighted);
   }
   return out;
 }
@@ -589,7 +643,7 @@ std::vector<at::Tensor> make_wide_inputs(int64_t s, int64_t device,
   auto fp32 = at::TensorOptions().dtype(at::kFloat).device(at::kCPU);
   auto cuda = c10::Device(c10::kCUDA, static_cast<c10::DeviceIndex>(device));
   auto x = (at::arange(s * w1.size(2), fp32).cos() * .25)
-               .reshape({s, w1.size(2)}).to(cuda, at::kHalf);
+               .reshape({s, w1.size(2)}).to(cuda, w1.scalar_type());
   auto pattern = at::tensor({0, 0, 1, -1, 2, 3, -1, -1, 3, 1, 2, 2, 0, 3},
                             at::TensorOptions().dtype(at::kInt)).reshape({7, K});
   auto scales = at::tensor({.75f, -.25f, -.5f, 1.25f, .125f, -.875f, .625f, -1.5f,
@@ -653,6 +707,8 @@ void benchmark_wide(const std::string& package, const std::string& archive,
   require(iterations > 0 && !sizes.empty(), "Benchmark needs positive iterations and shapes");
   Weights weights(archive, true);
   const auto w1 = weights.layers.at(0).first, w2 = weights.layers.at(0).second;
+  require(w1.scalar_type() == (config_precision == "bf16" ? at::kBFloat16 : at::kHalf),
+          "Wide benchmark --precision differs from archive dtype");
   torch::inductor::AOTIModelPackageLoader runner(package, "model");
   // Large-S benchmark overrides Runtime's 2 MiB small acceptance budget.
   // S=16384 alone needs a 4 MiB FP16 output and an 8 MiB FP32 accumulator;
@@ -667,7 +723,8 @@ void benchmark_wide(const std::string& package, const std::string& archive,
     require(s >= 7 && s <= 16384, "Benchmark S is outside exported [7,16384]");
     // Reference, archive/model load, context bind and route construction are untimed.
     auto reference_inputs = make_wide_inputs(s, device, w1, w2, at::Tensor());
-    auto expected = reference(reference_inputs);
+    auto expected = reference(reference_inputs, true, config_expert_activation, config_numerical_mode)
+                        .to(w1.scalar_type()).to(at::kFloat);
     for (const std::string policy : {"disabled", "static", "reuse"}) {
       int64_t capped_tiles = 0, capped_banks = 0, capped_capacity = 0;
       int64_t capped_hits = 0, capped_misses = 0;
@@ -676,13 +733,15 @@ void benchmark_wide(const std::string& package, const std::string& archive,
         const std::vector<int64_t> residents = policy == "static"
             ? std::vector<int64_t>{0, 1, 2, 3} : std::vector<int64_t>{};
         Runtime runtime(device, w1, w2, 1, residents,
-                        policy == "reuse" ? 2 * charge : 0, 0, {}, {}, true, tile_rows, budget);
+                        policy == "reuse" ? 2 * charge : 0, 0, {}, {}, true, tile_rows, budget, -1,
+                        config_async_staging, config_host_profile,
+                        config_expert_activation, config_numerical_mode);
         auto inputs = reference_inputs;
         inputs[5] = runtime.token;
         auto validate = [&](const at::Tensor& output, const at::Tensor& stats) {
           auto actual = output.to(at::kCPU).to(at::kFloat);
           auto error = (actual - expected).abs();
-          require(output.sizes() == inputs[0].sizes() && output.scalar_type() == at::kHalf &&
+          require(output.sizes() == inputs[0].sizes() && output.scalar_type() == inputs[0].scalar_type() &&
                       output.device() == inputs[0].device() && at::isfinite(actual).all().item<bool>() &&
                       error.le(expected.abs() * .02 + .0002).all().item<bool>() &&
                       error.norm().item<float>() / expected.norm().item<float>() < .02,
@@ -781,6 +840,9 @@ void benchmark_wide(const std::string& package, const std::string& archive,
                   << "\"synthetic_weights\":true,\"workload_note\":\"deployment performance boundary only; "
                      "small S is synthetic, not model speedup evidence\","
                   << "\"shape\":{\"S\":" << s << ",\"H\":128,\"I\":64,\"E\":4,\"K\":2},"
+                  << "\"precision\":\"" << config_precision
+                  << "\",\"expert_activation\":\"" << (config_expert_activation ? "gelu" : "silu")
+                  << "\",\"numerical_mode\":\"" << (config_numerical_mode ? "staged" : "fused") << "\","
                   << "\"cache_policy\":\"" << policy << "\",\"max_route_tile_rows\":" << tile_rows
                   << ",\"tile_policy\":\"" << (tile_rows ? "4096" : "auto") << "\","
                   << "\"iterations\":" << iterations << ",\"latency_ms_total\":" << total_ms
@@ -838,8 +900,17 @@ void validate_locked_archive(const Weights& weights, int64_t device) {
   int64_t backing = 0, resident_charge = 0;
   for (const auto& entry : weights.configs) {
     const auto& v = entry.second;
-    require(v.size() >= 23 && v[0] == 1 && v[21] >= 0 && v[21] <= 512 &&
-                v.size() == static_cast<size_t>(23 + v[21]), "LOCKED archive vector length/version");
+    // v1 = 23 fixed fields; v2 = the same prefix + activation@23 +
+    // numerical@24, with static resident IDs from 25. The outer manifest and
+    // archive format stay version 1/2 respectively.
+    const size_t header = v.size() >= 1 && v[0] == 1 ? 23 : v.size() >= 1 && v[0] == 2 ? 25 : v.size() >= 1 && v[0] == 3 ? 26 : 0;
+    require(header > 0 && v.size() >= header && v[21] >= 0 && v[21] <= 512 &&
+                v.size() == header + static_cast<size_t>(v[21]),
+            "LOCKED archive vector length/version");
+    if (v[0] >= 2)
+      require((v[23] == 0 || v[23] == 1) && (v[24] == 0 || v[24] == 1),
+              "LOCKED archive invalid expert activation/numerical mode");
+    if (v[0] == 3) require(v[25] == 1, "LOCKED archive invalid expert_type");
     require(v[1] > 0 && v[2] > 0 && v[3] > 0 && v[4] >= 1 && v[4] <= 2 &&
                 v[5] >= 0 && v[5] <= 2 && v[6] >= 0 && v[6] <= INT_MAX &&
                 v[7] >= 0 && v[7] <= v[1] && v[8] >= 0 && v[9] >= 0 && v[9] <= 1 &&
@@ -848,7 +919,10 @@ void validate_locked_archive(const Weights& weights, int64_t device) {
                 (v[15] == 0 || v[15] == 32 || v[15] == 64 || v[15] == 128) &&
                 (v[16] == 64 || v[16] == 128), "LOCKED archive invalid common fields");
     require(first.size() >= 23 && std::equal(v.begin(), v.begin() + 17, first.begin()) &&
-                v[22] == first[22], "LOCKED archive inconsistent common fields");
+                v[22] == first[22] && v[0] == first[0] &&
+                (v[0] == 1 || (v[23] == first[23] && v[24] == first[24])) &&
+                (v[0] != 3 || v[25] == first[25]),
+            "LOCKED archive inconsistent common fields");
     require(v[22] >= 80 && v[22] == properties.major * 10 + properties.minor,
             "LOCKED archive target SM mismatch");
     require(v[17] > 0 && v[17] <= 512 && v[18] > 0 && v[18] <= INT_MAX && v[18] % 64 == 0 &&
@@ -856,12 +930,12 @@ void validate_locked_archive(const Weights& weights, int64_t device) {
                 (v[20] == 0 || v[20] == 1) && v[21] <= v[17],
             "LOCKED archive invalid weight description");
     const auto& pair = weights.layers.at(entry.first);
-    require(pair.first.sizes() == at::IntArrayRef({v[17], 2 * v[19], v[18]}) &&
+    require(pair.first.sizes() == at::IntArrayRef({v[17], (v[0] == 3 ? 1 : 2) * v[19], v[18]}) &&
                 pair.second.sizes() == at::IntArrayRef({v[17], v[18], v[19]}) &&
                 pair.first.scalar_type() == (v[20] ? at::kBFloat16 : at::kHalf),
             "LOCKED archive actual weight/config mismatch");
     int64_t previous = -1;
-    for (size_t j = 23; j < v.size(); ++j) {
+    for (size_t j = header; j < v.size(); ++j) {
       require(v[j] > previous && v[j] < v[17] && v[7] > 0,
               "LOCKED archive invalid static resident IDs");
       previous = v[j];
@@ -953,13 +1027,15 @@ void check_locked(const std::string& package, const std::string& archive, int64_
   Weights weights(archive, false, true);
   require(weights.layers.size() == (chain ? 2 : 1), "LOCKED archive model layer count mismatch");
   validate_locked_archive(weights, device);
+  const size_t header = weights.configs.begin()->second[0] == 3 ? 26 : weights.configs.begin()->second[0] == 2 ? 25 : 23;
   // Invalid vector validation is independently exercised before any context creation.
-  for (int field : {-1, 0, 1, 13, 17, 21, 22, 23}) {
+  for (int field : {-1, 0, 1, 13, 17, 21, 22, static_cast<int>(header)}) {
     auto invalid = weights;
     auto& v = invalid.configs.begin()->second;
     if (field == -1) v.pop_back();
-    else if (field == 23 && v.size() <= 23) v.push_back(v[17]);
-    else v[field] = field == 23 ? v[17] : (field == 22 ? v[field] + 1 : -1);
+    else if (field == static_cast<int>(header) && v.size() <= header) v.push_back(v[17]);
+    else if (field == static_cast<int>(header)) v[field] = v[17];
+    else v[field] = field == 22 ? v[field] + 1 : -1;
     bool rejected = false;
     try { validate_locked_archive(invalid, device); }
     catch (const std::exception& error) {
@@ -1043,7 +1119,7 @@ void check_locked(const std::string& package, const std::string& archive, int64_
             "LOCKED sealed direct forward with manifest failed");
     std::cout << "PASS LOCKED C++ sealed direct forward full manifest" << std::endl;
   }
-  for (int field : {1, 13, 14, 15, 16, 23}) {
+  for (int field : {1, 13, 14, 15, 16, static_cast<int>(header)}) {
     auto wrong = weights;
     for (auto& entry : wrong.configs) {
       auto& v = entry.second;
@@ -1052,7 +1128,8 @@ void check_locked(const std::string& package, const std::string& archive, int64_
       else if (field == 15) v[field] = 64;
       else if (field == 16) v[field] = v[field] == 64 ? 128 : 64;
       else {
-        require(v.size() == 24, "LOCKED archive acceptance requires one static resident per layer");
+        require(v.size() == header + 1,
+                "LOCKED archive acceptance requires one static resident per layer");
         v[field] = 2;
       }
     }
@@ -1062,9 +1139,9 @@ void check_locked(const std::string& package, const std::string& archive, int64_
   }
   if (chain) {
     auto wrong_static = weights;
-    require(wrong_static.configs.at(5).size() == 24,
+    require(wrong_static.configs.at(5).size() == header + 1,
             "LOCKED chain requires one static resident for layer5");
-    wrong_static.configs.at(5)[23] = 1;
+    wrong_static.configs.at(5)[header] = 1;
     require(wrong_static.configs.at(0) == weights.configs.at(0), "LOCKED layer0 config changed");
     {
       LockedRuntime incompatible(wrong_static, device);
@@ -1162,6 +1239,141 @@ std::vector<int64_t> public_status(PublicRuntime& runtime) {
   const auto* data = tensor.const_data_ptr<int64_t>();
   require(data[0] == 1 && data[1] >= 0 && data[1] <= 2, "PUBLIC status v1 state mismatch");
   return std::vector<int64_t>(data, data + 10);
+}
+
+void use_artifact_config(const Weights& weights) {
+  const auto& v = weights.configs.begin()->second;
+  const std::string precision = v[20] ? "bf16" : "fp16";
+  const int64_t activation = v[0] >= 2 ? v[23] : 0;
+  const int64_t numerical = v[0] >= 2 ? v[24] : 0;
+  config_expert_type = v[0] == 3 ? v[25] : 0;
+  require(!precision_explicit || config_precision == precision,
+          "--precision differs from frozen artifact dtype");
+  require(!expert_activation_explicit || config_expert_activation == activation,
+          "--expert-activation differs from frozen artifact config");
+  require(!numerical_mode_explicit || config_numerical_mode == numerical,
+          "--numerical-mode differs from frozen artifact config");
+  require(!async_staging_explicit || v[13] == 1,
+          "--async-staging differs from frozen artifact config");
+  require(!host_profile_explicit || v[14] == 1,
+          "--host-profile differs from frozen artifact config");
+  config_precision = precision;
+  config_expert_activation = activation;
+  config_numerical_mode = numerical;
+  config_async_staging = v[13] != 0;
+  config_host_profile = v[14] != 0;
+}
+
+void assert_no_python_interpreter();
+
+void check_geglu(const std::string& package, const std::string& archive,
+                 int64_t device, const std::vector<int64_t>& sizes, int64_t expert_type = 0) {
+  require(!sizes.empty(), "GEGLU requires dynamic sizes");
+  for (const auto s : sizes) require(s >= 2 && s <= 64, "GEGLU S is outside exported [2,64]");
+  for (int64_t s : {2, 7, 64})
+    require(std::find(sizes.begin(), sizes.end(), s) != sizes.end(),
+            "GEGLU requires S=2, S=7 and S=64");
+  Weights weights(archive, false, true);
+  require(weights.layers.size() == 2 && weights.layers.count(0) && weights.layers.count(5),
+          "GEGLU requires the frozen two-layer 0/5 chain");
+  validate_locked_archive(weights, device);
+  use_artifact_config(weights);
+  for (const auto& entry : weights.configs)
+    require(entry.second[0] == (expert_type == 1 ? 3 : 2) &&
+                (expert_type == 0 || entry.second[25] == 1) &&
+                entry.second[23] == 1 && entry.second[24] == 1 &&
+                entry.second[5] == 1 && entry.second[8] > 0,
+            "GEGLU requires dynamic config-v2 GELU/staged accumulate artifact");
+  const auto manifest = locked_manifest(weights);
+  PublicRuntime runtime(device, weights.layers, manifest);
+  require(runtime.manifest() == manifest, "GEGLU frozen manifest changed");
+  require(runtime.expert_type() == expert_type, "Frozen expert_type mismatch");
+  torch::inductor::AOTIModelPackageLoader loader(package, "model");
+  const auto bindings = locked_bindings(true);
+  auto observations = sizes;
+  observations.push_back(sizes.front());  // Exercise reuse after dynamic shape changes.
+  for (const auto s : observations) {
+    auto inputs = locked_inputs(s, device, weights, runtime.token(), true);
+    const auto chain_reference = [&](int64_t activation) {
+      auto value = inputs[0];
+      for (const auto& entry : weights.layers) {
+        const auto& v = weights.configs.at(entry.first);
+        value = reference({value, entry.second.first, entry.second.second,
+                           inputs[5], inputs[6], inputs[7]}, true, activation, v[24], runtime.expert_type())
+                    .to(inputs[0].scalar_type());
+      }
+      return value.to(at::kCPU).to(at::kFloat);
+    };
+    // Artifact fields are authoritative; GEGLU was checked above to be 1/1.
+    const auto expected = chain_reference(config_expert_activation);
+    const auto silu = chain_reference(0);
+    const double norm = expected.to(at::kDouble).norm().item<double>();
+    const double discrimination = (expected - silu).to(at::kDouble).norm().item<double>() /
+                                  std::max(norm, 1e-12);
+    require(at::isfinite(expected).all().item<bool>() &&
+                expected.abs().max().item<float>() > .0001 && discrimination > .001,
+            "GEGLU reference underflowed or cannot distinguish GELU from SiLU");
+    const auto before = public_status(runtime);
+    const auto token = runtime.token().clone();
+    const auto version = runtime.token()._version();
+    const auto ptr = runtime.token().const_data_ptr();
+    auto outputs = runtime.invoke(
+        [&](const std::vector<at::Tensor>& bound) { return loader.run(bound); }, inputs, bindings);
+    c10::cuda::getCurrentCUDAStream(device).synchronize();
+    const auto after = public_status(runtime);
+    require(after[1] == 0 && after[2] == 0 && after[3] == 0 &&
+                after[4] == before[4] + 2 && after[5] == after[4] &&
+                after[8] == before[8] + 1 && after[9] == 5,
+            "GEGLU managed status progression mismatch");
+    require(runtime.token().const_data_ptr() == ptr && runtime.token()._version() == version + 2 &&
+                runtime.token()[0].item<int64_t>() == token[0].item<int64_t>() &&
+                runtime.token()[1].item<int64_t>() == token[1].item<int64_t>() + 2,
+            "GEGLU compiled chain token identity/mutation mismatch");
+    require(outputs.size() == 1 && outputs[0].defined() && outputs[0].sizes() == inputs[0].sizes() &&
+                outputs[0].device() == inputs[0].device() &&
+                outputs[0].scalar_type() == inputs[0].scalar_type(), "GEGLU output metadata mismatch");
+    const auto actual = outputs[0].to(at::kCPU).to(at::kFloat);
+    const auto error = actual.to(at::kDouble) - expected.to(at::kDouble);
+    const double relative_l2 = error.norm().item<double>() / norm;
+    const double reference_rms = norm / std::sqrt(static_cast<double>(expected.numel()));
+    const double dtype_epsilon = inputs[0].scalar_type() == at::kHalf ? 1.0 / 1024 : 1.0 / 128;
+    // MLP outputs have no second gate/up product suppressing their scale.
+    // Use the same dtype/RMS budget as Python; legacy GLU stays at 2e-6.
+    const double comparison_atol = .000002 + (expert_type == 1 ? 2 * dtype_epsilon * reference_rms : 0);
+    require(at::isfinite(actual).all().item<bool>() &&
+                (actual - expected).abs().le(expected.abs() * .02 + comparison_atol).all().item<bool>() &&
+                relative_l2 < .02, "dtype-rounded staged expert-chain reference mismatch");
+    auto stats = call("recsys_ops::fuse_moe_offload_stats", {runtime.token()})[0].toTensor();
+    require(stats.device().is_cpu() && stats.scalar_type() == at::kLong && stats.numel() == stats_fields,
+            "GEGLU stats schema mismatch");
+    const auto* st = stats.const_data_ptr<int64_t>();
+    const auto& v = weights.configs.begin()->second;
+    require(st[0] == 2 && st[16] + st[17] == 2 && st[9] == 1 && st[11] > 0 &&
+                st[14] + st[19] + st[22] <= st[4] && st[4] <= v[1] && st[5] <= v[3] && st[6] <= v[2],
+            "GEGLU active routes/activation/budget mismatch");
+    assert_no_python_interpreter();
+    std::cout << std::setprecision(17) << (expert_type == 1 ? "ACCEPTANCE_MLP_CPP {\"S\":" : "ACCEPTANCE_GEGLU_CPP {\"S\":") << s
+              << ",\"label\":\"C++ AOTI S=" << s << "\",\"precision\":\"" << config_precision
+              << "\",\"expert_type\":\"" << (expert_type == 1 ? "mlp" : "glu")
+              << "\",\"expert_activation\":\"gelu\",\"numerical_mode\":\"staged\""
+              << ",\"comparison_atol\":" << comparison_atol
+              << ",\"comparison_rtol\":0.02,\"reference_rms\":" << reference_rms
+              << ",\"max_abs_error\":" << error.abs().max().item<double>()
+              << ",\"rmse\":" << error.square().mean().sqrt().item<double>()
+              << ",\"relative_l2\":" << relative_l2
+              << ",\"exact_equal\":" << (actual.equal(expected) ? "true" : "false")
+              << ",\"gelu_vs_silu_relative_l2\":" << discrimination
+              << ",\"token_checked\":true,\"status_checked\":true,\"reference_checked\":true"
+              << ",\"python_uninitialized\":true,\"strict_no_jit\":true"
+              << ",\"async_staging_enabled\":" << (config_async_staging ? "true" : "false")
+              << ",\"host_profile_enabled\":" << (config_host_profile ? "true" : "false")
+              << ",\"status_values\":[";
+    for (size_t j = 0; j < after.size(); ++j) std::cout << (j ? "," : "") << after[j];
+    std::cout << "],\"stats_values\":[";
+    for (int j = 0; j < stats_fields; ++j) std::cout << (j ? "," : "") << st[j];
+    std::cout << "]}" << std::endl;
+  }
+  runtime.close();
 }
 
 void print_public_status(const std::vector<int64_t>& status, const std::string& label) {
@@ -1464,10 +1676,14 @@ void benchmark_locked(const std::string& package, const std::string& archive,
   require(weights.layers.size() == 1 && weights.layers.count(0), "Benchmark requires layer 0 only");
   const auto& pair = weights.layers.at(0);
   const int64_t e = pair.first.size(0), h = pair.first.size(2);
-  require(e == 16 && pair.first.scalar_type() == at::kHalf, "Locked synthetic fixture requires E16 FP16");
+  validate_locked_archive(weights, device);
+  use_artifact_config(weights);
+  const auto dtype = pair.first.scalar_type();
+  require(e == 16 && (dtype == at::kHalf || dtype == at::kBFloat16),
+          "Locked synthetic fixture requires E16 fp16/bf16");
   const auto cpu = at::TensorOptions().device(at::kCPU);
   const auto gpu = c10::Device(c10::kCUDA, static_cast<c10::DeviceIndex>(device));
-  auto x = (at::arange(s * h, cpu.dtype(at::kFloat)).cos() * .25).reshape({s, h}).to(gpu, at::kHalf);
+  auto x = (at::arange(s * h, cpu.dtype(at::kFloat)).cos() * .25).reshape({s, h}).to(gpu, dtype);
   auto rows = at::arange(s, cpu.dtype(at::kLong)).reshape({s, 1});
   auto slots = at::arange(k, cpu.dtype(at::kLong)).reshape({1, k});
   std::map<std::string, at::Tensor> routes, scales, expected;
@@ -1484,7 +1700,9 @@ void benchmark_locked(const std::string& package, const std::string& archive,
     if (entry.first == "skewed_masked")
       scale = at::where((rows + slots).remainder(3).eq(0), -scale * .5, scale * 1.25);
     // Independent actual CPU ATen reference outside all invocation timers.
-    expected[entry.first] = reference({x, pair.first, pair.second, entry.second, scale, {}});
+    expected[entry.first] = reference({x, pair.first, pair.second, entry.second, scale, {}},
+                                      true, config_expert_activation, config_numerical_mode)
+                                .to(dtype).to(at::kFloat);
     entry.second = entry.second.to(gpu);
     scales[entry.first] = scale.to(gpu);
   }
@@ -1521,7 +1739,11 @@ void benchmark_locked(const std::string& package, const std::string& archive,
     return runtime;
   };
   auto measure = [&](PublicRuntime& runtime, const std::string& phase, const std::string& route) {
-    std::vector<at::Tensor> inputs{x, {}, {}, routes.at(route), scales.at(route), {}};
+    auto inputs = runtime.prepare({x, {}, {}, routes.at(route), scales.at(route), {}}, bindings);
+    const auto status_before = public_status(runtime);
+    const auto token_before = runtime.token().clone();
+    const auto token_ptr = runtime.token().const_data_ptr();
+    const auto token_version = runtime.token()._version();
     stream.synchronize();
     rusage before{}, after{};
     require(getrusage(RUSAGE_SELF, &before) == 0, "getrusage failed");
@@ -1537,10 +1759,18 @@ void benchmark_locked(const std::string& package, const std::string& archive,
     };
     auto stats = stats_of(runtime);
     const auto status = public_status(runtime);
-    require(status[1] == 0 && status[2] == 0 && status[3] == 0, "Benchmark runtime not healthy");
+    require(status[1] == 0 && status[2] == 0 && status[3] == 0 &&
+                status[4] == status_before[4] + 1 && status[5] == status[4] &&
+                status[8] == status_before[8] + 1 && status[9] == 0,
+            "Benchmark managed status progression mismatch");
+    require(runtime.token().const_data_ptr() == token_ptr &&
+                runtime.token()._version() == token_version + 1 &&
+                runtime.token()[0].item<int64_t>() == token_before[0].item<int64_t>() &&
+                runtime.token()[1].item<int64_t>() == token_before[1].item<int64_t>() + 1,
+            "Benchmark token identity/mutation mismatch");
     auto allocator = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
-    require(outputs.size() == 1 && outputs[0].sizes() == x.sizes() && outputs[0].scalar_type() == at::kHalf,
-            "Locked benchmark output metadata mismatch");
+    require(outputs.size() == 1 && outputs[0].sizes() == x.sizes() && outputs[0].scalar_type() == dtype &&
+                outputs[0].device() == x.device(), "Locked benchmark output metadata mismatch");
     auto actual = outputs[0].to(at::kCPU).to(at::kFloat);
     auto error = (actual - expected.at(route)).abs();
     require(at::isfinite(actual).all().item<bool>() &&
@@ -1595,6 +1825,10 @@ void benchmark_locked(const std::string& package, const std::string& archive,
             "\"backend\":\"cpp_public_aoti\",\"final_frozen\":true,"
             "\"timer\":\"steady_clock_invoke_preflight_begin_loader_check_stream_sync\","
             "\"reference_checked\":true,\"model_load_ms\":" << model_load_ms
+         << ",\"precision\":" << std::quoted(config_precision)
+         << ",\"expert_activation\":" << std::quoted(config_expert_activation ? "gelu" : "silu")
+         << ",\"numerical_mode\":" << std::quoted(config_numerical_mode ? "staged" : "fused")
+         << ",\"async_staging_enabled\":" << (config_async_staging ? "true" : "false")
          << ",\"host_profile\":" << (weights.configs.at(0)[14] ? "true" : "false")
          << ",\"case_wall_ms\":" << elapsed_ms(wall_start)
          << ",\"process_peak_rss_bytes\":" << peak_rss_kib() * 1024
@@ -1943,6 +2177,49 @@ void assert_no_python_interpreter() {
 int run_main(int argc, char** argv) {
   try {
     const auto process_started = Clock::now();
+    const std::string mode = argc >= 2 ? argv[1] : "";
+    const std::set<std::string> modes{"--native-faults", "--locked-benchmark", "--public",
+                                       "--locked", "--locked-chain", "--geglu", "--mlp"};
+    require(mode.empty() || mode[0] != '-' || modes.count(mode), "Unknown runner mode: " + mode);
+    const bool wide_benchmark = argc > 5 && std::string(argv[5]) == "--benchmark-wide";
+    require(!(precision_explicit || expert_activation_explicit || numerical_mode_explicit) ||
+                mode == "--geglu" || mode == "--mlp" || mode == "--locked-benchmark" || wide_benchmark,
+            "--precision/--expert-activation/--numerical-mode require GEGLU or benchmark mode");
+    for (int j = 2; j < argc; ++j) {
+      const std::string option = argv[j];
+      require(option.empty() || option[0] != '-' || option == "--negative-layer" ||
+                  option == "--wide" || option == "--benchmark-wide",
+              "Unknown runner argument: " + option);
+    }
+    if (mode == "--geglu" || mode == "--mlp") {
+      require(argc >= 9, "Usage: runner --geglu model.pt2 ops.so device weights.pt S2 S7 S64 [S...] "
+                         "[--precision fp16|bf16] [--async-staging] [--host-profile]");
+      std::vector<int64_t> sizes;
+      for (int j = 6; j < argc; ++j) {
+        size_t consumed = 0;
+        const std::string value = argv[j];
+        const int64_t s = std::stoll(value, &consumed);
+        require(consumed == value.size() && s >= 2 && s <= 64, "Invalid GEGLU S: " + value);
+        sizes.push_back(s);
+      }
+      for (int64_t s : {2, 7, 64})
+        require(std::find(sizes.begin(), sizes.end(), s) != sizes.end(), "GEGLU requires S=2,7,64");
+      assert_no_python_interpreter();
+      void* native = dlopen(argv[3], RTLD_NOW | RTLD_GLOBAL);
+      if (!native) throw std::runtime_error(std::string("GEGLU ops dlopen failed: ") + dlerror());
+      const int64_t device = std::stoll(argv[4]);
+      require(device >= 0 && device <= std::numeric_limits<c10::DeviceIndex>::max(),
+              "GEGLU device index out of range");
+      c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device));
+      at::NoGradGuard no_grad;
+      check_geglu(argv[2], argv[5], device, sizes, mode == "--mlp" ? 1 : 0);
+      assert_no_python_interpreter();
+      std::cout << (mode == "--mlp" ?
+                    "PASS MLP standalone frozen-manifest official AOTI strict_noJIT Python_uninitialized" :
+                    "PASS GEGLU standalone frozen-manifest official AOTI strict_noJIT Python_uninitialized")
+                << std::endl;
+      return 0;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--native-faults") {
       require(argc == 4, "Usage: runner --native-faults ops.so device [--output-dir path]");
       assert_no_python_interpreter();
@@ -2002,22 +2279,14 @@ int run_main(int argc, char** argv) {
       std::cout << "PASS LOCKED standalone Python-free format2 AOTI" << std::endl;
       return 0;
     }
-    // Strip create-time flags from trailing arguments before legacy shape/wide
-    // parsing, preserving both old acceptance and benchmark command layouts.
-    int positional_argc = std::min(argc, 5);
-    for (int arg = 5; arg < argc; ++arg) {
-      const std::string option = argv[arg];
-      if (option == "--async-staging") config_async_staging = true;
-      else if (option == "--host-profile") config_host_profile = true;
-      else argv[positional_argc++] = argv[arg];
-    }
-    argc = positional_argc;
-    argv[argc] = nullptr;
+    // Common create-time CLI flags were validated and stripped in main for
+    // every mode, including paths that return before legacy parsing.
     const bool benchmarking = argc >= 8 && std::string(argv[5]) == "--benchmark-wide";
     require(benchmarking || argc >= 9,
             "Usage: runner model.pt2 ops.so cuda_device weights.pt chain.pt2 S2 S7 S64 [S...] "
             "[--wide wide_fp16.pt2 wide_weights_fp16.pt]; or runner wide.pt2 ops.so cuda_device "
             "wide_weights.pt --benchmark-wide iterations S [S...]"
+        " [--precision fp16|bf16] [--expert-activation silu|gelu] [--numerical-mode fused|staged]"
         " [--async-staging] [--host-profile]");
     int sizes_end = argc;
     std::string wide_package, wide_archive;
@@ -2152,14 +2421,42 @@ class EvidenceStream : public std::streambuf {
 
 int main(int argc, char** argv) {
   try {
-    std::vector<char*> positional;
-    for (int j = 0; j < argc; ++j) {
-      if (std::string(argv[j]) == "--output-dir") {
+    std::vector<char*> positional{argv[0]};
+    for (int j = 1; j < argc; ++j) {
+      const std::string option = argv[j];
+      if (option == "--output-dir") {
         require(j + 1 < argc && output_directory.empty(), "--output-dir requires one unique path");
         output_directory = std::filesystem::absolute(argv[++j]);
+      } else if (option == "--async-staging") {
+        require(!async_staging_explicit, "Duplicate --async-staging");
+        async_staging_explicit = config_async_staging = true;
+      } else if (option == "--host-profile") {
+        require(!host_profile_explicit, "Duplicate --host-profile");
+        host_profile_explicit = config_host_profile = true;
+      } else if (option == "--precision" || option == "--expert-activation" || option == "--numerical-mode") {
+        require(j + 1 < argc, option + " requires a value");
+        const std::string value = argv[++j];
+        if (option == "--precision") {
+          require(!precision_explicit && (value == "fp16" || value == "bf16"),
+                  "--precision requires one unique fp16|bf16 value");
+          precision_explicit = true;
+          config_precision = value;
+        } else if (option == "--expert-activation") {
+          require(!expert_activation_explicit && (value == "silu" || value == "gelu"),
+                  "--expert-activation requires one unique silu|gelu value");
+          expert_activation_explicit = true;
+          config_expert_activation = value == "gelu" ? 1 : 0;
+        } else {
+          require(!numerical_mode_explicit && (value == "fused" || value == "staged"),
+                  "--numerical-mode requires one unique fused|staged value");
+          numerical_mode_explicit = true;
+          config_numerical_mode = value == "staged" ? 1 : 0;
+        }
       } else positional.push_back(argv[j]);
     }
-    if (output_directory.empty()) return run_main(argc, argv);
+    const int positional_argc = static_cast<int>(positional.size());
+    positional.push_back(nullptr);
+    if (output_directory.empty()) return run_main(positional_argc, positional.data());
     std::filesystem::create_directories(output_directory);
     std::ofstream stdout_file(output_directory / "runner.stdout.txt");
     std::ofstream stderr_file(output_directory / "runner.stderr.txt");
@@ -2176,8 +2473,6 @@ int main(int argc, char** argv) {
     EvidenceStream stderr_tee(std::cerr.rdbuf(), stderr_file.rdbuf());
     auto* stdout_original = std::cout.rdbuf(&stdout_tee);
     auto* stderr_original = std::cerr.rdbuf(&stderr_tee);
-    const int positional_argc = static_cast<int>(positional.size());
-    positional.push_back(nullptr);
     int code = 1;
     try { code = run_main(positional_argc, positional.data()); }
     catch (...) {

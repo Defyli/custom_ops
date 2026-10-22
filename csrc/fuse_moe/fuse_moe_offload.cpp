@@ -549,6 +549,8 @@ struct Context {
     bool seal_requires_manifest = false;
     const bool async_staging, host_profile;
     const int64_t tile_m, tile_n, target_sm;
+    // Immutable compute contract; every deployment config must agree.
+    const int64_t expert_activation, numerical_mode, expert_type;
     std::unordered_map<int64_t, Layer> layers;
     std::vector<Output> outputs;
     std::array<Tensor, BufferCount> pool;
@@ -559,32 +561,47 @@ struct Context {
     Context(int d, int64_t g, int64_t r, int64_t p, int64_t b,
             int64_t m, int64_t tile, int64_t cache, int64_t dynamic,
             int64_t cache_policy, int64_t decay, int64_t reuse, int64_t update,
-            bool async, bool profile, int64_t tm, int64_t tn, int64_t sm, const Tensor& t)
+            bool async, bool profile, int64_t tm, int64_t tn, int64_t sm,
+            int64_t activation, int64_t numerical, int64_t type, const Tensor& t)
         : device(d), gpu(g), ram(r), pinned(p), banks(b), mode(m), max_tile(tile), cache_limit(cache),
           dynamic_limit(dynamic), policy(cache_policy), decay_interval(decay), min_reuse(reuse),
           update_limit(update), token_storage(t.storage().getWeakStorageImpl()),
           async_staging(async), host_profile(profile), tile_m(tm), tile_n(tn),
-          target_sm(sm), transfers(d, b) {
+          target_sm(sm), expert_activation(activation), numerical_mode(numerical),
+          expert_type(type), transfers(d, b) {
 #if defined(CUSTOM_OPS_OFFLOAD_TESTING) && CUSTOM_OPS_OFFLOAD_TESTING
         staging.set_faults(&faults);
 #endif
     }
 };
-// Version 1: [version, gpu, ram, pinned, banks, mode, max_tile, cache_limit,
-// dynamic_limit, policy, decay_interval, min_reuse, update_limit, async, profile,
-// tile_m, tile_n, E, H, I, dtype_code, resident_count, target_sm, sorted static IDs...].
-// There are 23 fixed fields; target_sm is at 22 and static IDs start at 23.
+// Deployment config layout. Version 1: [version, gpu, ram, pinned, banks, mode,
+// max_tile, cache_limit, dynamic_limit, policy, decay_interval, min_reuse,
+// update_limit, async, profile, tile_m, tile_n, E, H, I, dtype_code,
+// resident_count, target_sm, sorted static IDs...]. Version 2 appends
+// expert_activation/numerical_mode at 23/24 and moves static IDs to 25, i.e.
+// 25 + resident_count fields. Version 3 adds expert_type at 25 and moves
+// static IDs to 26. Versions 1/2 imply GLU; version 1 also implies SiLU/fused.
+// Native validation permits explicit v3 GLU and legacy v2 0/0 records;
+// canonical producers use v1 for GLU 0/0, v2 for other GLU modes, v3 for MLP.
+// The outer manifest framing stays 1.
 // The half-open slice [1,17) matches immutable, resolved context values.
 // Runtime device ordinal is deliberately absent: same-target replicas may use
 // different local CUDA ordinals while sharing the graph's deployment contract.
+constexpr size_t kDeploymentConfigV1Fields = 23;
+constexpr size_t kDeploymentConfigV2Fields = 25;
+constexpr size_t kDeploymentConfigV3Fields = 26;
 void validate_deployment_config(at::IntArrayRef config, const Context& c,
                                 const Layer& layer, const Tensor& w1, const Tensor& w2,
                                 const char* format_error = "invalid deployment configuration format") {
     TORCH_CHECK(!c.sealed || !config.empty(),
         "sealed deployment context requires its compiled configuration");
     if (config.empty()) return;
-    TORCH_CHECK(config.size() >= 23 && config[0] == 1,
-        format_error, ": expected version 1 and 23 fixed fields");
+    // Each record selects a fixed 23/25/26-field header by version 1/2/3.
+    // The outer manifest keeps version-1 framing; records may mix versions.
+    const int64_t version = config[0];
+    TORCH_CHECK(config.size() >= kDeploymentConfigV1Fields &&
+        (version == 1 || version == 2 || version == 3),
+        format_error, ": expected configuration version 1, 2 or 3 and at least 23 fixed fields");
     TORCH_CHECK(config[22] >= 80,
         format_error, ": target_sm must be SM80+");
     const int64_t experts = config[17], hidden = config[18], intermediate = config[19];
@@ -602,11 +619,37 @@ void validate_deployment_config(at::IntArrayRef config, const Context& c,
     TORCH_CHECK(experts > 0 && experts <= 512 && hidden > 0 && hidden <= INT_MAX &&
         hidden % 64 == 0 && intermediate > 0 && intermediate <= INT_MAX / 2 &&
         intermediate % 64 == 0 && (config[20] == 0 || config[20] == 1) &&
-        resident_count >= 0 && resident_count <= experts &&
-        config.size() - 23 == static_cast<size_t>(resident_count),
-        format_error, ": invalid weights or resident count/length");
+        resident_count >= 0 && resident_count <= experts,
+        format_error, ": invalid weights or resident count");
+    // The version fixes the header width; the validated resident_count fixes
+    // the remainder, so a malformed record can never masquerade as the other
+    // layout. Static resident IDs start at 23 (v1), 25 (v2) or 26 (v3).
+    const size_t fixed = version == 3 ? kDeploymentConfigV3Fields :
+        (version == 2 ? kDeploymentConfigV2Fields : kDeploymentConfigV1Fields);
+    TORCH_CHECK(config.size() == fixed + static_cast<size_t>(resident_count),
+        format_error, ": config length must match its version and resident_count");
+    const int64_t expert_type = version == 3 ? config[25] : 0;
+    TORCH_CHECK(expert_type == 0 || expert_type == 1,
+        format_error, ": expert_type must be 0 (GLU) or 1 (MLP)");
+    TORCH_CHECK(expert_type == c.expert_type,
+        "deployment configuration mismatch: expert_type");
+    if (version >= 2) {
+        TORCH_CHECK((config[23] == 0 || config[23] == 1) &&
+            (config[24] == 0 || config[24] == 1),
+            format_error, ": expert_activation and numerical_mode must be 0 or 1");
+        TORCH_CHECK(config[23] == c.expert_activation,
+            "deployment configuration mismatch: expert_activation");
+        TORCH_CHECK(config[24] == c.numerical_mode,
+            "deployment configuration mismatch: numerical_mode");
+    } else {
+        // Legacy records encode SiLU/legacy-fused implicitly. A GEGLU or
+        // staged-rounding context must never accept them by omission.
+        TORCH_CHECK(c.expert_activation == 0 && c.numerical_mode == 0,
+            "deployment configuration mismatch: version 1 configuration implies "
+            "expert_activation=0/numerical_mode=0");
+    }
     int64_t previous = -1;
-    for (size_t j = 23; j < config.size(); ++j) {
+    for (size_t j = fixed; j < config.size(); ++j) {
         TORCH_CHECK(config[j] > previous && config[j] < experts,
             format_error, ": static resident IDs must be sorted and unique in [0,E)");
         previous = config[j];
@@ -620,14 +663,14 @@ void validate_deployment_config(at::IntArrayRef config, const Context& c,
     TORCH_CHECK(config[22] == c.target_sm, "deployment configuration mismatch: target_sm");
     auto matches_weights = [&](const Tensor& a, const Tensor& b) {
         return a.dim() == 3 && b.dim() == 3 && a.size(0) == experts && b.size(0) == experts &&
-            a.size(1) == 2 * intermediate && a.size(2) == hidden &&
+            a.size(1) == (expert_type == 0 ? 2 : 1) * intermediate && a.size(2) == hidden &&
             b.size(1) == hidden && b.size(2) == intermediate &&
             a.scalar_type() == (config[20] == 0 ? at::kHalf : at::kBFloat16) &&
             b.scalar_type() == a.scalar_type();
     };
     TORCH_CHECK(matches_weights(w1, w2) && matches_weights(layer.w1, layer.w2),
         "deployment configuration mismatch: weight dimensions or dtype");
-    size_t next = 23;
+    size_t next = fixed;
     for (size_t expert = 0; expert < layer.resident.size(); ++expert) {
         if (!layer.resident[expert].defined() ||
             (!layer.heat.empty() && layer.heat[expert].dynamic)) continue;
@@ -638,9 +681,11 @@ void validate_deployment_config(at::IntArrayRef config, const Context& c,
     TORCH_CHECK(next == config.size(), "deployment configuration mismatch: static resident expert IDs");
 }
 
-// Version 1 manifest: [1, layer_count, layer_id, config_length, *config,
-// ...]. A sorted, complete inventory lets every graph invocation validate all
-// layers before any token/cache mutation, allocation, or GPU submission.
+// Manifest framing stays version 1: [1, layer_count, layer_id, config_length,
+// *config, ...]. Each record may carry a version-1/2/3 (23/25/26-field)
+// config; validation dispatches per record and covers every layer.
+// A sorted, complete inventory lets every graph invocation validate all layers
+// before any token/cache mutation, allocation, or GPU submission.
 void validate_deployment_manifest(at::IntArrayRef manifest, at::IntArrayRef config,
                                   const Context& c, int64_t current_layer) {
     TORCH_CHECK(!c.seal_requires_manifest || !manifest.empty(),
@@ -649,8 +694,9 @@ void validate_deployment_manifest(at::IntArrayRef manifest, at::IntArrayRef conf
     TORCH_CHECK(manifest.size() >= 2 && manifest[0] == 1 && manifest[1] >= 0,
         "invalid deployment manifest format: expected version 1 and nonnegative layer count");
     const int64_t count = manifest[1];
-    // Every record contains at least two header fields plus 23 config fields.
-    TORCH_CHECK(static_cast<uint64_t>(count) <= (manifest.size() - 2) / 25,
+    // Every record contains at least two header fields plus a 23-field config.
+    constexpr size_t kMinLayerRecord = 2 + kDeploymentConfigV1Fields;
+    TORCH_CHECK(static_cast<uint64_t>(count) <= (manifest.size() - 2) / kMinLayerRecord,
         "invalid deployment manifest format: truncated layer records");
     TORCH_CHECK(static_cast<uint64_t>(count) == c.layers.size(),
         "deployment configuration mismatch: manifest must include every bound layer");
@@ -665,7 +711,10 @@ void validate_deployment_manifest(at::IntArrayRef manifest, at::IntArrayRef conf
         TORCH_CHECK(id > previous,
             "invalid deployment manifest format: layer IDs must be sorted, unique and nonnegative");
         previous = id;
-        TORCH_CHECK(length >= 23 && static_cast<uint64_t>(length) <= manifest.size() - offset,
+        // The config's own version/length contract is validated below; the
+        // smallest legal record still carries the 23 fixed version-1 fields.
+        TORCH_CHECK(length >= static_cast<int64_t>(kDeploymentConfigV1Fields) &&
+            static_cast<uint64_t>(length) <= manifest.size() - offset,
             "invalid deployment manifest format: invalid config length");
         const auto segment = manifest.slice(offset, static_cast<size_t>(length));
         offset += static_cast<size_t>(length);
@@ -730,7 +779,8 @@ struct Victim {
     int64_t bytes;
 };
 int64_t expert_size(const Layer& layer) {
-    return mul(mul(layer.w1.size(2), layer.w2.size(2)), 6);
+    return add(mul(layer.w1.numel() / layer.w1.size(0), layer.w1.element_size()),
+        mul(layer.w2.numel() / layer.w2.size(0), layer.w2.element_size()));
 }
 uint32_t observed_frequency(const Layer& layer, int expert, const Layer* current,
                             const int* counts) {
@@ -828,16 +878,16 @@ std::shared_ptr<Context> lookup(const Tensor& token) {
         "runtime_token identity mismatch (tokens cannot be cloned or serialized)");
     return it->second;
 }
-void weights(const Tensor& w1, const Tensor& w2) {
+void weights(const Tensor& w1, const Tensor& w2, int64_t expert_type) {
     TORCH_CHECK(w1.device().is_cpu() && w2.device().is_cpu(), "offload weights must remain on CPU");
     TORCH_CHECK(w1.dim() == 3 && w2.dim() == 3 && w1.is_contiguous() && w2.is_contiguous(),
-        "offload weights must be canonical contiguous (E,2I,H)/(E,H,I)");
+        "offload weights must be canonical contiguous w1=(E,2I,H) for GLU or (E,I,H) for MLP, w2=(E,H,I)");
     TORCH_CHECK((w1.scalar_type() == at::kHalf || w1.scalar_type() == at::kBFloat16) &&
         w2.scalar_type() == w1.scalar_type(), "offload requires matching fp16/bf16 weights");
     TORCH_CHECK(w1.size(0) > 0 && w1.size(0) <= 512 && w2.size(0) == w1.size(0) &&
-        w2.size(1) == w1.size(2) && w1.size(1) == 2 * w2.size(2) &&
         w1.size(2) > 0 && w2.size(2) > 0 && w1.size(2) % 64 == 0 && w2.size(2) % 64 == 0 &&
-        w1.size(2) <= INT_MAX && w2.size(2) <= INT_MAX / 2,
+        w1.size(2) <= INT_MAX && w2.size(2) <= INT_MAX / 2 &&
+        w2.size(1) == w1.size(2) && w1.size(1) == (expert_type == 0 ? 2 : 1) * w2.size(2),
         "invalid E/H/I or unsupported alignment (E<=512, H/I multiples of 64)");
     TORCH_CHECK(!w1.is_pinned() && !w2.is_pinned(),
         "canonical weights must be pageable RAM; pinned_budget_bytes covers staging only");
@@ -945,7 +995,7 @@ bool promote(Context& c, Layer& layer, int expert, const uint8_t* gate_up,
     // Admission already drains: also complete the new allocation itself before
     // a different stream writes it (required by stream-ordered allocators).
     C10_CUDA_CHECK(cudaStreamSynchronize(stream));
-    const int64_t gate_bytes = mul(layer.w1[0].numel(), 2);
+    const int64_t gate_bytes = mul(layer.w1.numel() / layer.w1.size(0), layer.w1.element_size());
     auto* dst = candidate.data_ptr<uint8_t>();
     C10_CUDA_CHECK(cudaMemcpyAsync(dst, gate_up, gate_bytes, cudaMemcpyDeviceToDevice, publication.copy));
     C10_CUDA_CHECK(cudaMemcpyAsync(dst + gate_bytes, down, bytes - gate_bytes,
@@ -1063,7 +1113,7 @@ Execution execution_plan(const Context& c, const int* counts, int experts,
                 sizes[ResidentMeta] = add(sizes[ResidentMeta], mul(2 * resident_groups, sizeof(void*)));
         }
         for (int b = 0; b < banks; ++b) {
-            sizes[HostBank0 + b] = sizes[GpuBank0 + b] = mul(mul(mul(capacity, h), i), 6);
+            sizes[HostBank0 + b] = sizes[GpuBank0 + b] = mul(capacity, expert_size(layer));
             sizes[HostMeta0 + b] = sizes[GpuMeta0 + b] = mul(4 * capacity + 2, 4);
         }
         return sizes;
@@ -1141,7 +1191,15 @@ Tensor fuse_moe_offload_create(int64_t device, int64_t gpu, int64_t ram,
                               int64_t pinned, int64_t banks, int64_t mode, int64_t max_tile,
                               int64_t cache_limit, int64_t dynamic_limit, int64_t policy,
                               int64_t decay_interval, int64_t min_reuse, int64_t update_limit,
-                              bool async_staging, bool host_profile, int64_t tile_m, int64_t tile_n) {
+                              bool async_staging, bool host_profile, int64_t tile_m, int64_t tile_n,
+                              int64_t expert_activation, int64_t numerical_mode, int64_t expert_type) {
+    // Reject unknown compute contracts before touching CUDA state or allocating.
+    TORCH_CHECK(expert_type == 0 || expert_type == 1,
+        "expert_type must be 0 (GLU) or 1 (MLP)");
+    TORCH_CHECK(expert_activation == 0 || expert_activation == 1,
+        "expert_activation must be 0 (SiLU) or 1 (GELU-erf)");
+    TORCH_CHECK(numerical_mode == 0 || numerical_mode == 1,
+        "numerical_mode must be 0 (legacy fused) or 1 (staged rounding)");
     TORCH_CHECK(device >= 0 && device < at::cuda::device_count(), "invalid CUDA device");
     TORCH_CHECK(gpu >= 0 && ram >= 0 && pinned >= 0 && (banks == 1 || banks == 2),
         "budgets must be nonnegative; num_banks must be 1 or 2");
@@ -1173,7 +1231,7 @@ Tensor fuse_moe_offload_create(int64_t device, int64_t gpu, int64_t ram,
     auto context = std::make_shared<Context>(device, gpu, ram, pinned, banks, mode, max_tile,
         cache_limit, dynamic_limit, policy, decay_interval, min_reuse, update_limit,
         async_staging, host_profile, tile_m, tile_n,
-        int64_t(prop.major) * 10 + prop.minor, token);
+        int64_t(prop.major) * 10 + prop.minor, expert_activation, numerical_mode, expert_type, token);
     std::lock_guard<std::mutex> lock(registry_mutex);
     registry.emplace(id, std::move(context));
     return token;
@@ -1187,7 +1245,7 @@ void fuse_moe_offload_bind(const Tensor& token, int64_t layer_id,
     TORCH_CHECK(!c->managed, "cannot bind inside a managed offload scope");
     TORCH_CHECK(!c->sealed, "deployment context is sealed");
     TORCH_CHECK(!c->closed && layer_id >= 0, "closed context or invalid layer_id");
-    weights(w1, w2);
+    weights(w1, w2, c->expert_type);
     TORCH_CHECK(!c->layers.count(layer_id), "layer already bound; use a new context for new weights");
     c->layers.emplace(layer_id, Layer{w1, w2, w1._version(), w2._version(),
         std::vector<Tensor>(w1.size(0)), c->dynamic_limit ? std::vector<Heat>(w1.size(0)) : std::vector<Heat>{}, 0});
@@ -1230,8 +1288,8 @@ void fuse_moe_offload_resident_bind(const Tensor& token, int64_t layer_id,
     C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
     TORCH_CHECK(capture == cudaStreamCaptureStatusNone, "resident binding is not CUDA Graph capturable");
     if (expert_ids.empty()) return;
-    const int64_t w1_bytes = mul(layer.w1[0].numel(), 2);
-    const int64_t w2_bytes = mul(layer.w2[0].numel(), 2);
+    const int64_t w1_bytes = mul(layer.w1.numel() / layer.w1.size(0), layer.w1.element_size());
+    const int64_t w2_bytes = mul(layer.w2.numel() / layer.w2.size(0), layer.w2.element_size());
     const int64_t bytes = add(w1_bytes, w2_bytes);
     const int64_t additional = mul(expert_ids.size(), charge(bytes));
     const int64_t next = add(c->cache_bytes, additional);
@@ -1292,7 +1350,10 @@ void fuse_moe_offload_validate(const Tensor& token, at::IntArrayRef deployment_m
         "invalid deployment manifest format: expected version 1 and at least one complete layer record");
     const int64_t first_layer = deployment_manifest[2];
     const int64_t length = deployment_manifest[3];
-    TORCH_CHECK(first_layer >= 0 && length >= 23 &&
+    // Only a lower bound is enforced here; the per-record layout (23 or 25
+    // fixed fields plus resident_count) is validated centrally below.
+    TORCH_CHECK(first_layer >= 0 &&
+        length >= static_cast<int64_t>(kDeploymentConfigV1Fields) &&
         static_cast<uint64_t>(length) <= deployment_manifest.size() - 4,
         "invalid deployment manifest format: invalid first layer header or config length");
     const auto config = deployment_manifest.slice(4, static_cast<size_t>(length));
@@ -1496,6 +1557,10 @@ Tensor fuse_moe_offload(const Tensor& x, const Tensor& w1, const Tensor& w2,
     p.tile_m = c->tile_m ? int(c->tile_m) : fuse_moe::moe_pick_tile_m_auto(t / e, true);
     p.use_pdl = false; p.use_vert_sched = false;
     p.use_wide_n = c->tile_n == 128;
+    // Immutable compute contract; deployment configs must agree with it.
+    p.expert_activation = int(c->expert_activation);
+    p.numerical_mode = int(c->numerical_mode);
+    p.expert_type = int(c->expert_type);
     // Planning can trim unused buffers only after route work has drained.
     if (!preflight) {
         route_pointers();
@@ -1604,7 +1669,8 @@ Tensor fuse_moe_offload(const Tensor& x, const Tensor& w1, const Tensor& w2,
             mul(mul(s, h), 4), stream));
         moe_offload_scales(p.topk_pos_ptr, p.topk_scale_ptr, pointer<float>(*c, Scales), t, stream);
     }
-    int64_t w1_bytes = mul(mul(2 * i, h), 2), w2_bytes = mul(mul(h, i), 2);
+    const int64_t w1_bytes = mul(w1.numel() / e, w1.element_size());
+    const int64_t w2_bytes = mul(w2.numel() / e, w2.element_size());
     int64_t miss_waves = 0, metadata_bytes = 0;
     std::vector<bool> consumed(c->dynamic_limit ? e : 0, false);
     const int64_t timestamp = token.data_ptr<int64_t>()[1] + 1;
@@ -1787,7 +1853,7 @@ Tensor fuse_moe_offload(const Tensor& x, const Tensor& w1, const Tensor& w2,
     auto sizes = pool_sizes(*c);
     int64_t gpu_pool = pool_bytes(sizes, false), pinned_pool = pool_bytes(sizes, true);
     int64_t reuses = std::count(allocations.reused.begin(), allocations.reused.end(), true);
-    const int64_t expert_bytes = mul(mul(h, i), 6);
+    const int64_t expert_bytes = add(w1_bytes, w2_bytes);
     c->stats = {active, int64_t(waves.size()), mul(active - hits, expert_bytes),
         metadata_bytes, add(add(outputs, gpu_pool), total_cache_bytes(*c)), pinned_pool,
         add(add(backing, pinned_pool), host_plan_bytes), banks, capacity,

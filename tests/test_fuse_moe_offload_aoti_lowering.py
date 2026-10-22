@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import moe_offload_aoti as feature
+from custom_ops.moe_offload import ExpertStore, OffloadConfig
 
 
 SCHEMA = (
@@ -135,6 +136,123 @@ class LoweringContracts(unittest.TestCase):
                 self.assertIn("{arg0, arg1, arg2, arg3, arg4, arg5, result}.data()", line)
                 self.assertIn("aoti_torch_new_uninitialized_tensor", "\n".join(wrapper.lines[:-1]))
                 self.assertNotIn(".cbegin()", line)
+
+    @staticmethod
+    def config_vector(expert_activation="silu", numerical_mode="fused", expert_type="glu"):
+        # Real frontend contract; no native extension, CUDA or compilation.
+        e, h, intermediate = 2, 64, 64
+        store = ExpertStore({0: (torch.zeros(e, (2 if expert_type == "glu" else 1) * intermediate, h, dtype=torch.float16),
+                                 torch.zeros(e, h, intermediate, dtype=torch.float16))},
+                            ram_budget_bytes=1 << 20)
+        config = OffloadConfig.from_store(
+            store, gpu_budget_bytes=1 << 20, ram_budget_bytes=1 << 20,
+            pinned_budget_bytes=1 << 20, target_sm=89,
+            expert_activation=expert_activation, numerical_mode=numerical_mode, expert_type=expert_type)
+        return config, config.layer_config(0), config.manifest()
+
+    def test_v2_config_keeps_the_checked_nine_argument_protocol(self):
+        feature._validate_schema(self.op)
+        self.assertEqual(len(self.op._schema.arguments), 9)
+        _, vector, manifest = self.config_vector("gelu", "staged")
+        self.assertEqual(vector[0], 2)
+        self.assertEqual(len(vector), 25 + vector[21])
+        self.assertEqual((vector[23], vector[24]), (1, 1))
+        self.assertEqual(manifest[0], 1, "outer manifest framing must stay version 1")
+        emit = feature._emit_checked_26 if feature._version() == "2.6" else feature._emit_checked_211
+        wrapper = cpp.CppWrapperCpu.__new__(cpp.CppWrapperCpu)
+        wrapper.lines = []
+        output = ir.Buffer(name="result", layout=ir.FixedLayout(
+            torch.device("cpu"), torch.float32, [2], [1],
+        ))
+        emit(wrapper, self.op, self.buffers() + [3, vector, manifest],
+             ["result"], [output], 4)
+        line = wrapper.lines[-1]
+        packed = ", ".join(str(v) for v in (3, *vector, *manifest))
+        self.assertTrue(line.startswith("AOTI_TORCH_ERROR_CODE_CHECK("))
+        self.assertTrue(line.endswith("));"))
+        self.assertIn(f"proxy_executor, 4, {1 + len(vector) + len(manifest)},", line)
+        self.assertIn("{" + packed + "}.data()", line)
+        self.assertIn("{arg0, arg1, arg2, arg3, arg4, arg5, result}.data()", line)
+        # Modes travel inside the v2 int[] constant, never as new op arguments.
+        self.assertNotIn("expert_activation", line)
+        self.assertNotIn("numerical_mode", line)
+
+    def test_empty_batch_fake_is_offload_only_for_both_expert_types(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from custom_ops.moe_offload import _fake_offload
+        from custom_ops.recsys import _fake_fuse_moe
+        for expert_type, factor, code in (("glu", 2, 0), ("mlp", 1, 1)):
+            config, vector, manifest = self.config_vector("gelu", "staged", expert_type)
+            with self.subTest(expert_type=expert_type), FakeTensorMode():
+                x = torch.empty(0, 64, device="cuda", dtype=torch.float16)
+                w1 = torch.empty(2, factor * 64, 64, dtype=x.dtype)
+                w2 = torch.empty(2, 64, 64, dtype=x.dtype)
+                ids = torch.empty(0, 2, device="cuda", dtype=torch.int32)
+                scale = torch.empty(0, 2, device="cuda", dtype=torch.float32)
+                token = torch.empty(2, dtype=torch.int64)
+                output = _fake_offload(x, w1, w2, ids, scale, token, 0, vector, manifest)
+                self.assertEqual(tuple(output.shape), (0, 64))
+                self.assertEqual(output.dtype, x.dtype)
+                self.assertEqual(output.device, x.device)
+                with self.assertRaises(RuntimeError):
+                    _fake_fuse_moe(x, w1.to("cuda"), w2.to("cuda"), ids, scale, 1, 1, code)
+
+    def test_v3_mlp_preserves_checked_opaque_nine_argument_protocol(self):
+        feature._validate_schema(self.op)
+        self.assertEqual(len(self.op._schema.arguments), 9)
+        for activation in ("silu", "gelu"):
+            for numerical in ("fused", "staged"):
+                config, vector, manifest = self.config_vector(activation, numerical, "mlp")
+                self.assertEqual((vector[0], len(vector), vector[25]), (3, 26 + vector[21], 1))
+                self.assertEqual(vector[23:25], (int(activation == "gelu"), int(numerical == "staged")))
+                self.assertEqual(manifest[0], 1)
+                self.assertEqual(config.runtime_options()["expert_type"], "mlp")
+                emit = feature._emit_checked_26 if feature._version() == "2.6" else feature._emit_checked_211
+                wrapper = cpp.CppWrapperCpu.__new__(cpp.CppWrapperCpu)
+                wrapper.lines = []
+                output = ir.Buffer(name="result", layout=ir.FixedLayout(torch.device("cpu"), torch.float32, [2], [1]))
+                emit(wrapper, self.op, self.buffers() + [3, vector, manifest], ["result"], [output], 4)
+                line = wrapper.lines[-1]
+                self.assertTrue(line.startswith("AOTI_TORCH_ERROR_CODE_CHECK("))
+                self.assertIn("{" + ", ".join(str(v) for v in (3, *vector, *manifest)) + "}.data()", line)
+                self.assertIn(f"proxy_executor, 4, {1 + len(vector) + len(manifest)},", line)
+
+    def test_default_modes_stay_canonical_v1_without_inference(self):
+        _, legacy, legacy_manifest = self.config_vector()
+        self.assertEqual(legacy[0], 1)
+        self.assertEqual(len(legacy), 23 + legacy[21])
+        self.assertEqual(legacy_manifest[0], 1)
+        _, gelu, _ = self.config_vector(expert_activation="gelu")
+        _, staged, _ = self.config_vector(numerical_mode="staged")
+        for vector, codes in ((gelu, (1, 0)), (staged, (0, 1))):
+            self.assertEqual(vector[0], 2)
+            self.assertEqual((vector[23], vector[24]), codes)
+            self.assertEqual(vector[1:23], legacy[1:23])
+        # activation_mode is an independent context selector and must not leak
+        # into the expert-mode codes.
+        e, h, intermediate = 2, 64, 64
+        store = ExpertStore({0: (torch.zeros(e, 2 * intermediate, h, dtype=torch.float16),
+                                 torch.zeros(e, h, intermediate, dtype=torch.float16))},
+                            ram_budget_bytes=1 << 20)
+        config = OffloadConfig.from_store(
+            store, gpu_budget_bytes=1 << 20, ram_budget_bytes=1 << 20,
+            pinned_budget_bytes=1 << 20, target_sm=89, activation_mode="fp32_accumulate")
+        vector = config.layer_config(0)
+        self.assertEqual(vector[5], 1)
+        self.assertEqual(vector[0], 1)
+        self.assertEqual(vector[23:25], ())
+        self.assertEqual((config.expert_activation, config.numerical_mode), ("silu", "fused"))
+
+    def test_checked_protocol_rejects_an_extra_mode_argument(self):
+        library = torch.library.Library("offload_aoti_lowering_test_extra", "FRAGMENT")
+        library.define(
+            "fuse_moe_offload(Tensor x, Tensor w1, Tensor w2, Tensor ids, Tensor scale, "
+            "Tensor(a!) runtime_token, int layer_id, int[]? deployment_config=None, "
+            "int[]? deployment_manifest=None, int expert_activation=0) -> Tensor")
+        op = torch.ops.offload_aoti_lowering_test_extra.fuse_moe_offload.default
+        with self.assertRaisesRegex(RuntimeError, "unsupported operator schema"):
+            feature._validate_schema(op)
+        self.assertEqual(len(self.op._schema.arguments), 9)
 
     def test_node_codegen_preserves_extern_json_and_token_mutation(self):
         from torch._inductor.graph import GraphLowering

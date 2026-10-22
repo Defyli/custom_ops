@@ -15,7 +15,7 @@
  *
  * 各家族路径概览：
  *   sm8x（SM80~SM118 cp.async 基线，4090D=sm89）
- *     gemm1 = gate/up 配对融合（scatter gather-on-load + silu·mul epilogue）
+ *     gemm1 = gate/up 配对融合（scatter gather-on-load + act(gate)·up epilogue）
  *     gemm2 = cp.async multistage（激活连续）
  *     → 跨 tile 连续流水（slab 发射流全局计数 + 寄存器行索引 +
  *        向量化 epilogue，见 sm89/group_gemm_sm89.cuh）
@@ -37,6 +37,14 @@
  *                     cp.async 家族上游仅有 horizon）
  *   FUSE_MOE_NO_PDL   强制普通 launch（分段计时归因用）
  *   FUSE_MOE_TIME=1   流水线分段计时（各 kernel wall time）
+ *
+ * 激活 / 数值语义（FMOE_params，op/offload 层填写）：
+ *   expert_activation = 0 SiLU(SwiGLU，默认) / 1 GELU-erf(GEGLU)
+ *   numerical_mode    = 0 fused（FP32 gate/up 到 act·up 后 round 到 Tout）
+ *                       / 1 staged（gate/up、act、乘积分别 round 到 Tout）
+ *   expert_type = 0 GLU（默认）/ 1 MLP（单投影 act，无 up 分支）
+ *   MLP staged 在 act 前 round 单投影，act 后 round 到 Tout。
+ *   以上只在 host 侧一次分发到模板特化，kernel 内无逐元素动态分支。
  */
 
 #pragma once
@@ -63,14 +71,25 @@ namespace fuse_moe {
 // 本接线（见下方 sm120 家族）。
 inline void moe_compute_sm8x(FMOE_params &params, cudaStream_t stream,
                              bool explicit_config = false) {
-    const int intermediate2 = params.intermediate * 2;
+    const int projection_cols = params.intermediate * (params.expert_type == 0 ? 2 : 1);
     const bool is_half = !params.is_bf16;
-    group_gemm::group_gemm_gateup_fused_async(
-        params.act_out_ptr, params.x_ptr, params.w1_ptr, params.row_indices_ptr,
-        params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
-        params.use_vert_sched, intermediate2, params.hidden, params.num_expert,
-        params.tile_m, is_half, params.use_pdl, stream, params.w1_group_ptrs,
-        explicit_config);
+    // GEMM1: paired GLU or a single MLP projection with activation epilogue.
+    if (params.expert_type == 0) {
+        group_gemm::group_gemm_gateup_fused_async(
+            params.act_out_ptr, params.x_ptr, params.w1_ptr, params.row_indices_ptr,
+            params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+            params.use_vert_sched, projection_cols, params.hidden, params.num_expert,
+            params.tile_m, is_half, params.use_pdl, stream, params.w1_group_ptrs,
+            explicit_config, params.expert_activation, params.numerical_mode);
+    } else {
+        group_gemm::group_gemm_async(
+            params.act_out_ptr, params.x_ptr, params.w1_ptr, params.row_indices_ptr,
+            params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+            params.use_vert_sched, projection_cols, params.hidden, params.num_expert,
+            params.tile_m, is_half, params.use_pdl, stream, params.w1_group_ptrs,
+            /*accumulator=*/nullptr, /*accum_rows=*/nullptr, /*sorted_scale=*/nullptr,
+            explicit_config, params.numerical_mode, params.expert_activation);
+    }
     if (params.use_wide_n && params.hidden % 128 == 0) {
         group_gemm::group_gemm_wide_n_async(
             params.down_out_ptr, params.act_out_ptr, params.w2_ptr, params.seqlens_ptr,
@@ -78,7 +97,7 @@ inline void moe_compute_sm8x(FMOE_params &params, cudaStream_t stream,
             params.use_vert_sched, params.hidden, params.intermediate, params.num_expert,
             params.tile_m, is_half, params.use_pdl, stream, params.w2_group_ptrs,
             params.accumulator_ptr, params.accumulator_ptr ? params.row_indices_ptr : nullptr,
-            params.sorted_scale_ptr, explicit_config);
+            params.sorted_scale_ptr, explicit_config, params.numerical_mode);
     } else {
         group_gemm::group_gemm_async(
             params.down_out_ptr, params.act_out_ptr, params.w2_ptr, nullptr,
@@ -86,13 +105,13 @@ inline void moe_compute_sm8x(FMOE_params &params, cudaStream_t stream,
             params.use_vert_sched, params.hidden, params.intermediate, params.num_expert,
             params.tile_m, is_half, params.use_pdl, stream, params.w2_group_ptrs,
             params.accumulator_ptr, params.accumulator_ptr ? params.row_indices_ptr : nullptr,
-            params.sorted_scale_ptr, explicit_config);
+            params.sorted_scale_ptr, explicit_config, params.numerical_mode);
     }
 }
 
 template <typename T>
 inline void moe_launch_sm8x_impl(FMOE_params &params, cudaStream_t stream) {
-    const int intermediate2 = params.intermediate * 2;
+    const int projection_cols = params.intermediate * (params.expert_type == 0 ? 2 : 1);
     const bool is_half = !params.is_bf16;
 
     // ① count / build indices（row_indices / topk_pos / cu_seqlens / tiles /
@@ -104,17 +123,26 @@ inline void moe_launch_sm8x_impl(FMOE_params &params, cudaStream_t stream) {
                                   params.num_topk, params.num_expert, params.tile_m,
                                   params.use_pdl, stream);
 
-    // ② gemm1 融合：gate/up 配对 N-tile + silu·mul epilogue，直写
-    //    act_out (T, I)——免 gate_up_out (T, 2I) 物化与独立 act_mul kernel
-    //    （省 2×T×I×2B DRAM 往返；X tile 装载量减半，见
-    //    sm89/group_gemm_sm89.cuh 的 group_gemm_gateup_kernel）
+    // ② GEMM1 epilogue 直写 act_out (T, I)，无需投影缓冲或独立激活 kernel。
+    //    GLU 使用原 gate/up 配对；MLP 只计算单投影并激活，无第二路 MMA。
     FM_DEBUG_MARK("gemm1_fused");
-    group_gemm::group_gemm_gateup_fused_async(
-        params.act_out_ptr, params.x_ptr, params.w1_ptr, params.row_indices_ptr,
-        params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
-        params.use_vert_sched,
-        /*n=*/intermediate2, /*k=*/params.hidden, params.num_expert, params.tile_m, is_half,
-        params.use_pdl, stream);
+    if (params.expert_type == 0) {
+        group_gemm::group_gemm_gateup_fused_async(
+            params.act_out_ptr, params.x_ptr, params.w1_ptr, params.row_indices_ptr,
+            params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+            params.use_vert_sched,
+            /*n=*/projection_cols, /*k=*/params.hidden, params.num_expert, params.tile_m, is_half,
+            params.use_pdl, stream, /*weight_ptrs=*/nullptr, /*explicit_config=*/false,
+            params.expert_activation, params.numerical_mode);
+    } else {
+        group_gemm::group_gemm_async(
+            params.act_out_ptr, params.x_ptr, params.w1_ptr, params.row_indices_ptr,
+            params.seqlens_ptr, params.cu_seqlens_ptr, params.tiles_ptr, params.cu_tiles_ptr,
+            params.use_vert_sched, projection_cols, params.hidden, params.num_expert,
+            params.tile_m, is_half, params.use_pdl, stream, /*weight_ptrs=*/nullptr,
+            /*accumulator=*/nullptr, /*accum_rows=*/nullptr, /*sorted_scale=*/nullptr,
+            /*explicit_config=*/false, params.numerical_mode, params.expert_activation);
+    }
 
     // ③ down group GEMM（cp.async multistage：激活连续；默认相邻 N-pair
     //    变体 per-slab MMA 密度 ×2，hidden%128!=0 或 FUSE_MOE_TILE_N=64
@@ -141,7 +169,7 @@ inline void moe_launch_sm8x_impl(FMOE_params &params, cudaStream_t stream) {
     reduce_async(reinterpret_cast<T *>(params.out_ptr),
                  reinterpret_cast<const T *>(params.down_out_ptr), params.topk_pos_ptr,
                  params.topk_scale_ptr, params.num_seq, params.hidden, params.num_topk,
-                 params.use_pdl, stream);
+                 params.use_pdl, stream, /*explicit_config=*/false, params.numerical_mode);
 }
 
 // sm8x 家族策略入口：tile 选择 + dtype 分发
@@ -168,7 +196,7 @@ inline void moe_launch_sm8x(FMOE_params &params, cudaStream_t stream) {
 
 template <typename T>
 inline void moe_launch_sm120_impl(FMOE_params &params, cudaStream_t stream) {
-    const int intermediate2 = params.intermediate * 2;
+    const int projection_cols = params.intermediate * (params.expert_type == 0 ? 2 : 1);
     const bool is_half = !params.is_bf16;
 
     if (std::getenv("FUSE_MOE_TMA") == nullptr) {
@@ -205,14 +233,23 @@ inline void moe_launch_sm120_impl(FMOE_params &params, cudaStream_t stream) {
         params.gate_up_out_ptr, x_sorted.data_ptr(), params.w1_ptr, params.seqlens_ptr,
         params.cu_seqlens_ptr, params.tiles_ptr,
         /*a_rows=*/params.total_num_seq,
-        /*n=*/intermediate2, /*k=*/params.hidden, params.num_expert, params.tile_m, is_half,
-        params.use_pdl, stream);
+        /*n=*/projection_cols, /*k=*/params.hidden, params.num_expert, params.tile_m, is_half,
+        params.use_pdl, stream, /*fp32_output=*/params.numerical_mode == 0);
 
-    // ③ silu(gate) * up（compact）
+    // ③ compact 激活：GLU act(gate)*up，MLP 仅 act(projection)。
+    //    fused 输入 FP32；staged 输入 T，保留既有 GLU 舍入边界。
     FM_DEBUG_MARK("act_mul");
-    act_mul_async(reinterpret_cast<T *>(params.act_out_ptr),
-                  reinterpret_cast<const T *>(params.gate_up_out_ptr), params.total_num_seq,
-                  params.intermediate, params.use_pdl, stream);
+    if (params.numerical_mode == 0) {
+        act_mul_async(reinterpret_cast<T *>(params.act_out_ptr),
+                      reinterpret_cast<const float *>(params.gate_up_out_ptr), params.total_num_seq,
+                      params.intermediate, params.use_pdl, stream, params.expert_activation,
+                      params.numerical_mode, params.expert_type);
+    } else {
+        act_mul_async(reinterpret_cast<T *>(params.act_out_ptr),
+                      reinterpret_cast<const T *>(params.gate_up_out_ptr), params.total_num_seq,
+                      params.intermediate, params.use_pdl, stream, params.expert_activation,
+                      params.numerical_mode, params.expert_type);
+    }
 
     // ④ down group GEMM（TMA：A = act_out compact，任意行坐标基）
     FM_DEBUG_MARK("gemm2_tma");
@@ -228,7 +265,7 @@ inline void moe_launch_sm120_impl(FMOE_params &params, cudaStream_t stream) {
     reduce_async(reinterpret_cast<T *>(params.out_ptr),
                  reinterpret_cast<const T *>(params.down_out_ptr), params.topk_pos_ptr,
                  params.topk_scale_ptr, params.num_seq, params.hidden, params.num_topk,
-                 params.use_pdl, stream);
+                 params.use_pdl, stream, /*explicit_config=*/false, params.numerical_mode);
 }
 
 // sm120 家族策略入口：tile 选择 + dtype 分发 + 引擎选择
@@ -253,6 +290,13 @@ inline void moe_launch_sm120(FMOE_params &params, cudaStream_t stream) {
 // 分段计时归因用——launch_kernel_pdl 对 FUSE_MOE_TIME 亦自动串行化）。
 inline void moe_fwd_launch(FMOE_params &params, cudaStream_t stream) {
     const int major = arch_targets::gpu_major();
+
+    TORCH_CHECK(params.expert_type == 0 || params.expert_type == 1,
+                "expert_type must be 0 (GLU) or 1 (MLP)");
+    TORCH_CHECK(params.expert_activation == 0 || params.expert_activation == 1,
+                "expert_activation must be 0 (SiLU) or 1 (GELU-erf)");
+    TORCH_CHECK(params.numerical_mode == 0 || params.numerical_mode == 1,
+                "numerical_mode must be 0 (fused) or 1 (staged)");
 
     params.use_pdl = (major >= 9) && (std::getenv("FUSE_MOE_NO_PDL") == nullptr);
     // task 遍历序（仅 cp.async 引擎消费；见文件头 FUSE_MOE_SCHED 说明）

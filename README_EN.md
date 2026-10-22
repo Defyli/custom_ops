@@ -14,10 +14,11 @@ with three core operators:
   term plus a low-precision tensor-core residual correction term restores
   near-fp32 accuracy at near-bf16 cost, with bias addition and silu/gelu
   activation fused into the epilogue
-- **`fuse_moe`**: a fused MoE FFN forward (single GPU) — counting, routing
-  permutation, the gate_up group GEMM, silu·mul, the down group GEMM, and the
-  topk weighted reduction are fused into 4 kernels; bf16/fp16 inputs with fp32
-  accumulation
+- **`fuse_moe`**: fused MoE FFN forward (single GPU) — the default cp.async path
+  combines counting/routing, projection + activation, down group GEMM and topk
+  reduction into 4 kernels. Explicitly supports three-matrix **GLU**
+  (SwiGLU/GEGLU) and two-matrix **ordinary MLP** (SiLU/GELU), with bf16/fp16
+  inputs and fp32 accumulation; offload streams CPU expert weights within a GPU budget
 
 **Highlights**
 
@@ -80,6 +81,9 @@ with three core operators:
   up N panels of W1 (sharing the X tile, halving X loads); the epilogue applies
   `silu(gate)·up` and writes act_out directly — no `gate_up_out (T, 2I)`
   materialization and no separate activation kernel
+- **Single-projection ordinary MLP**: `expert_type="mlp"` computes `act(W1·x)`
+  without an up projection or gating product; shares routing/down/reduction
+  with GLU and retains the four-kernel default path
 - **Cross-tile continuous pipeline**: the slab issue stream uses global
   counters and never drains at task (tile) boundaries; scatter row indices live
   in registers with rolling prefetch; activations stay in the expert-sorted
@@ -387,6 +391,10 @@ Backend selection notes:
 
 ### fuse_moe (fused MoE FFN, single GPU)
 
+The original tables below are historical **GLU / SiLU / fused** measurements.
+The new ordinary-MLP and offload tables use a separate environment and numerical
+contract; two- and three-matrix GEMM FLOPS are never mixed.
+
 Test setup: RTX 5090D / PyTorch 2.6 / CUDA 12.8, bf16, uniform routing.
 The sm120 default engine is the continuous-pipeline cp.async kernel
 (outperforms the TMA engine by 3–15% across shapes); `FUSE_MOE_TMA=1`
@@ -427,6 +435,122 @@ log in [docs/fuse_moe_porting_and_optimization.md](docs/fuse_moe_porting_and_opt
   (gated by smem)
 - **PDL chaining**: count → gemm1 → gemm2 → reduce chained via
   Programmatic Dependent Launch (sm89 falls back to stream order)
+
+### Ordinary MLP and GLU MoE (GPU-resident, new benchmark)
+
+Measured on 2026-10-21: **PyTorch 2.11.0+cu128 / CUDA 12.8**, bf16,
+exact-erf GELU, `numerical_mode="staged"`, default cp.async engine.
+The 4090D host uses Xeon Platinum 8576C / PCIe 4.0 x16; the 5090D **v2** host
+uses EPYC 9K65 / PCIe 5.0 x16. Offload differences across these machines cannot
+be attributed to the GPU alone. Fixed `H=2048, I=1024, E=64, K=2`; only S varies.
+Seeded uniform routing selects two distinct experts per token (seed=42, +1
+for each subsequent shape).
+
+Both topologies use 2 group-GEMM launches, but **GLU gemm1 computes paired
+gate/up projections; ordinary MLP computes only one**. Counting multiply and add
+separately, GEMM FLOPS are `6*S*K*H*I` for GLU and `4*S*K*H*I` for MLP.
+All bf16 expert weights occupy **768 MiB / 512 MiB**, respectively.
+
+| GPU | S | Expert type | custom µs | eager µs | vs eager | custom TFLOPS |
+|---|---:|---|---:|---:|---:|---:|
+| 4090D | 128 | GLU (GEGLU) | 883.8 | 10719.6 | 12.13x | 3.6 |
+| 4090D | 128 | Ordinary MLP | 601.7 | 9512.8 | 15.81x | 3.6 |
+| 4090D | 1024 | GLU (GEGLU) | 1008.2 | 11331.6 | 11.24x | 25.6 |
+| 4090D | 1024 | Ordinary MLP | 676.5 | 10261.5 | 15.17x | 25.4 |
+| 4090D | 4096 | GLU (GEGLU) | 1227.0 | 11558.9 | 9.42x | 84.0 |
+| 4090D | 4096 | Ordinary MLP | 855.5 | 10498.0 | 12.27x | 80.3 |
+| 5090D v2 | 128 | GLU (GEGLU) | 635.8 | 6934.6 | 10.91x | 5.1 |
+| 5090D v2 | 128 | Ordinary MLP | 430.8 | 6833.9 | 15.86x | 5.0 |
+| 5090D v2 | 1024 | GLU (GEGLU) | 692.2 | 8215.3 | 11.87x | 37.2 |
+| 5090D v2 | 1024 | Ordinary MLP | 470.4 | 7431.2 | 15.80x | 36.5 |
+| 5090D v2 | 4096 | GLU (GEGLU) | 768.5 | 8305.4 | 10.81x | 134.1 |
+| 5090D v2 | 4096 | Ordinary MLP | 539.1 | 7553.1 | 14.01x | 127.5 |
+
+Latency is the median of 5 **CUDA-event batch means**, with 20 warmup and 50
+timed calls per repeat; custom/eager order rotates. Eager is a real `nn.Module`
+using per-expert `nonzero` routing, low-precision `Linear`, standard dtype
+GELU/multiply and FP32 `index_add`. It includes the full E scan and data-dependent
+synchronization, not redundant activation casts, and is not an optimized
+grouped-GEMM or compile baseline. TF32, reduced-precision reduction and gradients
+are disabled. Generation, CPU reference, loading, compilation and checking are
+excluded. Large-shape benchmark correctness checks the first 16 tokens against
+an independent CPU FP32 stage reference and checks full-output shape/dtype/finite;
+full GPU matrices, exact scalar rounding witnesses and masked/duplicate routes
+are verified separately by the test suite.
+
+### MoE offload (CPU weights, explicit GPU budget)
+
+Same inputs and GELU/staged contract, measured through `PrefillMoERuntime.forward`,
+not AOTI. MoE context budgets: **GPU 128 MiB / RAM 2048 MiB / pinned 64 MiB**;
+`activation_mode="auto"`, automatic route tiles, no dynamic cache.
+GPU-resident baseline weights are released before offload measurement. GPU charge
+includes context workspace/cache and live output, excluding x, unrelated model
+tensors, allocator reserves and the driver. **512/768 MiB of expert weights both
+exceed the 128 MiB context budget**: this does not secretly keep all weights on
+GPU, nor is it a whole-device OOM test.
+
+All numbers below use **host wall-clock: forward + CUDA synchronize**, including
+host packing, routing, H2D, compute and the final drain; stats/checking are outside
+the clock. Cold is the median first forward of 5 fresh runtimes; initialization is
+recorded separately and excluded from cold. Warm is the median of 5 means, each
+over 50 calls after 20 warmups in the same runtime. P95 pools all 250 timed calls.
+Sync/async order rotates, without concurrent work on the same GPU. **Do not
+compute speedups by mixing GPU-event µs above with host-wall ms below**;
+a GPU-resident host-wall reference is included for the same routing scenario.
+
+**No cache / uniform routing** (active expert weights transferred again on every call):
+
+| GPU | S | Type | H2D MiB/call | resident wall ms | cold async ms | warm sync ms | warm async ms | async P95 ms |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| 4090D | 128 | GLU | 744 | 0.919 | 63.824 | 58.434 | 62.031 | 63.175 |
+| 4090D | 128 | MLP | 496 | 0.632 | 39.101 | 38.371 | 38.350 | 38.821 |
+| 4090D | 1024 | GLU | 768 | 1.038 | 60.901 | 59.105 | 60.834 | 75.004 |
+| 4090D | 1024 | MLP | 512 | 0.712 | 40.157 | 40.102 | 39.647 | 41.186 |
+| 4090D | 4096 | GLU | 768 | 1.256 | 61.022 | 60.684 | 59.972 | 61.641 |
+| 4090D | 4096 | MLP | 512 | 0.890 | 40.687 | 39.871 | 40.298 | 42.512 |
+| 5090D v2 | 128 | GLU | 744 | 0.653 | 41.443 | 39.344 | 40.057 | 40.447 |
+| 5090D v2 | 128 | MLP | 496 | 0.448 | 27.915 | 26.105 | 25.846 | 26.593 |
+| 5090D v2 | 1024 | GLU | 768 | 0.712 | 42.477 | 40.055 | 40.527 | 41.441 |
+| 5090D v2 | 1024 | MLP | 512 | 0.491 | 28.774 | 26.996 | 27.036 | 27.948 |
+| 5090D v2 | 4096 | GLU | 768 | 0.794 | 42.166 | 40.816 | 40.658 | 41.396 |
+| 5090D v2 | 4096 | MLP | 512 | 0.568 | 28.444 | 27.135 | 26.240 | 27.924 |
+
+- S=128 activates 62 experts, so H2D is below all 64 experts; S=1024/4096 activate all 64.
+- Actual plans use 2 banks: GLU wave capacity 2, MLP capacity 3; wave counts
+  are 31/32/32 and 21/22/22. Context GPU highwater is **49.53–96.93 MiB**;
+  initialization is **1.17–1.47 ms** (both sync/async cold/init are retained in JSON).
+- Host packing and weight transfer dominate; MLP transfers 2/3 of the GLU bytes.
+  **Async staging is not a speedup guarantee**: some shapes are slower or have
+  higher P95, and those results are not hidden by selecting the faster mode.
+
+**Static hotset hits**: only experts 0/1 are routed and preloaded; the other 62
+experts stay on CPU. Static cache is **24 MiB GLU / 16 MiB MLP**; weight H2D per
+forward is **0 B**, actual transfer banks=0 and resident waves=1. This cache-hit
+scenario **does not represent uniform routing**.
+
+| GPU | S | Type | resident wall ms | cold async ms | warm sync ms | warm async ms | async P95 ms |
+|---|---:|---|---:|---:|---:|---:|---:|
+| 4090D | 128 | GLU | 0.134 | 0.424 | 0.153 | 0.154 | 0.164 |
+| 4090D | 128 | MLP | 0.106 | 0.423 | 0.126 | 0.126 | 0.139 |
+| 4090D | 1024 | GLU | 0.427 | 0.724 | 0.448 | 0.450 | 0.462 |
+| 4090D | 1024 | MLP | 0.315 | 0.618 | 0.337 | 0.337 | 0.347 |
+| 4090D | 4096 | GLU | 0.884 | 1.297 | 0.907 | 0.907 | 0.914 |
+| 4090D | 4096 | MLP | 0.634 | 1.058 | 0.649 | 0.650 | 0.661 |
+| 5090D v2 | 128 | GLU | 0.069 | 0.436 | 0.081 | 0.081 | 0.093 |
+| 5090D v2 | 128 | MLP | 0.057 | 0.493 | 0.072 | 0.072 | 0.082 |
+| 5090D v2 | 1024 | GLU | 0.320 | 0.778 | 0.336 | 0.336 | 0.340 |
+| 5090D v2 | 1024 | MLP | 0.234 | 0.646 | 0.250 | 0.251 | 0.256 |
+| 5090D v2 | 4096 | GLU | 0.606 | 1.257 | 0.629 | 0.628 | 0.635 |
+| 5090D v2 | 4096 | MLP | 0.431 | 1.008 | 0.452 | 0.452 | 0.461 |
+
+Context GPU highwater is **18.01–88.07 MiB**; initialization, including static
+weight upload, is **2.31–3.51 ms**, excluded from warm latency.
+Local evidence is retained in `artifacts/moe_structures_sm89_20261021/` and
+`artifacts/moe_structures_sm120_20261021/`, files
+`storage_{uniform,hotset}_bf16_gelu_staged_review1.json`. They include library/script
+SHA256, 5-repeat raw timings, cold/init measurements, reference checks and per-call
+H2D/budget stats (artifacts are not committed with source). Reproduction commands
+are in [Benchmark](#benchmark).
 
 ## Requirements
 
@@ -474,7 +598,7 @@ w_high, w_low, w_scale = split_mixed_precision_weight(w)  # one-time split at mo
 y = ops.mixed_gemm(x, w_high, w_low, w_scale, bias=b,
                    activation="silu")                   # fp32 output, accuracy ≈ fp32
 
-# ── Fused MoE FFN: y[s] = Σ_j scale[s,j]·(Down_ej @ silu(GateUp_ej @ x[s]))
+# ── Default SwiGLU MoE: down(silu(gate(x)) * up(x)), then topk weighting
 S, H, I, E, K = 4096, 2048, 1024, 8, 2
 x  = torch.randn(S, H, device="cuda", dtype=torch.bfloat16)
 w1 = torch.randn(E, 2 * I, H, device="cuda", dtype=torch.bfloat16) * 0.05
@@ -483,6 +607,12 @@ topk_ids   = torch.randint(0, E, (S, K), device="cuda", dtype=torch.int32)
 topk_scale = torch.rand(S, K, device="cuda")            # fp32 routing weights
 
 y = ops.fuse_moe(x, w1, w2, topk_ids, topk_scale)       # (S, H) bf16
+
+# Ordinary two-matrix GELU MLP MoE: down(gelu(w1(x))), no up projection
+w1_mlp = torch.randn(E, I, H, device="cuda", dtype=x.dtype) * 0.05
+y_mlp = ops.fuse_moe(x, w1_mlp, w2, topk_ids, topk_scale,
+                     expert_type="mlp", expert_activation="gelu",
+                     numerical_mode="staged")
 ```
 
 > Dtype note: fp16 works on all supported architectures (sm70 / sm89 / sm120);
@@ -542,24 +672,57 @@ Limitations:
 - `K % 8 == 0`
 - FP8 backend requires SM89+; INT8 backend requires SM80+
 
-### `ops.fuse_moe(x, gate_up_weight, down_weight, topk_ids, topk_scale) -> Tensor`
+### `ops.fuse_moe(x, gate_up_weight, down_weight, topk_ids, topk_scale, backend=None, *, expert_activation="silu", numerical_mode="fused", expert_type="glu") -> Tensor`
 
-Fused MoE FFN forward:
-`y[s] = Σ_j topk_scale[s,j] · (Down_{e_j} @ silu(GateUp_{e_j} @ x[s]))`.
-Counting, routing permutation, both group GEMMs, activation, and the topk
-weighted reduction are fused into 4 kernels; bf16/fp16 inputs with fp32
-accumulation.
+`expert_type` explicitly selects the topology, never inferred from activation or weight shapes:
+
+- `"glu"` (default): `y[s] = Σ_j scale[s,j] · Down_e(act(Gate_e·x[s]) · (Up_e·x[s]))`,
+  a three-matrix gated FFN; gemm1 computes paired gate/up projections.
+- `"mlp"`: `y[s] = Σ_j scale[s,j] · Down_e(act(W1_e·x[s]))`,
+  an ordinary two-matrix FFN; gemm1 computes one projection, without gating multiplication.
+
+`expert_activation="silu"|"gelu"` applies to either topology: SwiGLU/GEGLU for GLU,
+SiLU/GELU MLP otherwise. GELU uses exact erf (`F.gelu(approximate="none")`), not
+an implicit tanh approximation. Both topologies use 4 kernels and 2 group-GEMM
+launches on the default cp.async path. The optional TMA path includes gathering
+and a separate activation, totaling 6 kernels.
 
 | Param | Shape | Notes |
 |---|---|---|
 | `x` | (S, H) | bf16 / fp16, token order |
-| `gate_up_weight` | (E, 2I, H) | same dtype as x (gate first, up second) |
+| `gate_up_weight` | GLU (E, 2I, H) / MLP (E, I, H) | same dtype as x; GLU gate first/up second; MLP single projection |
 | `down_weight` | (E, H, I) | same dtype as x |
-| `topk_ids` | (S, K) | int32, values in [0, E) |
-| `topk_scale` | (S, K) | fp32 topk weights |
+| `topk_ids` | (S, K) | contiguous int32, nonnegative values in [0, E); -1 slots are ignored |
+| `topk_scale` | (S, K) | contiguous fp32 topk weights; do not downcast before calling |
 | Returns | (S, H) | same dtype as x |
 
-Constraints: `H % 64 == 0`, `I % 64 == 0`, `K <= 128`, `E <= 512`, SM80+.
+Constraints: contiguous CUDA inputs, positive S/H/I, matching x/weight dtype,
+`H % 64 == 0`, `I % 64 == 0`, `1 <= K <= 128`, `1 <= E <= 512`, SM80+.
+
+- `numerical_mode="fused"` fuses activation (and the GLU product) after FP32
+  projection before rounding. `"staged"` rounds projection, activation, GLU
+  product, down and weighted product to the output dtype before FP32 reduction.
+  MLP has no up/product stage. This is a **forward rounding contract, not
+  autograd or bitwise parity**.
+- All three selectors accept exact strings only, not integers, booleans or case variants.
+- GLU concatenates gate/up `(E,I,H)` along dim=1, gate first, into `(E,2I,H)`.
+  MLP uses one `(E,I,H)` W1 with `expert_type="mlp"`. Both use `(E,H,I)` down;
+  callers explicitly adapt flattened/transposed source layouts.
+- Offload freezes `expert_type`, `expert_activation` and `numerical_mode` in
+  `OffloadConfig`; `activation_mode` only selects buffering/reduction. GLU
+  silu/fused emits v1 (23 fixed fields), other GLU pairs emit v2 (25 fixed fields,
+  mode codes at 23/24); MLP always emits v3 (26 fixed fields, type code 1 at 25,
+  resident IDs from 26). Manifest framing=1 and weight archive format=2 remain
+  unchanged. Rebuild `.so/.so.json/.pt2/weights.pt` together after the native
+  schema change; do not mix old binaries with new callers.
+- TileLang supports GLU/MLP and guards masked routes, failing explicitly when
+  exact erf is unavailable. Legacy GLU/fused retains TileLang FP32 down/weighting;
+  new MLP modes both preserve the native down rounding boundary. Staged has
+  the same stage contract across backends; comparisons still use tolerances.
+
+[GEGLU development and acceptance notes](docs/MOE_GEGLU_EXTENSION.md) preserve
+the earlier GLU-extension record. Its historical “ordinary MLP is out of contract”
+scope statement is superseded by `expert_type="mlp"` above.
 
 ### `split_mixed_precision_weight(w, scale=1/256, backend="auto") -> (w_high, w_low, w_scale)`
 
@@ -587,7 +750,11 @@ python examples/basic_usage.py        # minimal example: invocation + SDPA verif
 python examples/custom_mask_demo.py   # 4 typical masks: causal / sliding-window / padding / random-sparse
 python examples/gqa_example.py        # GQA: no K/V head expansion needed
 python examples/mixed_gemm_demo.py    # mixed-precision GEMM: weight split + epilogue fusion + accuracy
-python tests/test_fuse_moe.py         # fuse_moe: 21-case correctness (single-expert / sparse / duplicate routing)
+python examples/fuse_moe_demo.py      # GLU MoE: forward + numeric check + vs eager
+python examples/fuse_moe_demo.py --expert-type mlp --expert-activation gelu --numerical-mode staged
+python examples/fuse_moe_offload_demo.py --jit --expert-type mlp   # development; use --ops-library for deployment
+python examples/swiglu_demo.py        # SwiGLU: FFN activation + vs eager
+python tests/test_fuse_moe.py         # GLU/MLP × two activations × two rounding modes, masked/duplicate routes
 ```
 
 ## Benchmark
@@ -624,9 +791,43 @@ python benchmark/benchmark_mixed_gemm.py                       # backend auto (F
 python benchmark/benchmark_mixed_gemm.py --backend int8        # pick the residual backend
 python benchmark/benchmark_mixed_gemm.py --shape 4096 4096 4096 --csv result.csv
 
-# fuse_moe: vs PyTorch eager / torch.compile / compile+reduce-overhead (CUDA graph)
+# fuse_moe: historical GLU suite, eager / torch.compile / compile+reduce-overhead
 python benchmark/benchmark_fuse_moe.py
 ```
+
+**Unified ordinary-MLP / GLU and offload benchmark** (separate from the legacy suite):
+first build the current production schema offline. Use `8.9` for SM89 or `12.0a` for SM120:
+
+```bash
+python examples/fuse_moe_offload_aoti.py build-native --arch 8.9 --output-dir artifacts/moe_native
+export MOE_SO="$PWD/artifacts/moe_native/recsys_fuse_moe_kernel.so"
+mkdir -p artifacts/moe_benchmark
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
+
+# GPU-resident + uncached offload: CPU weights, active experts transferred every call
+python benchmark/benchmark_fuse_moe.py --suite storage --ops-library "$MOE_SO" \
+  --expert-types glu mlp --expert-activation gelu --numerical-mode staged --dtype bf16 \
+  --shapes 128,2048,1024,64,2 1024,2048,1024,64,2 4096,2048,1024,64,2 \
+  --offload --gpu-budget-mib 128 --ram-budget-mib 2048 --pinned-budget-mib 64 \
+  --offload-cache disabled --routing uniform --offload-staging sync async \
+  --seed 42 --repeats 5 --warmup 20 --iters 50 --json artifacts/moe_benchmark/uniform.json
+
+# Static hotset: only experts 0/1 resident; the other 62 experts stay on CPU
+python benchmark/benchmark_fuse_moe.py --suite storage --ops-library "$MOE_SO" \
+  --expert-types glu mlp --expert-activation gelu --numerical-mode staged --dtype bf16 \
+  --shapes 128,2048,1024,64,2 1024,2048,1024,64,2 4096,2048,1024,64,2 \
+  --offload --gpu-budget-mib 128 --ram-budget-mib 2048 --pinned-budget-mib 64 \
+  --offload-cache static_hot --routing hotset --offload-staging sync async \
+  --seed 42 --repeats 5 --warmup 20 --iters 50 --json artifacts/moe_benchmark/hotset.json
+```
+
+Omit `--offload` and the budget/cache/staging options to measure GPU-resident
+only. `--expert-types mlp` measures ordinary MLP alone; choose SiLU or fused
+explicitly. The standard eager baseline is always stage-rounded, so the fair
+comparison on this page uses staged. JSON output is created exclusively: use a
+new path for reruns. It retains library/script hashes, raw timings, reference
+checks and per-call offload stats. Clear `FUSE_MOE_*` diagnostic/tuning variables
+before measuring; diagnostic runs are not performance evidence.
 
 ## Repository Structure
 

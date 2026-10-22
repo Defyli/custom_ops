@@ -126,10 +126,32 @@ struct Identity {
   }
 };
 
-// All 23 fixed v1 fields validated before create. Native validate remains the
-// authority after binding (including actual context fields, SM and residents).
+// v1 has 23 fixed fields and implies SiLU/fused (0/0); v2 has 25,
+// with expert_activation/numerical_mode at 23/24 and resident IDs from 25.
+// v3 has 26 fixed fields, adds expert_type at 25, and starts resident IDs at 26.
+// v1/v2 imply GLU (type 0); native permits explicit v3 GLU as well as MLP.
+// Native validate remains authoritative after binding (context, SM, residents).
+inline size_t config_fixed_fields(const std::vector<int64_t>& c) {
+  TORCH_CHECK(!c.empty() && (c[0] == 1 || c[0] == 2 || c[0] == 3),
+              "offload: expected v1, v2 or v3 config");
+  return c[0] == 1 ? 23 : (c[0] == 2 ? 25 : 26);
+}
+inline int64_t expert_activation(const std::vector<int64_t>& c) {
+  return c[0] == 1 ? 0 : c[23];
+}
+inline int64_t numerical_mode(const std::vector<int64_t>& c) {
+  return c[0] == 1 ? 0 : c[24];
+}
+inline int64_t expert_type(const std::vector<int64_t>& c) {
+  return c[0] == 3 ? c[25] : 0;
+}
 inline void validate_config(const std::vector<int64_t>& c) {
-  TORCH_CHECK(c.size() >= 23 && c[0] == 1, "offload: expected v1 config with 23 fixed fields");
+  const auto fixed = config_fixed_fields(c);
+  TORCH_CHECK(c.size() >= fixed, "offload: truncated config fixed fields");
+  TORCH_CHECK((expert_activation(c) == 0 || expert_activation(c) == 1) &&
+      (numerical_mode(c) == 0 || numerical_mode(c) == 1) &&
+      (expert_type(c) == 0 || expert_type(c) == 1),
+      "offload: invalid expert_activation/numerical_mode/expert_type enum");
   TORCH_CHECK(c[1] > 0 && c[2] > 0 && c[3] > 0 && (c[4] == 1 || c[4] == 2) &&
       c[5] >= 0 && c[5] <= 2 && c[6] >= 0 && c[6] <= INT_MAX &&
       c[7] >= 0 && c[7] <= c[1] && c[8] >= 0 && (c[9] == 0 || c[9] == 1) &&
@@ -140,10 +162,10 @@ inline void validate_config(const std::vector<int64_t>& c) {
   TORCH_CHECK(c[17] > 0 && c[17] <= 512 && c[18] > 0 && c[18] <= INT_MAX &&
       c[18] % 64 == 0 && c[19] > 0 && c[19] <= INT_MAX / 2 && c[19] % 64 == 0 &&
       (c[20] == 0 || c[20] == 1) && c[21] >= 0 && c[21] <= c[17] &&
-      c.size() - 23 == static_cast<size_t>(c[21]) && c[22] >= 80,
+      c.size() - fixed == static_cast<size_t>(c[21]) && c[22] >= 80,
       "offload: invalid E/H/I/dtype/resident count/target SM");
   int64_t previous = -1;
-  for (size_t j = 23; j < c.size(); ++j) {
+  for (size_t j = fixed; j < c.size(); ++j) {
     TORCH_CHECK(c[j] > previous && c[j] < c[17], "offload: invalid sorted resident IDs");
     previous = c[j];
   }
@@ -167,7 +189,9 @@ inline std::map<int64_t, std::vector<int64_t>> parse(const std::vector<int64_t>&
     validate_config(c);
     if (!configs.empty()) {
       const auto& first = configs.begin()->second;
-      TORCH_CHECK(std::equal(c.begin(), c.begin() + 17, first.begin()) && c[22] == first[22],
+      TORCH_CHECK(std::equal(c.begin() + 1, c.begin() + 17, first.begin() + 1) &&
+          c[22] == first[22] && expert_activation(c) == expert_activation(first) &&
+          numerical_mode(c) == numerical_mode(first) && expert_type(c) == expert_type(first),
                   "offload: inconsistent context configuration across layers");
     }
     configs.emplace(id, std::move(c));
@@ -192,6 +216,9 @@ class Runtime {
     std::set<c10::StorageImpl*> storages;
     int64_t backing = 0, resident = 0;
     const auto& first = configs.begin()->second;
+    expert_activation_ = detail::expert_activation(first);
+    numerical_mode_ = detail::numerical_mode(first);
+    expert_type_ = detail::expert_type(first);
     for (const auto& entry : configs) {
       const auto it = weights_.find(entry.first);
       TORCH_CHECK(it != weights_.end(), "offload: manifest layer not bound: ", entry.first);
@@ -209,10 +236,15 @@ class Runtime {
           backing += static_cast<int64_t>(bytes);
         }
       }
-      TORCH_CHECK(pair.first.sizes() == at::IntArrayRef({c[17], 2 * c[19], c[18]}) &&
+      const int64_t w1_rows = detail::multiply(c[19], detail::expert_type(c) == 0 ? 2 : 1);
+      TORCH_CHECK(pair.first.sizes() == at::IntArrayRef({c[17], w1_rows, c[18]}) &&
           pair.second.sizes() == at::IntArrayRef({c[17], c[18], c[19]}),
           "offload: weight dimensions differ from manifest");
-      const auto bytes = detail::multiply(detail::multiply(c[18], c[19]), 6);
+      const auto w1_bytes = detail::multiply(pair.first.numel() / c[17], pair.first.element_size());
+      const auto w2_bytes = detail::multiply(pair.second.numel() / c[17], pair.second.element_size());
+      TORCH_CHECK(w1_bytes <= std::numeric_limits<int64_t>::max() - w2_bytes,
+                  "offload: weight size overflow");
+      const auto bytes = w1_bytes + w2_bytes;
       TORCH_CHECK(bytes <= std::numeric_limits<int64_t>::max() - 511, "offload: size overflow");
       const auto charge = ((bytes + 511) / 512) * 512;
       TORCH_CHECK(c[21] <= (first[7] - resident) / charge,
@@ -229,7 +261,13 @@ class Runtime {
     for (size_t j = 1; j <= 16; ++j) {
       if (j == 13 || j == 14) args.emplace_back(bool(first[j]));
       else args.emplace_back(first[j]);
-    }  // All 17 create arguments explicit; no boxed schema-default assumptions.
+    }
+    args.emplace_back(detail::expert_activation(first));
+    args.emplace_back(detail::numerical_mode(first));
+    args.emplace_back(detail::expert_type(first));
+    // All 20 create arguments are explicit; frozen context/compute fields come
+    // from the manifest. Boxed calls do not insert schema defaults; the extension
+    // must be rebuilt with the 20-argument schema.
     token_ = detail::tensor_result(detail::call("recsys_ops::fuse_moe_offload_create", std::move(args)));
     try {
       TORCH_CHECK(token_.defined() && token_.device().is_cpu() && token_.scalar_type() == at::kLong &&
@@ -242,7 +280,8 @@ class Runtime {
       for (const auto& entry : configs)
         if (entry.second[21])
           detail::call("recsys_ops::fuse_moe_offload_resident_bind", {token_, entry.first,
-              c10::IValue(std::vector<int64_t>(entry.second.begin() + 23, entry.second.end()))});
+              c10::IValue(std::vector<int64_t>(
+                  entry.second.begin() + detail::config_fixed_fields(entry.second), entry.second.end()))});
       validate_locked();  // Always uses the artifact manifest supplied by the caller.
     } catch (...) {
       cleanup();  // Constructor failure must not mask the original exception.
@@ -262,6 +301,10 @@ class Runtime {
   const std::pair<at::Tensor, at::Tensor>& weights(int64_t layer) const { return weights_.at(layer); }
   const std::vector<int64_t>& manifest() const noexcept { return manifest_; }
   int64_t device() const noexcept { return device_; }
+  // Frozen artifact contract: v1 implies SiLU/fused; v1/v2 imply GLU.
+  int64_t expert_activation() const noexcept { return expert_activation_; }
+  int64_t numerical_mode() const noexcept { return numerical_mode_; }
+  int64_t expert_type() const noexcept { return expert_type_; }
 
   // Only designated placeholders are filled; arbitrary other arguments survive.
   std::vector<at::Tensor> prepare(std::vector<at::Tensor> inputs,
@@ -386,6 +429,7 @@ class Runtime {
   const int64_t device_;
   const WeightMap weights_;
   const std::vector<int64_t> manifest_;
+  int64_t expert_activation_ = 0, numerical_mode_ = 0, expert_type_ = 0;  // Constructor-only writes.
   std::map<int64_t, std::pair<detail::Identity, detail::Identity>> identities_;
   at::Tensor token_;  // Assigned only during construction; never reset by close.
   std::optional<detail::Identity> token_identity_;

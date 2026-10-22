@@ -26,8 +26,12 @@ CUSTOM_OP_DISPATCH_FN(
      const torch::Tensor& gate_up_weight,
      const torch::Tensor& down_weight,
      const torch::Tensor& topk_ids,
-     const torch::Tensor& topk_scale),
-    (x, gate_up_weight, down_weight, topk_ids, topk_scale),
+     const torch::Tensor& topk_scale,
+     int64_t expert_activation,
+     int64_t numerical_mode,
+     int64_t expert_type),
+    (x, gate_up_weight, down_weight, topk_ids, topk_scale, expert_activation, numerical_mode,
+     expert_type),
     x
 )
 
@@ -39,7 +43,8 @@ CUSTOM_OPS_LIBRARY_BEGIN
     CUSTOM_OP_SCHEMA(
         fuse_moe,
         "Tensor x, Tensor gate_up_weight, Tensor down_weight, "
-        "Tensor topk_ids, Tensor topk_scale",
+        "Tensor topk_ids, Tensor topk_scale, "
+        "int expert_activation=0, int numerical_mode=0, int expert_type=0",
         "-> Tensor"
     )
     m.def("fuse_moe_offload(Tensor x, Tensor gate_up_weight_cpu, Tensor down_weight_cpu, "
@@ -50,7 +55,8 @@ CUSTOM_OPS_LIBRARY_BEGIN
           "int max_route_tile_rows=4096, int resident_cache_bytes=0, int dynamic_cache_bytes=0, "
           "int cache_policy=0, int cache_decay_interval=32, int cache_min_reuse=2, "
           "int cache_update_bytes=0, bool async_staging=False, bool host_profile=False, "
-          "int tile_m=0, int tile_n=128) -> Tensor");
+          "int tile_m=0, int tile_n=128, int expert_activation=0, int numerical_mode=0, "
+          "int expert_type=0) -> Tensor");
     m.def("fuse_moe_offload_bind(Tensor runtime_token, int layer_id, Tensor w1, Tensor w2) -> ()");
     m.def("fuse_moe_offload_resident_bind(Tensor token, int layer_id, int[] expert_ids) -> ()");
     m.def("fuse_moe_offload_validate(Tensor runtime_token, int[] deployment_manifest) -> ()");
@@ -89,4 +95,4 @@ CUSTOM_OPS_IMPL_END
 // Step 7: pybind 入口
 // ─────────────────────────────────────────────────────────────────────────────
 
-CUSTOM_OPS_PYBIND_MODULE("RecsysOps/fuse_moe — fused MoE FFN (group GEMM + silu*mul + reduce)")
+CUSTOM_OPS_PYBIND_MODULE("RecsysOps/fuse_moe — GLU/MLP MoE FFN (group GEMM + SiLU/GELU-erf + reduce)")

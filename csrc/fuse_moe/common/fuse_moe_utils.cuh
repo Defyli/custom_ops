@@ -95,7 +95,29 @@ __device__ __forceinline__ constexpr void store(void *ptr, const vec_t<T, N> &v)
 // ============================
 //    Activation
 // ============================
+// expert_activation 约定（op 层校验，launch 层一次分发到模板）：
+//   0 = SiLU / SwiGLU：x·sigmoid(x)（历史默认，数值路径逐 bit 保持）
+//   1 = GELU-erf / GEGLU：PyTorch F.gelu(approximate='none') 精确式
+//       0.5·x·(1+erf(x/√2))，**不用 tanh 近似**
+// 逐阶段舍入（numerical_mode=1，staged）只在调用点额外把中间结果 round 到 Tout，
+// 激活函数本身在 FP32 计算。
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + __expf(-x)); }
+
+__device__ __forceinline__ float gelu_erf(float x) {
+  // 与 PyTorch CUDA GELU（kAlpha = M_SQRT1_2, ::erf）同式：erff 为硬件
+  // 精度单元实现；常数取 float(M_SQRT1_2)。
+  return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
+}
+
+// 编译期激活选择：模板参数使 epilogue 内无每元素动态分支。
+template <int kActivation>
+__device__ __forceinline__ float expert_act(float x) {
+  if constexpr (kActivation == 1) {
+    return gelu_erf(x);
+  } else {
+    return silu(x);
+  }
+}
 
 // ============================
 //    PDL 辅助（sm90+；低架构编译为空）

@@ -14,7 +14,13 @@ at::Tensor fuse_moe_offload_create(int64_t device, int64_t gpu_budget_bytes,
     int64_t activation_mode, int64_t max_route_tile_rows, int64_t resident_cache_bytes,
     int64_t dynamic_cache_bytes, int64_t cache_policy, int64_t cache_decay_interval,
     int64_t cache_min_reuse, int64_t cache_update_bytes, bool async_staging,
-    bool host_profile, int64_t tile_m, int64_t tile_n);
+    bool host_profile, int64_t tile_m, int64_t tile_n,
+    // 0=SiLU, 1=GELU-erf; 0=legacy fused numerics, 1=staged (stage-wise rounding).
+    // 0=GLU w1=(E,2I,H), 1=MLP w1=(E,I,H); both w2=(E,H,I).
+    // Defaults keep existing 17/19-argument C++ callers source compatible.
+    // This changes the C++ ABI: existing shared libraries must be rebuilt;
+    // the registered schema must include the explicit 20th expert_type argument.
+    int64_t expert_activation = 0, int64_t numerical_mode = 0, int64_t expert_type = 0);
 void fuse_moe_offload_bind(const at::Tensor& token, int64_t layer_id,
     const at::Tensor& w1, const at::Tensor& w2);
 void fuse_moe_offload_resident_bind(const at::Tensor& token, int64_t layer_id,

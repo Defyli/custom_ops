@@ -25,7 +25,7 @@
 //   - multistage（down GEMM）：激活行连续（expert 排序后布局），走
 //     copy_if + ZFILL 谓词拷贝。
 // 另有 gemm1 专用变体 group_gemm_gateup_kernel（见下方）：gate/up 配对
-// N-tile，把 silu(gate)·up 融进 epilogue，免 gate_up_out 物化。
+// N-tile，把 act(gate)·up（SiLU 或 GELU-erf）融进 epilogue，免 gate_up_out 物化。
 //
 // smem 排布：[sX (kTileM,kTileK,kStage)][sW (kTileN,kTileK,kStage)]
 //            [sC 专用区 (kTileN,kTileM)][shm_tiles (num_group)]。
@@ -179,7 +179,10 @@ __device__ __forceinline__ void scatter_load_x_tile(
 
 // ─── 核心 kernel ─────────────────────────────────────────────────────────────
 // kScatterA=true：gate_up GEMM（X 按行 gather）；false：down GEMM（X 连续）。
-template <typename Config, bool kScatterA, bool kFusedAccum = false>
+// kRoundProduct（仅 kFusedAccum 原子归约路径）：weighted product 先 round 到
+// Tout 再 FP32 atomicAdd（numerical_mode=1 的 offload 语义）。
+template <typename Config, bool kScatterA, bool kFusedAccum = false,
+          bool kRoundProduct = false, int kActivation = -1, bool kRoundIntermediate = false>
 __global__ void __launch_bounds__(Config::kNThreads, 1)
 group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
                   const int *row_indices_ptr,  // kScatterA 时非空
@@ -189,6 +192,9 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
                   float *accumulator, const int *accum_rows, const float *sorted_scale) {
   static_assert(!kFusedAccum || !kScatterA,
                 "fused accumulation is only supported for down GEMM");
+  static_assert(kActivation >= -1 && kActivation <= 1, "invalid GEMM activation");
+  static_assert(kActivation < 0 || (kScatterA && !kFusedAccum),
+                "activation epilogue is only supported for single-projection GEMM1");
   using namespace cute;  // NOLINT
   using Tin = typename Config::Tin;
   using Tout = typename Config::Tout;
@@ -471,7 +477,16 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
     auto tYc = make_tensor<Tout>(shape(tYr));
 #pragma unroll
     for (int i = 0; i < size(tYr); ++i) {
-      tYc(i) = static_cast<Tout>(tYr(i));
+      if constexpr (kActivation >= 0) {
+        // MLP: one projection only; staged rounds GEMM1 before activation.
+        float projection = tYr(i);
+        if constexpr (kRoundIntermediate) {
+          projection = static_cast<float>(static_cast<Tout>(projection));
+        }
+        tYc(i) = static_cast<Tout>(expert_act<kActivation>(projection));
+      } else {
+        tYc(i) = static_cast<Tout>(tYr(i));
+      }
     }
     cute::copy(tiled_copy_c, thr_copy_c.retile_S(tYc), tCs4g);
     __syncthreads();
@@ -498,8 +513,10 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
             const uint64_t sorted_row = uint64_t(Tc.start_token) + row_base + r;
             const int token = accum_rows[sorted_row];
             const float scale = sorted_scale[sorted_row];
+            const float product = static_cast<float>(sC(col, r)) * scale;
+            // staged：sC 已是 Tout round 结果，加权后再 round 到 Tout
             atomicAdd(accumulator + uint64_t(token) * n + col_base + col,
-                      static_cast<float>(sC(col, r)) * scale);
+                      kRoundProduct ? static_cast<float>(static_cast<Tout>(product)) : product);
           }
         }
       } else {
@@ -533,7 +550,7 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
   pdl_release();
 }
 
-// ─── gemm1 专用：gate/up 配对融合 kernel（scatter + silu·mul epilogue）──
+// ─── gemm1 专用：gate/up 配对融合 kernel（scatter + act·mul epilogue）──
 // 在 group_gemm_kernel（scatter 变体）的连续流水骨架上把 act_mul 融进
 // epilogue：
 //   - task 粒度从 N-tile 改为 N-pair：每 task 同时计算 gate 面板（W 行
@@ -541,13 +558,16 @@ group_gemm_kernel(void *Cptr, const void *Xptr, const void *Wptr,
 //     同一 X tile（X 的 smem/L2 装载量减半，task 数减半）；
 //   - 双累加器 tYr_g/tYr_u：同一 tiled_mma + 同一 B 分区 ⇒ fragment 索引
 //     i 在两次 MMA 中映射到相同 (m_row, n_col)，epilogue 直接
-//     act = silu(tYr_g(i)) · tYr_u(i)；
+//     act = act(tYr_g(i)) · tYr_u(i)；
+//     kActivation：0 = SiLU（历史默认），1 = GELU-erf（GEGLU）；
+//     kRoundIntermediate（numerical_mode=1）：gate/up、act 结果、乘积
+//     依次 round 到 Tout；
 //   - 输出直写 act_out (T, I)：省去 gate_up_out (T, 2I) 物化（2×T×I×2B
 //     的 DRAM 写+读）与独立 act_mul kernel。
 // smem：[sX (M,K,S)][sWg (64,K,S)][sWu (64,K,S)][sC 预留][shm_tiles]。
 // flat_divider = (n/2)/64（配对 tile 数，n = 2I）。
 template <typename Config, bool kPairGateUp = true, bool kScatterA = kPairGateUp,
-          bool kFusedAccum = false>
+          bool kFusedAccum = false, int kActivation = 0, bool kRoundIntermediate = false>
 __global__ void __launch_bounds__(Config::kNThreads, 1)
 group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
                          const int *row_indices_ptr, const int *seqlens_ptr,
@@ -821,7 +841,7 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
     // 融合 epilogue。⚠️ fragment 配对正确性依赖：tYr_g/tYr_u 来自同一
     // tiled_mma + 同一 B 分区的两次 gemm ⇒ 索引 i 映射到相同 (m_row,
     // n_col)，仅 W 数据源（两面板）不同。
-    //  - kPairGateUp：silu(gate)·up（fp32）→ 单块写 act_out (T, I)
+    //  - kPairGateUp：act(gate)·up（fp32）→ 单块写 act_out (T, I)
     //  - 相邻 N-pair：两块独立直写 (T, n)，列基 itile_n×(2×kTileN) 与 +64
     //    （gemm2 的宽 N 变体：每 task 覆盖 128 列，per-slab MMA 密度 ×2，
     //    低 occupancy 下加深延迟掩盖——与 gate/up 配对同杠杆）
@@ -839,8 +859,11 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
             const uint64_t sorted_row = uint64_t(Tc.start_token) + row_base + r;
             const int token = accum_rows[sorted_row];
             const float scale = sorted_scale[sorted_row];
+            const float product = static_cast<float>(sC(col, r)) * scale;
+            // staged：sC 已是 Tout round 结果，加权后再 round 到 Tout
             atomicAdd(accumulator + uint64_t(token) * n + col_base + col,
-                      static_cast<float>(sC(col, r)) * scale);
+                      kRoundIntermediate ? static_cast<float>(static_cast<Tout>(product))
+                                         : product);
           }
         }
       } else {
@@ -858,10 +881,24 @@ group_gemm_gateup_kernel(void *ActPtr, const void *Xptr, const void *Wptr,
     };
 
     if constexpr (kPairGateUp) {
+      // 融合 epilogue：act(gate)·up。
+      //  - kActivation：0 = SiLU（历史默认），1 = GELU-erf（GEGLU）
+      //  - kRoundIntermediate（numerical_mode=1，staged）：gate/up 累加器先
+      //    round 到 Tout，act(gate) 再 round 到 Tout，乘积再 round 写回
       auto tActc = make_tensor<Tout>(shape(tYr_g));
+      if constexpr (kRoundIntermediate) {
 #pragma unroll
-      for (int i = 0; i < size(tYr_g); ++i) {
-        tActc(i) = static_cast<Tout>(silu(tYr_g(i)) * tYr_u(i));
+        for (int i = 0; i < size(tYr_g); ++i) {
+          const Tout gate_r = static_cast<Tout>(tYr_g(i));
+          const Tout up_r = static_cast<Tout>(tYr_u(i));
+          const Tout act_r = static_cast<Tout>(expert_act<kActivation>(static_cast<float>(gate_r)));
+          tActc(i) = static_cast<Tout>(static_cast<float>(act_r) * static_cast<float>(up_r));
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < size(tYr_g); ++i) {
+          tActc(i) = static_cast<Tout>(expert_act<kActivation>(tYr_g(i)) * tYr_u(i));
+        }
       }
       cute::copy(tiled_copy_c, thr_copy_c.retile_S(tActc), tCs4g);
       __syncthreads();
@@ -927,15 +964,21 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                       int tile_m, bool is_half, bool use_pdl,
                       cudaStream_t stream, const void *const *weight_ptrs = nullptr,
                       float *accumulator = nullptr, const int *accum_rows = nullptr,
-                      const float *sorted_scale = nullptr, bool explicit_config = false) {
+                      const float *sorted_scale = nullptr, bool explicit_config = false,
+                      int numerical_mode = 0, int expert_activation = -1) {
   using namespace cute;  // NOLINT
 
   assert(n % 64 == 0 && "group_gemm: n must be a multiple of kTileN=64");
   assert(k % 64 == 0 && "group_gemm: k must be a multiple of 64");
 
   const bool scatter = (row_indices_ptr != nullptr);
+  // -1 is internal no-activation mode, never a public expert_activation value.
+  assert(expert_activation >= -1 && expert_activation <= 1);
+  assert(expert_activation < 0 || (scatter && !accumulator));
   assert(!accumulator || (!scatter && accum_rows && sorted_scale));
   assert(tile_m == 32 || tile_m == 64 || tile_m == 128);
+  assert((numerical_mode == 0 || numerical_mode == 1) &&
+         "group_gemm: numerical_mode must be 0 (fused) or 1 (staged)");
 
   cutlass::FastDivmod flat_divider(n / 64);  // num_tile_n
 
@@ -964,14 +1007,29 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
 
     // All specializations share the same signature; select once, then reuse
     // the existing occupancy/PDL launch and dtype/tile dispatch.
+    // Keep down/no-activation specializations unchanged.
     auto kernel = accumulator
-                      ? kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/false,
-                                                   /*kFusedAccum=*/true>
+                      ? (numerical_mode
+                             ? kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/false,
+                                                          /*kFusedAccum=*/true,
+                                                          /*kRoundProduct=*/true>
+                             : kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/false,
+                                                          /*kFusedAccum=*/true,
+                                                          /*kRoundProduct=*/false>)
                       : (scatter
                              ? kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/true,
                                                           /*kFusedAccum=*/false>
                              : kernels::group_gemm_kernel<GemmConfig, /*kScatterA=*/false,
                                                           /*kFusedAccum=*/false>);
+    if (scatter && expert_activation >= 0) {
+      kernel = numerical_mode
+                   ? (expert_activation
+                          ? kernels::group_gemm_kernel<GemmConfig, true, false, false, 1, true>
+                          : kernels::group_gemm_kernel<GemmConfig, true, false, false, 0, true>)
+                   : (expert_activation
+                          ? kernels::group_gemm_kernel<GemmConfig, true, false, false, 1, false>
+                          : kernels::group_gemm_kernel<GemmConfig, true, false, false, 0, false>);
+    }
 
     configure_dynamic_shared_memory(kernel, shm_size);
     int max_blocks = 1;
@@ -1021,8 +1079,11 @@ void group_gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
   }
 }
 
-// ── gemm1 融合入口（gate/up 配对 + silu·mul epilogue）─────────────────
+// ── gemm1 融合入口（gate/up 配对 + act·mul epilogue）─────────────────
 // 输出 act_out (T, n/2)；n = 2I（W 行数，gate 在 [0, I) up 在 [I, 2I)）。
+// expert_activation：0 = SiLU (SwiGLU)，1 = GELU-erf (GEGLU)；
+// numerical_mode：0 = legacy，1 = staged（中间结果 round 到 Tout）。
+// 两者均在 host 一次分发到模板特化，kernel 内无逐元素动态分支。
 // flat_divider = (n/2)/64（配对 tile 数）。kStage 预算（operands/stage
 // = (kTileM + 2·64)·kTileK·2B + sC 预留 8KB）：M64/K64→3、M64/K128→2、
 // M32/K64→4、M32/K128→2（双 W 面板挤占 operand 区，深度略低于基线变体，
@@ -1033,12 +1094,17 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
                                    const void *cu_tiles_ptr, bool use_vert, int n, int k,
                                    int num_group, int tile_m, bool is_half, bool use_pdl,
                                    cudaStream_t stream, const void *const *weight_ptrs = nullptr,
-                                   bool explicit_config = false) {
+                                   bool explicit_config = false, int expert_activation = 0,
+                                   int numerical_mode = 0) {
   using namespace cute;  // NOLINT
 
   assert(n % 128 == 0 && "gateup_fused: n (=2I) must be a multiple of 128");
   assert(k % 64 == 0 && "gateup_fused: k must be a multiple of 64");
   assert(tile_m == 32 || tile_m == 64 || tile_m == 128);
+  assert((expert_activation == 0 || expert_activation == 1) &&
+         "gateup_fused: expert_activation must be 0 (SiLU) or 1 (GELU-erf)");
+  assert((numerical_mode == 0 || numerical_mode == 1) &&
+         "gateup_fused: numerical_mode must be 0 (fused) or 1 (staged)");
 
   cutlass::FastDivmod flat_divider((n / 2) / 64);  // 配对 tile 数
 
@@ -1062,11 +1128,36 @@ void group_gemm_gateup_fused_async(void *act_ptr, const void *x_ptr, const void 
         GemmConfig::shm_xw + static_cast<int>(sizeof(T)) * 64 * kTileK * kStage +
         GemmConfig::shm_c_alloc +
         (num_group + 1) * static_cast<int>(sizeof(int));  // 调度表（tiles 或 cu_tiles）
-    // 防回归：双面板预算必须落在 sm120 每块动态 smem 硬限内（超限的
-    // launch 静默失败 → 输出 NaN，见 dispatch_k 的降级注释）
-    assert(shm_size <= 101376);
+    // Keep the double-panel budget guard in release builds. The per-device
+    // and per-kernel hardware limit is checked by configure_dynamic_shared_memory.
+    TORCH_CHECK(shm_size <= 101376,
+                "gateup_fused: shared memory budget exceeded (", shm_size, " bytes)");
 
-    auto kernel = kernels::group_gemm_gateup_kernel<GemmConfig>;
+    // 激活 / 数值语义 host 侧一次分发（4 个 epilogue 特化：SiLU/GELU ×
+    // legacy/staged）；legacy 默认实例与旧代码同源。
+    auto kernel = numerical_mode
+                      ? (expert_activation
+                             ? kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/true,
+                                                                 /*kScatterA=*/true,
+                                                                 /*kFusedAccum=*/false,
+                                                                 /*kActivation=*/1,
+                                                                 /*kRoundIntermediate=*/true>
+                             : kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/true,
+                                                                 /*kScatterA=*/true,
+                                                                 /*kFusedAccum=*/false,
+                                                                 /*kActivation=*/0,
+                                                                 /*kRoundIntermediate=*/true>)
+                      : (expert_activation
+                             ? kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/true,
+                                                                 /*kScatterA=*/true,
+                                                                 /*kFusedAccum=*/false,
+                                                                 /*kActivation=*/1,
+                                                                 /*kRoundIntermediate=*/false>
+                             : kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/true,
+                                                                 /*kScatterA=*/true,
+                                                                 /*kFusedAccum=*/false,
+                                                                 /*kActivation=*/0,
+                                                                 /*kRoundIntermediate=*/false>);
 
     configure_dynamic_shared_memory(kernel, shm_size);
     int max_blocks = 1;
@@ -1133,13 +1224,16 @@ void group_gemm_wide_n_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                              bool use_pdl, cudaStream_t stream,
                              const void *const *weight_ptrs = nullptr,
                              float *accumulator = nullptr, const int *accum_rows = nullptr,
-                             const float *sorted_scale = nullptr, bool explicit_config = false) {
+                             const float *sorted_scale = nullptr, bool explicit_config = false,
+                             int numerical_mode = 0) {
   using namespace cute;  // NOLINT
 
   assert(n % 128 == 0 && "wide_n: n must be a multiple of 2*kTileN=128");
   assert(k % 64 == 0 && "wide_n: k must be a multiple of 64");
   assert(!accumulator || (accum_rows && sorted_scale));
   assert(tile_m == 32 || tile_m == 64 || tile_m == 128);
+  assert((numerical_mode == 0 || numerical_mode == 1) &&
+         "wide_n: numerical_mode must be 0 (fused) or 1 (staged)");
 
   cutlass::FastDivmod flat_divider(n / 128);  // N-pair 数
 
@@ -1161,15 +1255,27 @@ void group_gemm_wide_n_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
         GemmConfig::shm_xw + static_cast<int>(sizeof(T)) * 64 * kTileK * kStage +
         GemmConfig::shm_c_alloc +
         (num_group + 1) * static_cast<int>(sizeof(int));  // 调度表（tiles 或 cu_tiles）
-    assert(shm_size <= 101376);
+    TORCH_CHECK(shm_size <= 101376,
+                "wide_n: shared memory budget exceeded (", shm_size, " bytes)");
 
+    // numerical_mode 仅影响 fused FP32 原子归约路径（加权积先 round 到 Tout）。
     auto kernel = accumulator
-                      ? kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/false,
-                                                          /*kScatterA=*/false,
-                                                          /*kFusedAccum=*/true>
+                      ? (numerical_mode
+                             ? kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/false,
+                                                                 /*kScatterA=*/false,
+                                                                 /*kFusedAccum=*/true,
+                                                                 /*kActivation=*/0,
+                                                                 /*kRoundIntermediate=*/true>
+                             : kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/false,
+                                                                 /*kScatterA=*/false,
+                                                                 /*kFusedAccum=*/true,
+                                                                 /*kActivation=*/0,
+                                                                 /*kRoundIntermediate=*/false>)
                       : kernels::group_gemm_gateup_kernel<GemmConfig, /*kPairGateUp=*/false,
                                                           /*kScatterA=*/false,
-                                                          /*kFusedAccum=*/false>;
+                                                          /*kFusedAccum=*/false,
+                                                          /*kActivation=*/0,
+                                                          /*kRoundIntermediate=*/false>;
 
     configure_dynamic_shared_memory(kernel, shm_size);
     int max_blocks = 1;

@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import torch
 
-from custom_ops.recsys import DEFAULT_RESIDUAL_SCALE
+from custom_ops.recsys import (
+    DEFAULT_RESIDUAL_SCALE, _resolve_fuse_moe_modes, _resolve_fuse_moe_expert_type,
+)
 
 
 def _tilelang_available() -> bool:
@@ -95,20 +97,35 @@ class TileLangOps:
     def fuse_moe(
         self,
         x:              torch.Tensor,                      # (S, H) bf16/fp16
-        gate_up_weight: torch.Tensor,                      # (E, 2I, H) 同 dtype
+        gate_up_weight: torch.Tensor,                      # (E, 2I or I, H) 同 dtype
         down_weight:    torch.Tensor,                      # (E, H, I) 同 dtype
         topk_ids:       torch.Tensor,                      # (S, K) int32
         topk_scale:     torch.Tensor,                      # (S, K) fp32
         config:         dict | None = None,    # 覆盖默认 tile config（基准测试用）
+        expert_activation: str = "silu",       # "silu" | "gelu"（exact erf）
+        numerical_mode:    str = "fused",      # "fused" | "staged"
+        *,
+        expert_type:       str = "glu",        # "glu" | "mlp"
     ) -> torch.Tensor:
-        """MoE FFN 前向融合：y[s] = Σ_j topk_scale[s,j]·(Down_ej @ silu(GateUp_ej @ x[s]))。
+        """MoE FFN 前向融合：y[s] = Σ_j topk_scale[s,j]·(Down_ej @ act(GateUp_ej @ x[s]))。
 
-        count/路由/gather/gemm1(silu·mul)/gemm2(加权原子归约) 共 5 个
+        expert_type='glu' 为 act(gate) * up；'mlp' 为单投影 act(proj)，
+        w1 分别为 (E, 2I, H) / (E, I, H)，w2 均为 (E, H, I)。
+        expert_activation="gelu" 为 exact erf（对齐 F.gelu approximate="none"，
+        非 tanh 近似）；numerical_mode="staged" 在 gate/up、激活结果、
+        激活乘积、down 结果与加权积逐阶段 round 到 Tout（与输入同 dtype），
+        再 FP32 归约并 round 到 Tout 输出。
+
+        count/路由/gather/gemm1(act·mul)/gemm2(加权原子归约) 共 5 个
         tile-lang kernel；限制与 CUDA 版一致（H%64==0、I%64==0、K≤128、E≤512）。
         """
+        _resolve_fuse_moe_modes(expert_activation, numerical_mode)
+        _resolve_fuse_moe_expert_type(expert_type)
         from custom_ops.tilelang_ops._fuse_moe import fuse_moe_tilelang
-        return fuse_moe_tilelang(x, gate_up_weight, down_weight, topk_ids,
-                                 topk_scale, config=config)
+        return fuse_moe_tilelang(
+            x, gate_up_weight, down_weight, topk_ids, topk_scale,
+            config=config, expert_activation=expert_activation,
+            numerical_mode=numerical_mode, expert_type=expert_type)
 
     # ── swiglu ────────────────────────────────────────────────────────────────
 

@@ -1,13 +1,18 @@
 /*
  * fuse_moe_op.cu — MoE 前向融合算子，PyTorch C++ 接口实现
  *
- * 对外暴露：fuse_moe_cuda(x, gate_up_weight, down_weight, topk_ids, topk_scale)
+ * 对外暴露：fuse_moe_cuda(x, gate_up_weight, down_weight, topk_ids, topk_scale,
+ *                        expert_activation=0, numerical_mode=0, expert_type=0)
+ *   expert_activation: 0 = SiLU (SwiGLU)，1 = GELU-erf (GEGLU)
+ *   numerical_mode:    0 = fused（FP32 gate/up 到 act·up 后 round 到 Tout）
+ *                      1 = staged（gate/up、act、乘积分别 round 到 Tout）
  *
  * 数据流（单 GPU，无 fp8 量化——x/权重 bf16 或 fp16 直入，MMA fp32 累加）：
  *   ① count/build_indices：按 topk_ids 统计每 expert token 数（seqlens/
  *      cu_seqlens）、构建 row_indices（expert 排序后布局的源行号）与
  *      topk_pos（(token, topk) → 排序后行号）、tiles（GEMM tile 数）
- *   ② gemm1 融合（gate/up 配对 N-tile）：act_out[t] = silu(gate)·up，
+ *   ② gemm1 融合（gate/up 配对 N-tile）：act_out[t] = act(gate)·up
+ *      （act = SiLU 或 GELU-erf，由 expert_activation 选择），
  *      gate/up = x[row_indices[t]] @ W1[e]^T 的两个 N 半区（共享 X tile）
  *   ③ down group GEMM：down_out[t] = act_out[t] @ W2[e]^T
  *      （W1[e] = gate_up_weight[e]，(2I, H)；W2[e] = down_weight[e]，(H, I)）
@@ -155,21 +160,35 @@ void moe_offload_route(fuse_moe::FMOE_params& p, int* invalid, cudaStream_t stre
 
 void moe_offload_compute(fuse_moe::FMOE_params& p, cudaStream_t stream) {
     TORCH_CHECK(arch_targets::gpu_major() >= 8, "offload requires SM80+");
+    // Activation / numerical semantics travel in params so offload waves inherit
+    // the create-time configuration without extra launch arguments.
+    TORCH_CHECK(p.expert_type == 0 || p.expert_type == 1,
+                "offload: expert_type must be 0 (GLU) or 1 (MLP)");
+    TORCH_CHECK(p.expert_activation == 0 || p.expert_activation == 1,
+                "offload: expert_activation must be 0 (SiLU) or 1 (GELU-erf)");
+    TORCH_CHECK(p.numerical_mode == 0 || p.numerical_mode == 1,
+                "offload: numerical_mode must be 0 (fused) or 1 (staged)");
     fuse_moe::moe_compute_sm8x(p, stream, /*explicit_config=*/true);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void moe_offload_reduce(fuse_moe::FMOE_params& p, cudaStream_t stream) {
+    TORCH_CHECK(p.expert_type == 0 || p.expert_type == 1,
+                "offload: expert_type must be 0 (GLU) or 1 (MLP)");
+    TORCH_CHECK(p.expert_activation == 0 || p.expert_activation == 1,
+                "offload: expert_activation must be 0 (SiLU) or 1 (GELU-erf)");
+    TORCH_CHECK(p.numerical_mode == 0 || p.numerical_mode == 1,
+                "offload: numerical_mode must be 0 (fused) or 1 (staged)");
     if (p.is_bf16) {
         fuse_moe::reduce_async(static_cast<cutlass::bfloat16_t*>(p.out_ptr),
             static_cast<const cutlass::bfloat16_t*>(p.down_out_ptr), p.topk_pos_ptr,
             p.topk_scale_ptr, p.num_seq, p.hidden, p.num_topk, false, stream,
-            /*explicit_config=*/true);
+            /*explicit_config=*/true, p.numerical_mode);
     } else {
         fuse_moe::reduce_async(static_cast<cutlass::half_t*>(p.out_ptr),
             static_cast<const cutlass::half_t*>(p.down_out_ptr), p.topk_pos_ptr,
             p.topk_scale_ptr, p.num_seq, p.hidden, p.num_topk, false, stream,
-            /*explicit_config=*/true);
+            /*explicit_config=*/true, p.numerical_mode);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -221,8 +240,18 @@ torch::Tensor fuse_moe_cuda(
     const torch::Tensor& gate_up_weight,
     const torch::Tensor& down_weight,
     const torch::Tensor& topk_ids,
-    const torch::Tensor& topk_scale
+    const torch::Tensor& topk_scale,
+    int64_t expert_activation,
+    int64_t numerical_mode,
+    int64_t expert_type
 ) {
+    TORCH_CHECK(expert_type == 0 || expert_type == 1,
+                "expert_type must be 0 (GLU) or 1 (MLP), got ", expert_type);
+    TORCH_CHECK(expert_activation == 0 || expert_activation == 1,
+                "expert_activation must be 0 (SiLU) or 1 (GELU-erf), got ",
+                expert_activation);
+    TORCH_CHECK(numerical_mode == 0 || numerical_mode == 1,
+                "numerical_mode must be 0 (fused) or 1 (staged), got ", numerical_mode);
     // ── 基础校验 ────────────────────────────────────────────────────────────
     TORCH_CHECK(x.is_cuda() && gate_up_weight.is_cuda() && down_weight.is_cuda() &&
                     topk_ids.is_cuda() && topk_scale.is_cuda(),
@@ -242,19 +271,22 @@ torch::Tensor fuse_moe_cuda(
     TORCH_CHECK(topk_scale.dtype() == torch::kFloat32, "topk_scale must be float32");
 
     TORCH_CHECK(x.dim() == 2, "x must be 2D (num_seq, hidden)");
-    TORCH_CHECK(gate_up_weight.dim() == 3, "gate_up_weight must be 3D (E, 2I, hidden)");
+    TORCH_CHECK(gate_up_weight.dim() == 3,
+                "gate_up_weight must be 3D: GLU (E, 2I, H) or MLP (E, I, H)");
     TORCH_CHECK(down_weight.dim() == 3, "down_weight must be 3D (E, hidden, I)");
     TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D (num_seq, num_topk)");
 
     const int64_t num_seq = x.size(0);
     const int64_t hidden = x.size(1);
     const int64_t num_expert = gate_up_weight.size(0);
-    const int64_t intermediate2 = gate_up_weight.size(1);  // 2 * I
+    const int64_t intermediate = down_weight.size(2);
+    const int64_t projection_cols = gate_up_weight.size(1);
     const int64_t num_topk = topk_ids.size(1);
 
-    TORCH_CHECK(num_seq > 0 && hidden > 0 && num_expert > 0, "empty input");
-    TORCH_CHECK(intermediate2 % 2 == 0, "gate_up_weight.size(1) must be even (gate+up fused)");
-    const int64_t intermediate = intermediate2 / 2;
+    TORCH_CHECK(num_seq > 0 && hidden > 0 && intermediate > 0 && num_expert > 0,
+                "empty input");
+    TORCH_CHECK(projection_cols == (expert_type == 0 ? 2 * intermediate : intermediate),
+                "gate_up_weight.size(1) must be 2I for GLU or I for MLP; I=down_weight.size(2)");
 
     TORCH_CHECK(topk_ids.size(0) == num_seq, "topk_ids must share num_seq with x");
     TORCH_CHECK(topk_scale.sizes() == topk_ids.sizes(), "topk_scale shape must match topk_ids");
@@ -263,16 +295,21 @@ torch::Tensor fuse_moe_cuda(
     TORCH_CHECK(down_weight.size(0) == num_expert,
                 "down_weight must share num_expert with gate_up_weight");
     TORCH_CHECK(down_weight.size(1) == hidden, "down_weight.size(1) must match hidden");
-    TORCH_CHECK(down_weight.size(2) == intermediate,
-                "down_weight.size(2) must match intermediate (= gate_up_weight.size(1)/2)");
 
-    // kernel tile 约定：kTileN=64（n=2I 与 n=H 均须整除）、kTileK∈{64,128}
+    // ── 激活 / 数值语义 ──────────────────────────────────────────────────
+    // expert_activation：0 = SiLU (SwiGLU，历史默认)，1 = GELU-erf (GEGLU)
+    // numerical_mode：0 = fused（FP32 gate/up 到 act·up 后 round 到 Tout）；
+    //                 1 = staged（gate/up、act、乘积分别 round 到 Tout，
+    //                 加权积亦先 round 再 FP32 累加；不承诺 torch 逐 bit 一致）
+    // MLP staged：单投影先 round 到 Tout，再 act 并 round 到 Tout，无乘积。
+    // kernel tile 约定：kTileN=64（n=projection_cols 与 n=H 均须整除）、kTileK∈{64,128}
     // （k=H 与 k=I 均须 %64）
     TORCH_CHECK(hidden % 64 == 0, "hidden must be a multiple of 64, got ", hidden);
     TORCH_CHECK(intermediate % 64 == 0,
-                "intermediate (= gate_up_weight.size(1)/2) must be a multiple of 64, got ",
+                "intermediate (= down_weight.size(2)) must be a multiple of 64, got ",
                 intermediate);
-    TORCH_CHECK(num_topk <= 128, "num_topk must be <= 128, got ", num_topk);
+    TORCH_CHECK(num_topk > 0 && num_topk <= 128,
+                "num_topk must be positive and <= 128, got ", num_topk);
     TORCH_CHECK(num_expert <= 512, "num_expert must be <= 512, got ", num_expert);
 
     // ── 环境与输出 ──────────────────────────────────────────────────────────
@@ -281,9 +318,9 @@ torch::Tensor fuse_moe_cuda(
 
     // ── 架构无关 workspace ─────────────────────────────────────────────────
     // 紧凑布局：act_out / down_out 按 compact 行号（expert 有序）。
-    // gate_up_out 仅 TMA 引擎使用（其 gemm1 为独立 gate/up 两个 GEMM，无
-    // 配对融合变体）；cp.async 引擎的 gemm1 融合 epilogue 直写 act_out，
-    // 不分配该缓冲。TMA 引擎的 x_sorted 由 launch 层自行分配。
+    // gate_up_out 仅 TMA 引擎使用（GLU N=2I，MLP N=I，再 act_mul）：
+    // fused 保留 FP32 gate/up；staged 物化 x.dtype。cp.async 的融合 epilogue
+    // 直写 act_out，不分配该缓冲。TMA 的 x_sorted 由 launch 层自行分配。
     torch::Tensor out = torch::empty_like(x);
 
     auto options_i32 = x.options().dtype(torch::kInt32);
@@ -300,7 +337,8 @@ torch::Tensor fuse_moe_cuda(
     torch::Tensor gate_up_out;  // 仅 FUSE_MOE_TMA=1（TMA 引擎）
     if (std::getenv("FUSE_MOE_TMA") != nullptr) {
         gate_up_out =
-            torch::empty({(int64_t)num_seq * num_topk, intermediate2}, x.options());
+            torch::empty({(int64_t)num_seq * num_topk, projection_cols},
+                         numerical_mode == 0 ? x.options().dtype(torch::kFloat32) : x.options());
     }
 
     // ── 填 params 并分发（tile/PDL/引擎策略全部内封在 launch 层）──────────
@@ -330,6 +368,9 @@ torch::Tensor fuse_moe_cuda(
     params.total_num_seq = static_cast<int>(num_seq * num_topk);
     params.avg_tokens_per_expert = static_cast<int>(num_seq * num_topk / num_expert);
     params.is_bf16 = is_bf16;
+    params.expert_type = static_cast<int>(expert_type);
+    params.expert_activation = static_cast<int>(expert_activation);
+    params.numerical_mode = static_cast<int>(numerical_mode);
 
     fuse_moe::moe_fwd_launch(params, stream);
 
@@ -343,7 +384,10 @@ torch::Tensor fuse_moe_cpu(
     const torch::Tensor& /*gate_up_weight*/,
     const torch::Tensor& /*down_weight*/,
     const torch::Tensor& /*topk_ids*/,
-    const torch::Tensor& /*topk_scale*/
+    const torch::Tensor& /*topk_scale*/,
+    int64_t /*expert_activation*/,
+    int64_t /*numerical_mode*/,
+    int64_t /*expert_type*/
 ) {
     TORCH_CHECK(false, "fuse_moe is only supported on CUDA");
 }

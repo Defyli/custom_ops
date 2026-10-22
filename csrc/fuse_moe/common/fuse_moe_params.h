@@ -110,7 +110,7 @@ struct FMOE_params {
 
     // 输入
     const void *x_ptr = nullptr;        // (S, H)，token 序
-    const void *w1_ptr = nullptr;       // (E, 2I, H) gate_up 权重
+    const void *w1_ptr = nullptr;       // GLU: (E, 2I, H); MLP: (E, I, H)
     const void *w2_ptr = nullptr;       // (E, H, I) down 权重
     // Optional device pointer tables for independently allocated cached experts.
     const void *const *w1_group_ptrs = nullptr;
@@ -128,7 +128,7 @@ struct FMOE_params {
     int *tiles_ptr = nullptr;        // (E) 每 expert 的 kTileM tile 数
     int *cu_tiles_ptr = nullptr;     // (E+1) tiles 的 exclusive 前缀和；[E] = total_m
                            //（vert 调度用，见 sm89/group_gemm_sm89.cuh）
-    void *gate_up_out_ptr = nullptr;  // (T, 2I)，仅 TMA 家族
+    void *gate_up_out_ptr = nullptr;  // GLU: (T, 2I); MLP: (T, I)，仅 TMA 家族
     void *act_out_ptr = nullptr;      // (T, I)
     void *down_out_ptr = nullptr;     // (T, H), unused by fused FP32 accumulation
     void *out_ptr = nullptr;          // (S, H) 最终输出
@@ -145,6 +145,14 @@ struct FMOE_params {
     int total_num_seq = 0; // T = S * K
     int avg_tokens_per_expert = 0;  // T / E
     bool is_bf16 = false;               // false → fp16
+
+    // 激活 / 数值语义（op 层填写，两家族入口共同消费）
+    int expert_type = 0;        // 0 = GLU（默认）；1 = MLP（单投影，无门控乘积）
+    int expert_activation = 0;  // 0 = SiLU (SwiGLU, 历史默认)；1 = GELU-erf (GEGLU)
+    int numerical_mode = 0;     // 0 = fused 旧语义（保留原有舍入边界）；
+                                // 1 = staged（逐阶段 round 到 Tout：gemm1 gate/up
+                                //     → act(gate) → 激活乘积 → down → 加权积，
+                                //     再 FP32 reduce，最终 round 到 Tout）
 
     // 策略（fuse_moe_launch 分发时填写）
     int tile_m = 0;    // count/GEMM 共用 kTileM（moe_pick_tile_m）
